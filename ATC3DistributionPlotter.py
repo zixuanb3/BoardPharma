@@ -1,0 +1,769 @@
+"""
+Build and plot sharing_atc3 vs not_sharing_atc3 counts across cohorts.
+
+For each configuration:
+- event in {direct_interlock, indirect_interlock, to_B_not_in_A, to_B_still_in_A}
+- event_type in {event, first_event}
+- panel_level in {year, quarter}
+- atc_level in {1, 2}
+  - 1: Use atc3 as is
+  - 2: Remove last character from atc3 (e.g., 'A01A' -> 'A01')
+
+The script reads:
+- data/atc3mapping/atc3mapping_year_level[_level2].csv
+- data/cohort_data/{panel_level}/{event_type}/Pure Control/{event}_{panel_level}_cohort_{YYYY}[... ]_balanced.csv
+- data/staggered_data/{year-level|quarter-level}/staggered_firm_level_panel_{panel}_{event}_{control}_balanced.csv
+- data/event.xlsx
+
+And writes:
+- data/cohort_data_with_atc3sharing/...
+- data/staggered_data_with_atc3sharing/...
+- figures/cohort_sharing_atc3/{panel_level}/{event_type}/sharing_atc3_{event}_{event_type}_{panel_level}[_level2].png
+- figures/staggered_sharing_atc3/{panel_level}/first_event/{control_folder}/...
+"""
+
+import ast
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ATC3_MAP_DIR = PROJECT_ROOT / "data" / "atc3mapping"
+COHORT_ROOT = PROJECT_ROOT / "data" / "cohort_data"
+COHORT_OUT_ROOT = PROJECT_ROOT / "data" / "cohort_data_with_atc3sharing"
+STAGGERED_ROOT = PROJECT_ROOT / "data" / "staggered_data"
+STAGGERED_OUT_ROOT = PROJECT_ROOT / "data" / "staggered_data_with_atc3sharing"
+EVENT_XLSX = PROJECT_ROOT / "data" / "event.xlsx"
+FIG_ROOT = PROJECT_ROOT / "figures" / "cohort_sharing_atc3"
+STAGGERED_FIG_ROOT = PROJECT_ROOT / "figures" / "staggered_sharing_atc3"
+
+EVENTS = [
+    "direct_interlock",
+    "indirect_interlock",
+    "to_B_not_in_A",
+    "to_B_still_in_A",
+]
+EVENT_TYPES = ["event", "first_event"]
+PANEL_LEVELS = ["quarter"]  # "year"
+COHORT_YEARS = list(range(2007, 2019))
+PERIODS = list(range(0, 1))  # -1 to 0
+
+# Control group folders used by StackedEventStudy and CohortPanelMaker
+CONTROL_FOLDERS = ["Not", "Not Yet", "Pure Control"]
+STAGGERED_CONTROL_FOLDER_MAP = {
+    "not_yet": "Not Yet",
+    "pure_control": "Pure Control",
+}
+
+# Period(s) used to determine atc3_sharing status (relative to cohort year).
+# E.g. [0] means check at the event year; [-1, 0] means check at t-1 or t.
+ATC3_SHARING_PERIODS = [0]
+
+
+def staggered_level_folder(panel_level: str) -> str:
+    return "year-level" if panel_level == "year" else "quarter-level"
+
+
+def parse_staggered_file_name(file_name: str) -> dict[str, str] | None:
+    """Parse staggered filename metadata.
+
+    Expected pattern:
+    staggered_firm_level_panel_{panel}_{event}_{control}_balanced.csv
+    """
+    stem = Path(file_name).stem
+    prefix = "staggered_firm_level_panel_"
+    suffix = "_balanced"
+
+    if not stem.startswith(prefix) or not stem.endswith(suffix):
+        return None
+
+    body = stem[len(prefix):-len(suffix)]
+
+    panel_level = None
+    rest = None
+    for p in ["year", "quarter"]:
+        marker = f"{p}_"
+        if body.startswith(marker):
+            panel_level = p
+            rest = body[len(marker):]
+            break
+    if panel_level is None or rest is None:
+        return None
+
+    control_type = None
+    event = None
+    for c in STAGGERED_CONTROL_FOLDER_MAP:
+        marker = f"_{c}"
+        if rest.endswith(marker):
+            control_type = c
+            event = rest[:-len(marker)]
+            break
+    if control_type is None or event is None:
+        return None
+    if event not in EVENTS:
+        return None
+
+    return {
+        "panel_level": panel_level,
+        "event": event,
+        "control_type": control_type,
+    }
+
+
+def apply_atc_level(df: pd.DataFrame, atc_level: int) -> pd.DataFrame:
+    """Return a copy transformed for requested ATC level."""
+    out = df.copy()
+    if atc_level == 2:
+        out["atc3"] = out["atc3"].astype(str).str[:-1]
+    return out
+
+
+def parse_list_cell(value) -> list[str]:
+    """Parse list-like cell from Excel into python list."""
+    if pd.isna(value):
+        return []
+    if isinstance(value, list):
+        return [str(x) for x in value if pd.notna(x)]
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "":
+            return []
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed if pd.notna(x)]
+        except (ValueError, SyntaxError):
+            pass
+
+        # Fallback for plain list-like text such as "['a','b']".
+        if text.startswith("[") and text.endswith("]"):
+            inner = text[1:-1].strip()
+            if inner == "":
+                return []
+            parts = [p.strip().strip("'\"") for p in inner.split(",")]
+            return [p for p in parts if p != ""]
+
+        return [text]
+
+    return [str(value)]
+
+
+def cohort_file_path(panel_level: str, event_type: str, event: str, cohort_year: int) -> Path:
+    """Build cohort file path following CohortPanelMaker naming."""
+    treat_suffix = "_first_event" if event_type == "first_event" else ""
+    file_name = f"{event}_{panel_level}_cohort_{cohort_year}{treat_suffix}_balanced.csv"
+    return COHORT_ROOT / panel_level / event_type / "Pure Control" / file_name
+
+
+def load_atc3_mapping(panel_level: str, atc_level: int = 1) -> pd.DataFrame:
+    """Load year-level ATC3 mapping.
+    
+    Parameters:
+    -----------
+    panel_level : str
+        Kept for compatibility; mapping is always year-level.
+    atc_level : int
+        1 for standard level, 2 for level2 version
+    """
+    level_suffix = "" if atc_level == 1 else "_level2"
+    path = ATC3_MAP_DIR / f"atc3mapping_year_level{level_suffix}.csv"
+    df = pd.read_csv(path)
+    return df
+
+
+def load_event_pairs() -> pd.DataFrame:
+    """Load event.xlsx and explode BoardNamePair list into long form."""
+    event_df = pd.read_excel(EVENT_XLSX)
+    needed = ["BoardName", "year", "event", "BoardNamePair"]
+    event_df = event_df[needed].copy()
+
+    event_df["BoardNamePair"] = event_df["BoardNamePair"].apply(parse_list_cell)
+
+    event_long = event_df.explode("BoardNamePair", ignore_index=True)
+    event_long = event_long.dropna(subset=["BoardNamePair"])
+    # Keep unique board-year-event-pair links.
+    event_long = event_long.drop_duplicates(
+        subset=["BoardName", "year", "event", "BoardNamePair"]
+    ).reset_index(drop=True)
+    return event_long
+
+
+def filter_event_rows(df: pd.DataFrame, event_type: str, cohort_year: int, panel_level: str, period: int = 0) -> pd.DataFrame:
+    """Return treated rows in the period-shifted year.
+
+    1. Filter by first_event_year / event_{cohort_year} to keep only
+       treated observations for this cohort.
+    2. Then keep rows where year == cohort_year + period.
+    For quarter-level data, always uses quarter == 1.
+    """
+    data = df.copy()
+    if event_type == "first_event":
+        if "first_event_year" not in data.columns:
+            raise KeyError("first_event cohort file must contain first_event_year")
+        data = data[data["first_event_year"].fillna(-1) == cohort_year]
+    else:
+        event_col = f"event_{cohort_year}"
+        if event_col not in data.columns:
+            raise KeyError(f"Missing column {event_col} in cohort file")
+        data = data[data[event_col] == 1]
+
+    target_year = cohort_year + period
+    data = data[data["year"] == target_year]
+
+    if panel_level == "quarter":
+        if "quarter" not in data.columns:
+            raise KeyError("Quarter-level cohort file must contain 'quarter' column")
+        data = data[data["quarter"] == 1]
+
+    return data
+
+
+def count_sharing_for_cohort(
+    cohort_df: pd.DataFrame,
+    event_pairs_long: pd.DataFrame,
+    atc3_mapping: pd.DataFrame,
+    panel_level: str,
+    event: str,
+    cohort_year: int = None,
+    period: int = 0,
+) -> tuple[int, int, int]:
+    """Return sharing_count, not_sharing_count, total_event_rows for one cohort."""
+    if cohort_df.empty:
+        return 0, 0, 0
+
+    required_cols = ["BoardName", "year", "product", "atc3"]
+    missing = [c for c in required_cols if c not in cohort_df.columns]
+    if missing:
+        raise KeyError(f"Cohort data missing required columns: {missing}")
+
+    obs = cohort_df[required_cols].copy().reset_index(drop=True)
+    obs["obs_id"] = obs.index
+    key_cols = ["year", "product", "atc3", "BoardName"]
+
+    # Candidate ATC3 peers for each observation from mapping table.
+    cand = obs.merge(atc3_mapping[key_cols + ["BoardNamePair"]], on=key_cols, how="left")
+    cand = cand.dropna(subset=["BoardNamePair"]).copy()
+    if cand.empty:
+        return 0, len(obs), len(obs)
+
+    # True event partners: use the original event year (cohort_year).
+    evt = event_pairs_long[
+        (event_pairs_long["event"] == event)
+        & (event_pairs_long["year"] == cohort_year)
+    ][["BoardName", "BoardNamePair"]].copy()
+
+    matched = cand.merge(
+        evt,
+        on=["BoardName", "BoardNamePair"],
+        how="inner",
+    )
+
+    sharing_obs_ids = set(matched["obs_id"].unique().tolist())
+    sharing_count = len(sharing_obs_ids)
+    total_count = len(obs)
+    not_sharing_count = total_count - sharing_count
+    return sharing_count, not_sharing_count, total_count
+
+
+def build_distribution_for_config(
+    panel_level: str,
+    event_type: str,
+    event: str,
+    event_pairs_long: pd.DataFrame,
+    atc3_mapping: pd.DataFrame,
+    atc_level: int = 1,
+    period: int = 0,
+) -> pd.DataFrame:
+    """Aggregate sharing vs not-sharing counts over cohorts for one configuration.
+    
+    Parameters:
+    -----------
+    atc_level : int
+        1 for standard level, 2 for level2 version (atc3 with last char removed)
+    period : int
+        Relative period to examine (-4 to 3). 0 = event year.
+    """
+    rows = []
+    for cohort in COHORT_YEARS:
+        file_path = cohort_file_path(panel_level, event_type, event, cohort)
+
+        if not file_path.exists():
+            rows.append(
+                {
+                    "cohort": cohort,
+                    "sharing_atc3": 0,
+                    "not_sharing_atc3": 0,
+                    "total": 0,
+                    "file_exists": 0,
+                }
+            )
+            continue
+
+        df = pd.read_csv(file_path)
+        
+        # Process atc3 based on atc_level
+        if atc_level == 2:
+            df['atc3'] = df['atc3'].astype(str).str[:-1]
+        
+        event_rows = filter_event_rows(df, event_type=event_type, cohort_year=cohort, panel_level=panel_level, period=period)
+
+        sharing, not_sharing, total = count_sharing_for_cohort(
+            cohort_df=event_rows,
+            event_pairs_long=event_pairs_long,
+            atc3_mapping=atc3_mapping,
+            panel_level=panel_level,
+            event=event,
+            cohort_year=cohort,
+            period=period,
+        )
+
+        rows.append(
+            {
+                "cohort": cohort,
+                "sharing_atc3": sharing,
+                "not_sharing_atc3": not_sharing,
+                "total": total,
+                "file_exists": 1,
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("cohort").reset_index(drop=True)
+
+
+def plot_distribution(summary_df: pd.DataFrame, panel_level: str, event_type: str, event: str, out_png: Path, period: int = 0) -> None:
+    """Plot sharing vs not-sharing distribution by cohort."""
+    x = summary_df["cohort"].tolist()
+    sharing = summary_df["sharing_atc3"].tolist()
+    not_sharing = summary_df["not_sharing_atc3"].tolist()
+
+    plt.figure(figsize=(12, 6))
+    plt.bar(x, sharing, label="sharing_atc3")
+    plt.bar(x, not_sharing, bottom=sharing, label="not_sharing_atc3")
+
+    # Add text labels on bars
+    for i, cohort in enumerate(x):
+        # Label for sharing_atc3 (bottom bar)
+        if sharing[i] > 0:
+            plt.text(cohort, sharing[i] / 2, str(sharing[i]), 
+                    ha='center', va='center', fontsize=8, fontweight='bold')
+        
+        # Label for not_sharing_atc3 (top bar)
+        if not_sharing[i] > 0:
+            plt.text(cohort, sharing[i] + not_sharing[i] / 2, str(not_sharing[i]), 
+                    ha='center', va='center', fontsize=8, fontweight='bold')
+
+    plt.xlabel("Cohort Year")
+    plt.ylabel("Number of Event Observations")
+    plt.title(
+        f"ATC3 Sharing Distribution | event={event} | event_type={event_type} | level={panel_level} | period={period}"
+    )
+    plt.legend()
+    plt.xticks(x, rotation=45)
+    plt.tight_layout()
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+
+# ============================================================================
+#  Generate cohort CSVs with atc3_sharing column
+# ============================================================================
+
+def compute_sharing_set(
+    cohort_df: pd.DataFrame,
+    event_pairs_long: pd.DataFrame,
+    atc3_mapping: pd.DataFrame,
+    panel_level: str,
+    event: str,
+    event_type: str,
+    cohort_year: int,
+    periods: list[int] | None = None,
+) -> set[tuple[str, str]]:
+    """Return the set of (BoardName, product) pairs that are sharing ATC3.
+
+    A treated (BoardName, product) is sharing_atc3 if, in *any* of the
+    specified ``periods`` relative to the cohort year, its ATC3 peers
+    (from atc3_mapping) include at least one of its interlock partners
+    (from event_pairs_long).
+
+    Control units (non-treated) are never tagged as sharing.
+
+    Parameters
+    ----------
+    periods : list[int]
+        Relative periods to check (e.g. [0] = event year only).
+    """
+    if periods is None:
+        periods = ATC3_SHARING_PERIODS
+
+    sharing_pairs: set[tuple[str, str]] = set()
+
+    for period in periods:
+        # Get treated rows in this period
+        event_rows = filter_event_rows(
+            cohort_df, event_type=event_type,
+            cohort_year=cohort_year, panel_level=panel_level,
+            period=period,
+        )
+        if event_rows.empty:
+            continue
+
+        required_cols = ["BoardName", "year", "product", "atc3"]
+
+        obs = event_rows[required_cols].copy().reset_index(drop=True)
+        obs["obs_id"] = obs.index
+        key_cols = ["year", "product", "atc3", "BoardName"]
+
+        # ATC3 peers
+        cand = obs.merge(
+            atc3_mapping[key_cols + ["BoardNamePair"]], on=key_cols, how="left"
+        )
+        cand = cand.dropna(subset=["BoardNamePair"]).copy()
+        if cand.empty:
+            continue
+
+        # Event partners at the cohort year
+        evt = event_pairs_long[
+            (event_pairs_long["event"] == event)
+            & (event_pairs_long["year"] == cohort_year)
+        ][["BoardName", "BoardNamePair"]].copy()
+
+        matched = cand.merge(evt, on=["BoardName", "BoardNamePair"], how="inner")
+
+        for _, row in matched[["BoardName", "product"]].drop_duplicates().iterrows():
+            sharing_pairs.add((row["BoardName"], row["product"]))
+
+    return sharing_pairs
+
+
+def add_atc3_sharing_column(
+    cohort_df: pd.DataFrame,
+    event_pairs_long: pd.DataFrame,
+    atc3_mapping: pd.DataFrame,
+    panel_level: str,
+    event: str,
+    event_type: str,
+    cohort_year: int,
+    periods: list[int] | None = None,
+) -> pd.DataFrame:
+    """Return cohort_df with an ``atc3_sharing`` 0/1 column added.
+
+    The label is constant across all years for a given (BoardName, product).
+    Control units are always 0.
+    """
+    sharing_pairs = compute_sharing_set(
+        cohort_df, event_pairs_long, atc3_mapping,
+        panel_level, event, event_type, cohort_year, periods,
+    )
+
+    df = cohort_df.copy()
+    if sharing_pairs:
+        sharing_idx = df.set_index(["BoardName", "product"]).index.isin(sharing_pairs)
+        df["atc3_sharing"] = sharing_idx.astype(int)
+    else:
+        df["atc3_sharing"] = 0
+    return df
+
+
+def add_atc3_sharing_column_for_years(
+    cohort_df: pd.DataFrame,
+    event_pairs_long: pd.DataFrame,
+    atc3_mapping: pd.DataFrame,
+    panel_level: str,
+    event: str,
+    event_type: str,
+    cohort_years: list[int],
+    periods: list[int] | None = None,
+) -> pd.DataFrame:
+    """Add atc3_sharing using a shared merge pipeline over multiple cohort years."""
+    sharing_pairs: set[tuple[str, str]] = set()
+    for cohort_year in cohort_years:
+        sharing_pairs |= compute_sharing_set(
+            cohort_df=cohort_df,
+            event_pairs_long=event_pairs_long,
+            atc3_mapping=atc3_mapping,
+            panel_level=panel_level,
+            event=event,
+            event_type=event_type,
+            cohort_year=cohort_year,
+            periods=periods,
+        )
+
+    df = cohort_df.copy()
+    if sharing_pairs:
+        sharing_idx = df.set_index(["BoardName", "product"]).index.isin(sharing_pairs)
+        df["atc3_sharing"] = sharing_idx.astype(int)
+    else:
+        df["atc3_sharing"] = 0
+    return df
+
+
+def generate_all_cohort_data_with_atc3sharing(
+    atc_level: int = 1,
+    periods: list[int] | None = None,
+) -> None:
+    """Iterate every balanced cohort CSV under cohort_data/, add atc3_sharing,
+    and save the result under cohort_data_with_atc3sharing/ mirroring the
+    original directory structure.
+
+    Only ``_balanced.csv`` files are processed.
+    """
+    event_pairs_long = load_event_pairs()
+
+    for panel_level in PANEL_LEVELS:
+        atc3_mapping = load_atc3_mapping(panel_level, atc_level=atc_level)
+
+        for event_type in EVENT_TYPES:
+            for control_folder in CONTROL_FOLDERS:
+                src_dir = COHORT_ROOT / panel_level / event_type / control_folder
+                if not src_dir.exists():
+                    continue
+
+                dst_dir = COHORT_OUT_ROOT / panel_level / event_type / control_folder
+                dst_dir.mkdir(parents=True, exist_ok=True)
+
+                for event in EVENTS:
+                    for f in sorted(src_dir.glob(f"{event}_{panel_level}_cohort_*_balanced.csv")):
+                        # Extract cohort year from filename
+                        # e.g. "direct_interlock_year_cohort_2012_balanced.csv"
+                        #   or "direct_interlock_year_cohort_2012_first_event_balanced.csv"
+                        stem = f.stem  # without .csv
+                        parts = stem.split("_cohort_")
+                        if len(parts) != 2:
+                            continue
+                        year_part = parts[1].replace("_first_event_balanced", "").replace("_balanced", "")
+                        try:
+                            cohort_year = int(year_part)
+                        except ValueError:
+                            continue
+
+                        df = pd.read_csv(f)
+
+                        df_proc = apply_atc_level(df, atc_level=atc_level)
+                        df_out = add_atc3_sharing_column_for_years(
+                            cohort_df=df_proc,
+                            event_pairs_long=event_pairs_long,
+                            atc3_mapping=atc3_mapping,
+                            panel_level=panel_level,
+                            event=event,
+                            event_type=event_type,
+                            cohort_years=[cohort_year],
+                            periods=periods,
+                        )
+
+                        # If atc_level==2, restore original atc3 values for output
+                        if atc_level == 2:
+                            df_out["atc3"] = df["atc3"]
+
+                        out_path = dst_dir / f.name
+                        df_out.to_csv(out_path, index=False)
+
+                    print(f"  [{panel_level}/{event_type}/{control_folder}] {event} done")
+
+    print(f"\nAll cohort data with atc3_sharing saved to: {COHORT_OUT_ROOT}")
+
+
+def generate_all_staggered_data_with_atc3sharing(
+    atc_level: int = 1,
+    periods: list[int] | None = None,
+) -> None:
+    """Process all staggered balanced files and mirror output folder structure."""
+    event_pairs_long = load_event_pairs()
+
+    for panel_level in PANEL_LEVELS:
+        atc3_mapping = load_atc3_mapping(panel_level, atc_level=atc_level)
+        src_dir = STAGGERED_ROOT / staggered_level_folder(panel_level)
+        if not src_dir.exists():
+            continue
+
+        for f in sorted(src_dir.glob("staggered_firm_level_panel_*_balanced.csv")):
+            parsed = parse_staggered_file_name(f.name)
+            if parsed is None:
+                continue
+            if parsed["panel_level"] != panel_level:
+                continue
+
+            event = parsed["event"]
+            control_type = parsed["control_type"]
+            control_folder = STAGGERED_CONTROL_FOLDER_MAP[control_type]
+            event_type = "first_event"
+
+            df = pd.read_csv(f)
+            df_proc = apply_atc_level(df, atc_level=atc_level)
+            cohort_years = (
+                df_proc["first_event_year"].dropna().astype(int).sort_values().unique().tolist()
+            )
+
+            df_out = add_atc3_sharing_column_for_years(
+                cohort_df=df_proc,
+                event_pairs_long=event_pairs_long,
+                atc3_mapping=atc3_mapping,
+                panel_level=panel_level,
+                event=event,
+                event_type=event_type,
+                cohort_years=cohort_years,
+                periods=periods,
+            )
+
+            if atc_level == 2:
+                df_out["atc3"] = df["atc3"]
+
+            out_dir = STAGGERED_OUT_ROOT / panel_level / event_type / control_folder
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f.name
+            df_out.to_csv(out_path, index=False)
+            print(f"Saved: {out_path}")
+
+    print(f"\nAll staggered data with atc3_sharing saved to: {STAGGERED_OUT_ROOT}")
+
+
+def build_distribution_for_staggered_file(
+    file_path: Path,
+    panel_level: str,
+    event: str,
+    event_pairs_long: pd.DataFrame,
+    atc3_mapping: pd.DataFrame,
+    atc_level: int = 1,
+    period: int = 0,
+) -> pd.DataFrame:
+    """Aggregate sharing counts by cohort year from one staggered file."""
+    df = pd.read_csv(file_path)
+    df_proc = apply_atc_level(df, atc_level=atc_level)
+
+    rows = []
+    for cohort in COHORT_YEARS:
+        event_rows = filter_event_rows(
+            df=df_proc,
+            event_type="first_event",
+            cohort_year=cohort,
+            panel_level=panel_level,
+            period=period,
+        )
+
+        sharing, not_sharing, total = count_sharing_for_cohort(
+            cohort_df=event_rows,
+            event_pairs_long=event_pairs_long,
+            atc3_mapping=atc3_mapping,
+            panel_level=panel_level,
+            event=event,
+            cohort_year=cohort,
+            period=period,
+        )
+
+        rows.append(
+            {
+                "cohort": cohort,
+                "sharing_atc3": sharing,
+                "not_sharing_atc3": not_sharing,
+                "total": total,
+                "file_exists": 1,
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("cohort").reset_index(drop=True)
+
+
+def period_suffix(period: int) -> str:
+    """Return filename suffix for given period."""
+    if period == 0:
+        return ""
+    elif period < 0:
+        return f"_pre_{abs(period)}"
+    else:
+        return f"_post_{period}"
+
+
+def main() -> None:
+    # --- Step 1: Generate data with atc3_sharing column ---
+    print("=" * 60)
+    print("Generating cohort/staggered data with atc3_sharing (atc_level=2, period=0) ...")
+    print("=" * 60)
+    generate_all_cohort_data_with_atc3sharing(atc_level=2, periods=[0])
+    generate_all_staggered_data_with_atc3sharing(atc_level=2, periods=[0])
+
+    # --- Step 2: Plot sharing distributions ---
+    print("\n" + "=" * 60)
+    print("Plotting cohort/staggered sharing distributions ...")
+    print("=" * 60)
+    event_pairs_long = load_event_pairs()
+
+    for period in PERIODS:
+        p_suffix = period_suffix(period)
+
+        for atc_level in [2]: # [1, 2]
+            level_suffix = "" if atc_level == 1 else "_level2"
+            print(f"\n  ATC Level {atc_level}")
+
+            for panel_level in PANEL_LEVELS:
+                atc3_mapping = load_atc3_mapping(panel_level, atc_level=atc_level)
+
+                for event_type in EVENT_TYPES:
+                    for event in EVENTS:
+                        summary = build_distribution_for_config(
+                            panel_level=panel_level,
+                            event_type=event_type,
+                            event=event,
+                            event_pairs_long=event_pairs_long,
+                            atc3_mapping=atc3_mapping,
+                            atc_level=atc_level,
+                            period=period,
+                        )
+
+                        out_dir = FIG_ROOT / panel_level / event_type
+                        stem = f"sharing_atc3_{event}_{event_type}_{panel_level}{level_suffix}{p_suffix}"
+                        out_png = out_dir / f"{stem}.png"
+
+                        plot_distribution(summary, panel_level, event_type, event, out_png, period=period)
+
+                        print(f"Saved: {out_png}")
+
+                # staggered_data is always first_event by construction
+                src_dir = STAGGERED_ROOT / staggered_level_folder(panel_level)
+                if not src_dir.exists():
+                    continue
+
+                for f in sorted(src_dir.glob("staggered_firm_level_panel_*_balanced.csv")):
+                    parsed = parse_staggered_file_name(f.name)
+                    if parsed is None:
+                        continue
+                    if parsed["panel_level"] != panel_level:
+                        continue
+
+                    event = parsed["event"]
+                    control_type = parsed["control_type"]
+                    control_folder = STAGGERED_CONTROL_FOLDER_MAP[control_type]
+
+                    summary = build_distribution_for_staggered_file(
+                        file_path=f,
+                        panel_level=panel_level,
+                        event=event,
+                        event_pairs_long=event_pairs_long,
+                        atc3_mapping=atc3_mapping,
+                        atc_level=atc_level,
+                        period=period,
+                    )
+
+                    out_dir = STAGGERED_FIG_ROOT / panel_level / "first_event" / control_folder
+                    stem = (
+                        f"sharing_atc3_{event}_first_event_"
+                        f"{panel_level}_{control_type}{level_suffix}{p_suffix}"
+                    )
+                    out_png = out_dir / f"{stem}.png"
+
+                    plot_distribution(
+                        summary_df=summary,
+                        panel_level=panel_level,
+                        event_type="first_event",
+                        event=event,
+                        out_png=out_png,
+                        period=period,
+                    )
+
+                    print(f"Saved: {out_png}")
+
+
+if __name__ == "__main__":
+    main()
