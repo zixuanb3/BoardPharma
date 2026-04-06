@@ -1,19 +1,28 @@
 r"""
-OVERVIEW:
-This module creates event study panels at the firm level, linking board interlocks and 
-director transitions with firm-level SSR Data. 
+Purpose:
+Build firm-level event-study panels for SSR pharma firms under multiple treatment concepts.
+The script supports both year and quarter panels, and balanced-sample tagging via stay_x_years and a configurable balance window requirement.
 
-INPUT:
-- boardex_ssr_price_sample.csv: SSR (pharmaceutical firms) price and quantity data
-- boardex_interlock_direct_firmpair.dta: Direct board interlock events (firm pairs)
-- boardex_interlock_indirect_firmpair.dta: Indirect board interlock events (firm pairs)
-- boardex_pharma.dta: Director transition events to/from pharmaceutical firms
+Process:
+- Build SSR base panel at the selected panel_level (year or quarter).
+- Construct treatment events by event_type:
+    direct/indirect interlock use symmetric firm-pair links;
+    to B still in A / to B not in A use directional director-move events on destination firm B.
+- Apply stay_x_years so treatment requires forward persistence.
+- In quarter mode, event and stay flags are placed in Q1 of the event year.
+- Mark first-event and event-year indicators, then compute balance tags using
+    balance_window = (start_offset, end_offset), i.e., t+start through t+end.
+- Export panel files to data/{panel_level}-level.
 
-OUTPUT:
-- ssr_firm_panel_direct_interlock.csv: Panel with direct interlock events
-- ssr_firm_panel_indirect_interlock.csv: Panel with indirect interlock events
-- ssr_firm_panel_to_B_still_in_A.csv: Panel with transitions while staying on origin board
-- ssr_firm_panel_to_B_not_in_A.csv: Panel with transitions after leaving origin board
+Input:
+- InterimData/boardex_ssr_price_sample.csv
+- InterimData/boardex_interlock_direct_firmpair.dta
+- InterimData/boardex_interlock_indirect_firmpair.dta
+- InterimData/boardex_pharma.dta
+
+Output:
+- data/year-level/ssr_firm_panel_*.csv
+- data/quarter-level/ssr_firm_panel_*.csv
 """
 
 import pathlib
@@ -33,9 +42,40 @@ OUTPUT_BASE_PATH = PROJECT_ROOT / "data"
 OUTPUT_BASE_PATH.mkdir(parents=True, exist_ok=True)
 
 
+# ========================== USER CONFIG ==========================
+# event_types:
+# - "direct interlock": symmetric firm-pair interlock treatment
+# - "indirect interlock": symmetric firm-pair indirect interlock treatment
+# - "to B still in A": directional director-move treatment (destination B) while still on A
+# - "to B not in A": directional director-move treatment (destination B) after leaving A
+#
+# panel_levels:
+# - "year": yearly panel
+# - "quarter": quarterly panel (event/stay indicator set in Q1 only)
+#
+# stay_x_years:
+# - persistence filter for treatment validity
+#
+# balance_window:
+# - balanced-window rule as (start_offset, end_offset)
+# - e.g. (-4, 3) means require periods from t-4 to t+3
+RUN_CONFIG = {
+    "event_types": [
+        "direct interlock",
+        "indirect interlock",
+        "to B not in A",
+        "to B still in A",
+    ],
+    "panel_levels": ["quarter"],
+    "stay_x_years": 3,
+    "balance_window": (-4, 3),
+}
+# ===============================================================
+
+
 def load_ssr_yearly() -> pd.DataFrame:
     """
-    Load and aggregate SSR (pharmaceutical firm) price data to yearly level.
+    Load and aggregate SSR data to firm-product-year.
     """
     ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv")
     ssr = ssr[["BoardName", "year", "product", "atc3", "revenue", "quantity"]]
@@ -49,22 +89,35 @@ def load_ssr_yearly() -> pd.DataFrame:
 
 
 class EventStudyPanelSSR:
-    def __init__(self, event_type: str, panel_level: str = "year", stay_x_years: int = 3):
+    def __init__(
+        self,
+        event_type: str,
+        panel_level: str = "year",
+        stay_x_years: int = 3,
+        balance_window: tuple[int, int] = (-4, 3),
+    ):
         self.event_type = event_type
         self.panel_level = panel_level.lower()
         self.stay_x_years = stay_x_years
         self.stay_col = f"stay_{stay_x_years}_years"
+        self.balance_window = balance_window
 
+        if self.stay_x_years < 1:
+            raise ValueError("stay_x_years must be >= 1")
         if self.panel_level not in {"year", "quarter"}:
             raise ValueError("panel_level must be either 'year' or 'quarter'")
+        if len(self.balance_window) != 2 or self.balance_window[0] > self.balance_window[1]:
+            raise ValueError("balance_window must be a tuple(start_offset, end_offset) with start <= end")
             
         self.ssr_yearly = load_ssr_yearly()
         self.ssr_base = self._build_ssr_base()
 
     def _build_ssr_base(self) -> pd.DataFrame:
+        # Year mode keeps firm-product-year observations as-is.
         if self.panel_level == "year":
             return self.ssr_yearly
 
+        # Quarter mode rebuilds the base at firm-product-year-quarter granularity.
         ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv")
         ssr = ssr[["BoardName", "year", "quarter", "product", "atc3", "revenue", "quantity"]]
         quarterly = (
@@ -76,20 +129,27 @@ class EventStudyPanelSSR:
         quarterly["quarter"] = quarterly["quarter"].astype(np.int8)
         return quarterly
 
-    @staticmethod
-    def _required_periods(event_year: int, panel_level: str) -> set:
-        if panel_level == "quarter":
-            return {(y, q) for y in range(event_year - 1, event_year + 2) for q in (1, 2, 3, 4)}
-        return set(range(event_year - 1, event_year + 2))
+    def _required_periods(self, event_year: int) -> set:
+        # Balanced-window requirement: include all periods from t+start to t+end.
+        start_offset, end_offset = self.balance_window
+        if self.panel_level == "quarter":
+            return {
+                (y, q)
+                for y in range(event_year + start_offset, event_year + end_offset + 1)
+                for q in (1, 2, 3, 4)
+            }
+        return set(range(event_year + start_offset, event_year + end_offset + 1))
 
     @staticmethod
     def _event_mask(df: pd.DataFrame, year: int, boards: set, panel_level: str) -> pd.Series:
+        # Quarterly panels register event-year flags in Q1 only.
         mask = (df["year"] == year) & df["BoardName"].isin(boards)
         if panel_level == "quarter" and "quarter" in df.columns:
             mask = mask & (df["quarter"] == 1)
         return mask
 
     def load_event_data(self) -> pd.DataFrame:
+        # event_type controls both data source and treatment meaning.
         event_files = {
             "direct interlock": "boardex_interlock_direct_firmpair.dta",
             "indirect interlock": "boardex_interlock_indirect_firmpair.dta",
@@ -103,6 +163,7 @@ class EventStudyPanelSSR:
         return pd.read_stata(INTERIM_DATA_PATH / event_files[self.event_type])
 
     def _mark_balance_panel(self, group: pd.DataFrame, event_col: str) -> pd.DataFrame:
+        # One balance tag per event definition (first event or event_year).
         balance_col = "balance_panel_first" if event_col == "first_event" else f"balance_panel_{event_col.split('_')[-1]}"
         group = group.copy()
         group[balance_col] = 0
@@ -114,18 +175,20 @@ class EventStudyPanelSSR:
         if treated.empty or treated.iloc[0][self.stay_col] != 1:
             return group
 
+        # Balanced flag requires full coverage of the configured balance window.
         event_year = int(treated.iloc[0]["year"])
         if self.panel_level == "quarter" and "quarter" in group.columns:
             observed_periods = set(zip(group["year"].astype(int), group["quarter"].astype(int)))
         else:
             observed_periods = set(group["year"].astype(int))
 
-        if self._required_periods(event_year, self.panel_level).issubset(observed_periods):
+        if self._required_periods(event_year).issubset(observed_periods):
             group[balance_col] = 1
         return group
 
     @staticmethod
     def _add_event_year_columns(df: pd.DataFrame, event_df: pd.DataFrame, panel_level: str) -> pd.DataFrame:
+        # event_YYYY columns store whether a board is treated in that calendar year.
         event_years = sorted(event_df["year"].unique())
         for y in event_years:
             df[f"event_{int(y)}"] = 0
@@ -141,10 +204,10 @@ class EventStudyPanelSSR:
         return df.groupby("BoardName", group_keys=False).apply(assign)
 
     def _build_board_transitions(self, pharma: pd.DataFrame) -> pd.DataFrame:
-        # 1. Store BoardName's inSSR mapping for final checking
+        # Keep inSSR mapping for origin/destination validation.
         board_inssr = pharma.dropna(subset=["BoardName"]).set_index("BoardName")["inSSR"].to_dict()
 
-        # 2. Extract ALL board holdings WITHOUT filtering inSSR to correctly capture gaps
+        # Keep full board history first; filtering too early can hide true year-to-year moves.
         pharma_clean = pharma.dropna(subset=["DirectorID", "year", "BoardName"])
         grouped = (
             pharma_clean.groupby(["DirectorID", "year"], as_index=False)
@@ -153,18 +216,18 @@ class EventStudyPanelSSR:
             .reset_index(drop=True)
         )
 
-        # 3. Build fast lookup dictionary: (DirectorID, Year) -> {Boards...}
+        # Fast lookup for persistence checks used by stay_x_years.
         board_lookup = {
             (did, int(y)): set(boards)
             for did, y, boards in grouped[["DirectorID", "year", "BoardName"]].itertuples(index=False)
         }
 
-        # 4. Process valid transitions step-by-step
+        # Build directional transitions from prior-year boards (A) to new boards (B).
         rows = []
         for did, year, current in grouped[["DirectorID", "year", "BoardName"]].itertuples(index=False):
             year = int(year)
             
-            # Use EXACT previous year! (not just the last observed record)
+            # Require consecutive years so event timing is not backfilled across gaps.
             previous = board_lookup.get((did, year - 1))
             if not previous:
                 continue
@@ -173,9 +236,9 @@ class EventStudyPanelSSR:
             if not new_boards:
                 continue
             
-            # Check all transitions from previous year's boards to current year's NEW boards
+            # Evaluate all A -> B combinations for this director-year.
             for b_last, b_new in product(previous, new_boards):
-                # Apply inSSR filter AT THE END: both A and B must be pharma
+                # Keep pharma-to-pharma transitions only.
                 if board_inssr.get(b_last, 0) != 1 or board_inssr.get(b_new, 0) != 1:
                     continue
                     
@@ -183,7 +246,7 @@ class EventStudyPanelSSR:
                 to_still = int(b_last in current_set and b_new in current_set)
                 to_not = int(b_last not in current_set and b_new in current_set)
 
-                # Check dynamic Stay X Years criteria
+                # stay_x_years: destination board B must persist in future years.
                 stay_met = True
                 if self.stay_x_years > 1:
                     for offset in range(1, self.stay_x_years):
@@ -242,6 +305,7 @@ class EventStudyPanelSSR:
         )
 
         if self.panel_level == "quarter":
+            # Quarterly output expands each treated board-year into Q1-Q4; event is anchored at Q1.
             events = events.loc[events.index.repeat(4)].reset_index(drop=True)
             events["quarter"] = events.groupby(["BoardName", "year"]).cumcount() + 1
             events["quarter"] = events["quarter"].astype(np.int8)
@@ -258,6 +322,7 @@ class EventStudyPanelSSR:
             first_mask = first_mask & panel["quarter"].eq(1)
         panel["first_event"] = first_mask.astype(int)
         
+        # Missing event/stay entries are untreated observations.
         panel[[event_col, self.stay_col]] = panel[[event_col, self.stay_col]].fillna(0).astype(np.int8)
 
         event_years = sorted(events["year"].unique())
@@ -277,6 +342,7 @@ class EventStudyPanelSSR:
         panel = panel.drop(columns=[c for c in panel.columns if c.startswith("event_")])
         panel = self._add_event_year_columns(panel, events, self.panel_level)
 
+        # Keep a unified event column name for downstream scripts.
         panel = panel.rename(columns={event_col: "event"})
         ordered = panel.columns.tolist()
         ordered.insert(4, ordered.pop(ordered.index("event")))
@@ -284,6 +350,7 @@ class EventStudyPanelSSR:
 
     def _build_interlock_panel(self) -> pd.DataFrame:
         event_data = self.load_event_data()
+        # Restrict interlock events to SSR boards so treatment is defined on panel universe.
         valid_boards = set(self.ssr_yearly["BoardName"].dropna().unique())
         event_data = event_data.loc[
             event_data["BoardName1"].isin(valid_boards) & event_data["BoardName2"].isin(valid_boards)
@@ -301,6 +368,7 @@ class EventStudyPanelSSR:
         pair_year_set = set(pair_year[["pair_min", "pair_max", "year"]].itertuples(index=False, name=None))
 
         def _check_stay(r):
+            # stay_x_years for interlocks: the same pair must remain linked in future years.
             if self.stay_x_years <= 1:
                 return 1
             for offset in range(1, self.stay_x_years):
@@ -323,6 +391,7 @@ class EventStudyPanelSSR:
         event_board_year[self.stay_col] = event_board_year[self.stay_col].astype(np.int8)
 
         if self.panel_level == "quarter":
+            # Quarter mode places treatment and stay markers in Q1.
             event_board_year = event_board_year.loc[event_board_year.index.repeat(4)].reset_index(drop=True)
             event_board_year["quarter"] = event_board_year.groupby(["BoardName", "year"]).cumcount() + 1
             event_board_year["quarter"] = event_board_year["quarter"].astype(np.int8)
@@ -366,7 +435,8 @@ class EventStudyPanelSSR:
             lambda r: int(
                 pd.notna(r["first_event_year"])
                 and r["first_event_stay"] == 1
-                and self._required_periods(int(r["first_event_year"]), self.panel_level).issubset(
+                # first-event balance uses the same configurable balance_window rule.
+                and self._required_periods(int(r["first_event_year"])).issubset(
                     periods_lookup.get((r["BoardName"], r["product"]), set())
                 )
             ),
@@ -374,7 +444,7 @@ class EventStudyPanelSSR:
         ).astype(np.int8)
 
         for y in event_years:
-            need_periods = self._required_periods(int(y), self.panel_level)
+            need_periods = self._required_periods(int(y))
             event_col = f"event_{int(y)}"
             bal_col = f"balance_panel_{int(y)}"
             
@@ -391,6 +461,7 @@ class EventStudyPanelSSR:
                 if bn in stay_firms and need_periods.issubset(periods)
             }
             
+            # Board-product units qualify only if both stay and window-coverage conditions hold.
             merged[bal_col] = (
                 pd.MultiIndex.from_frame(merged[["BoardName", "product"]]).isin(qualified).astype(np.int8)
             )
@@ -401,12 +472,14 @@ class EventStudyPanelSSR:
         output_path = OUTPUT_BASE_PATH / f"{self.panel_level}-level"
         output_path.mkdir(parents=True, exist_ok=True)
 
-        if self.event_type in ["to B not in A", "to B still in A"]:
+        if self.event_type == "to B still in A":
             still_panel = self._build_to_b_panel(mode="still")
-            not_panel = self._build_to_b_panel(mode="not")
-
             if not still_panel.empty:
                 still_panel.to_csv(output_path / f"ssr_firm_panel_to_B_still_in_A.csv", index=False)
+            return
+
+        if self.event_type == "to B not in A":
+            not_panel = self._build_to_b_panel(mode="not")
             if not not_panel.empty:
                 not_panel.to_csv(output_path / f"ssr_firm_panel_to_B_not_in_A.csv", index=False)
             return
@@ -423,16 +496,29 @@ class EventStudyPanelSSR:
 
 
 def main() -> None:
-    panel_levels = ["quarter"]
-    event_types = ["direct interlock", "indirect interlock", "to B not in A", "to B still in A"] 
-    
-    # You can customize stay_x_years. Example below uses 3 (same as original code)
-    stay_req = 3
+    def ensure_list(v):
+        # Allow both single-value and list-style config inputs.
+        if isinstance(v, str):
+            return [v]
+        return list(v)
+
+    panel_levels = ensure_list(RUN_CONFIG["panel_levels"])
+    event_types = ensure_list(RUN_CONFIG["event_types"])
+    stay_req = int(RUN_CONFIG["stay_x_years"])
+    balance_window = tuple(RUN_CONFIG["balance_window"])
     
     for panel_level in panel_levels:
         for event_type in event_types:
-            print(f"Generating panel: '{event_type}' at {panel_level} level with stay_{stay_req}_years requirement...")
-            EventStudyPanelSSR(event_type, panel_level=panel_level, stay_x_years=stay_req).merge_event_data()
+            print(
+                f"Generating panel: '{event_type}' | level={panel_level} | "
+                f"stay_{stay_req}_years | balance_window=t{balance_window[0]:+d}..t{balance_window[1]:+d}"
+            )
+            EventStudyPanelSSR(
+                event_type,
+                panel_level=panel_level,
+                stay_x_years=stay_req,
+                balance_window=balance_window,
+            ).merge_event_data()
     
     print("All panels generated!")
 

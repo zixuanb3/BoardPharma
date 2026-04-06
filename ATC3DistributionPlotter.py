@@ -1,25 +1,26 @@
 """
-Build and plot sharing_atc3 vs not_sharing_atc3 counts across cohorts.
+Purpose:
+Generate ATC-sharing labels for cohort and staggered files, then plot sharing vs
+non-sharing distributions across cohort years.
 
-For each configuration:
-- event in {direct_interlock, indirect_interlock, to_B_not_in_A, to_B_still_in_A}
-- event_type in {event, first_event}
-- panel_level in {year, quarter}
-- atc_level in {1, 2}
-  - 1: Use atc3 as is
-  - 2: Remove last character from atc3 (e.g., 'A01A' -> 'A01')
+Process:
+- Load event-partner links and ATC mapping tables.
+- For each configured design, label treated firm-product units as atc3_sharing
+    when their ATC peers overlap with event partners.
+- Save enriched cohort and staggered files under *_with_atc3sharing folders.
+- Build diagnostic plots for configured periods.
 
-The script reads:
+Input:
 - data/atc3mapping/atc3mapping_year_level[_level2].csv
-- data/cohort_data/{panel_level}/{event_type}/Pure Control/{event}_{panel_level}_cohort_{YYYY}[... ]_balanced.csv
-- data/staggered_data/{year-level|quarter-level}/staggered_firm_level_panel_{panel}_{event}_{control}_balanced.csv
+- data/cohort_data/...
+- data/staggered_data/...
 - data/event.xlsx
 
-And writes:
+Output:
 - data/cohort_data_with_atc3sharing/...
 - data/staggered_data_with_atc3sharing/...
-- figures/cohort_sharing_atc3/{panel_level}/{event_type}/sharing_atc3_{event}_{event_type}_{panel_level}[_level2].png
-- figures/staggered_sharing_atc3/{panel_level}/first_event/{control_folder}/...
+- figures/cohort_sharing_atc3/...
+- figures/staggered_sharing_atc3/...
 """
 
 import ast
@@ -39,27 +40,64 @@ EVENT_XLSX = PROJECT_ROOT / "data" / "event.xlsx"
 FIG_ROOT = PROJECT_ROOT / "figures" / "cohort_sharing_atc3"
 STAGGERED_FIG_ROOT = PROJECT_ROOT / "figures" / "staggered_sharing_atc3"
 
-EVENTS = [
-    "direct_interlock",
-    "indirect_interlock",
-    "to_B_not_in_A",
-    "to_B_still_in_A",
-]
-EVENT_TYPES = ["event", "first_event"]
-PANEL_LEVELS = ["quarter"]  # "year"
-COHORT_YEARS = list(range(2007, 2019))
-PERIODS = list(range(0, 1))  # -1 to 0
+# ========================== USER CONFIG ==========================
+# EVENTS:
+# - Four director-board shocks used to define event-partner networks.
+# - Changing this changes which partner network is used for ATC overlap checks.
+#
+# EVENT_TYPES:
+# - "event" vs "first_event".
+# - Changes whether overlap checks are anchored to every event year or only first event year.
+#
+# PANEL_LEVELS:
+# - "quarter" and/or "year".
+#
+# CONTROL_FOLDERS:
+# - "Not", "Not Yet", "Pure Control".
+# - Controls which cohort-design variants are traversed for enrichment and diagnostics.
+#
+# ATC3_SHARING_PERIODS:
+# - Relative periods used to define saved atc3_sharing labels.
+# - [0] means labels are defined from event-year observations only.
+#
+# PERIODS:
+# - Relative periods used only for plotted diagnostics.
+# - Does not change exported cohort/staggered files.
+#
+# atc_level:
+# - 1 keeps original ATC3.
+# - 2 truncates the last character and coarsens categories.
+# - Coarser ATC usually increases the chance of being tagged as sharing.
+RUN_CONFIG = {
+    "EVENTS": [
+        "direct_interlock",
+        "indirect_interlock",
+        "to_B_not_in_A",
+        "to_B_still_in_A",
+    ],
+    "EVENT_TYPES": ["event", "first_event"],
+    "PANEL_LEVELS": ["quarter"],
+    "CONTROL_FOLDERS": ["Not", "Not Yet", "Pure Control"],
+    "ATC3_SHARING_PERIODS": [0],
+    "PERIODS": [-1, 0],
+    "atc_level": 2,
+    "COHORT_YEARS": list(range(2007, 2019)),
+}
+# ===============================================================
 
-# Control group folders used by StackedEventStudy and CohortPanelMaker
-CONTROL_FOLDERS = ["Not", "Not Yet", "Pure Control"]
+EVENTS = RUN_CONFIG["EVENTS"]
+EVENT_TYPES = RUN_CONFIG["EVENT_TYPES"]
+PANEL_LEVELS = RUN_CONFIG["PANEL_LEVELS"]
+CONTROL_FOLDERS = RUN_CONFIG["CONTROL_FOLDERS"]
+ATC3_SHARING_PERIODS = RUN_CONFIG["ATC3_SHARING_PERIODS"]
+PERIODS = RUN_CONFIG["PERIODS"]
+COHORT_YEARS = RUN_CONFIG["COHORT_YEARS"]
+ATC_LEVEL = int(RUN_CONFIG["atc_level"])
+
 STAGGERED_CONTROL_FOLDER_MAP = {
     "not_yet": "Not Yet",
     "pure_control": "Pure Control",
 }
-
-# Period(s) used to determine atc3_sharing status (relative to cohort year).
-# E.g. [0] means check at the event year; [-1, 0] means check at t-1 or t.
-ATC3_SHARING_PERIODS = [0]
 
 
 def staggered_level_folder(panel_level: str) -> str:
@@ -193,10 +231,9 @@ def load_event_pairs() -> pd.DataFrame:
 def filter_event_rows(df: pd.DataFrame, event_type: str, cohort_year: int, panel_level: str, period: int = 0) -> pd.DataFrame:
     """Return treated rows in the period-shifted year.
 
-    1. Filter by first_event_year / event_{cohort_year} to keep only
-       treated observations for this cohort.
-    2. Then keep rows where year == cohort_year + period.
-    For quarter-level data, always uses quarter == 1.
+    Uses first_event_year or event_{cohort_year} to keep treated rows,
+    then keeps year == cohort_year + period.
+    Quarter panels are evaluated at quarter == 1.
     """
     data = df.copy()
     if event_type == "first_event":
@@ -505,12 +542,7 @@ def generate_all_cohort_data_with_atc3sharing(
     atc_level: int = 1,
     periods: list[int] | None = None,
 ) -> None:
-    """Iterate every balanced cohort CSV under cohort_data/, add atc3_sharing,
-    and save the result under cohort_data_with_atc3sharing/ mirroring the
-    original directory structure.
-
-    Only ``_balanced.csv`` files are processed.
-    """
+    """Add atc3_sharing to all balanced cohort files and mirror folder structure."""
     event_pairs_long = load_event_pairs()
 
     for panel_level in PANEL_LEVELS:
@@ -527,10 +559,8 @@ def generate_all_cohort_data_with_atc3sharing(
 
                 for event in EVENTS:
                     for f in sorted(src_dir.glob(f"{event}_{panel_level}_cohort_*_balanced.csv")):
-                        # Extract cohort year from filename
-                        # e.g. "direct_interlock_year_cohort_2012_balanced.csv"
-                        #   or "direct_interlock_year_cohort_2012_first_event_balanced.csv"
-                        stem = f.stem  # without .csv
+                        # Extract cohort year from standard cohort filename patterns.
+                        stem = f.stem
                         parts = stem.split("_cohort_")
                         if len(parts) != 2:
                             continue
@@ -677,14 +707,19 @@ def period_suffix(period: int) -> str:
 
 
 def main() -> None:
-    # --- Step 1: Generate data with atc3_sharing column ---
-    print("=" * 60)
-    print("Generating cohort/staggered data with atc3_sharing (atc_level=2, period=0) ...")
-    print("=" * 60)
-    generate_all_cohort_data_with_atc3sharing(atc_level=2, periods=[0])
-    generate_all_staggered_data_with_atc3sharing(atc_level=2, periods=[0])
+    sharing_periods = list(ATC3_SHARING_PERIODS)
 
-    # --- Step 2: Plot sharing distributions ---
+    # Generate enriched cohort and staggered files.
+    print("=" * 60)
+    print(
+        "Generating cohort/staggered data with atc3_sharing "
+        f"(atc_level={ATC_LEVEL}, periods={sharing_periods}) ..."
+    )
+    print("=" * 60)
+    generate_all_cohort_data_with_atc3sharing(atc_level=ATC_LEVEL, periods=sharing_periods)
+    generate_all_staggered_data_with_atc3sharing(atc_level=ATC_LEVEL, periods=sharing_periods)
+
+    # Plot diagnostics for configured periods.
     print("\n" + "=" * 60)
     print("Plotting cohort/staggered sharing distributions ...")
     print("=" * 60)
@@ -693,7 +728,7 @@ def main() -> None:
     for period in PERIODS:
         p_suffix = period_suffix(period)
 
-        for atc_level in [2]: # [1, 2]
+        for atc_level in [ATC_LEVEL]:
             level_suffix = "" if atc_level == 1 else "_level2"
             print(f"\n  ATC Level {atc_level}")
 

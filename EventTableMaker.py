@@ -1,14 +1,22 @@
 """
-Build firm-year event table with product lists and event-specific partner boards.
+Purpose:
+Build a firm-year event table that combines product lists with event-specific
+partner boards.
 
-Output schema:
-- BoardName
-- product (list of products for BoardName-year)
-- year
-- event
-- BoardNamePair (list of partner boards for that event)
+Process:
+- Build a full BoardName-year timeline from SSR product data.
+- Construct event rows for direct and indirect interlocks with stay_x_years filtering.
+- Construct director-move events (to_B_still_in_A and to_B_not_in_A) with the same
+    stay_x_years persistence rule.
+- Merge events onto the full timeline and export one consolidated table.
 
-Output file:
+Input:
+- InterimData/boardex_ssr_price_sample.csv
+- InterimData/boardex_interlock_direct_firmpair.dta
+- InterimData/boardex_interlock_indirect_firmpair.dta
+- InterimData/boardex_pharma.dta
+
+Output:
 - data/event.xlsx
 """
 
@@ -24,12 +32,23 @@ INTERIM_DATA_PATH = PROJECT_ROOT / "InterimData"
 OUTPUT_PATH = PROJECT_ROOT / "data" / "event.xlsx"
 
 
+# ========================== USER CONFIG ==========================
+# stay_x_years:
+# - Persistence filter used in both interlock and director-move event construction.
+# - Interlocks require the same firm pair to remain linked for future years.
+# - Director moves require destination board B to remain in future board lists.
+RUN_CONFIG = {
+    "stay_x_years": 3,
+}
+# ===============================================================
+
+
 def _sorted_unique_list(values: pd.Series) -> list:
     return sorted(pd.unique(values.dropna()).tolist())
 
 
 def build_base_timeline() -> pd.DataFrame:
-    """Build BoardName-year timeline and product list from SSR data."""
+    """Build complete BoardName-year timeline with product lists."""
     ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv")
     ssr = ssr[["BoardName", "year", "product"]]
     ssr["year"] = ssr["year"].astype(int)
@@ -50,7 +69,7 @@ def build_interlock_events(
     valid_boards: set,
     stay_x_years: int = 3,
 ) -> pd.DataFrame:
-    """Build event rows for direct/indirect interlock with stay-qualified pairs."""
+    """Build direct or indirect interlock events under stay_x_years filtering."""
     if stay_x_years < 1:
         raise ValueError("stay_x_years must be >= 1")
 
@@ -84,7 +103,7 @@ def build_interlock_events(
     if pair_year.empty:
         return pd.DataFrame(columns=["BoardName", "year", "event", "BoardNamePair"])
 
-    # Expand both directions: BoardName1 -> BoardName2 and BoardName2 -> BoardName1.
+    # Expand symmetric pairs so each board receives its partner list.
     left = pair_year.rename(columns={"pair_min": "BoardName", "pair_max": "BoardNamePairItem"})
     right = pair_year.rename(columns={"pair_max": "BoardName", "pair_min": "BoardNamePairItem"})
     pairs = pd.concat([left, right], ignore_index=True)
@@ -107,10 +126,10 @@ def build_transition_rows(pharma: pd.DataFrame, stay_x_years: int = 3) -> pd.Dat
     stay_still_col = f"stay_{stay_x_years}_years_still"
     stay_not_col = f"stay_{stay_x_years}_years_not"
 
-    # 1. Store BoardName's inSSR mapping for final checking
+    # Keep inSSR mapping for final pharma-to-pharma filtering.
     board_inssr = pharma.dropna(subset=["BoardName"]).set_index("BoardName")["inSSR"].to_dict()
 
-    # 2. Extract ALL board holdings WITHOUT filtering inSSR to correctly capture gaps
+    # Keep full board history first so year gaps are preserved.
     pharma_clean = pharma.dropna(subset=["DirectorID", "year", "BoardName"])
     pharma_clean["year"] = pharma_clean["year"].astype(int)
 
@@ -121,18 +140,18 @@ def build_transition_rows(pharma: pd.DataFrame, stay_x_years: int = 3) -> pd.Dat
         .reset_index(drop=True)
     )
 
-    # 3. Build fast lookup dictionary: (DirectorID, Year) -> {Boards...}
+    # Build lookup for consecutive-year and persistence checks.
     board_lookup = {
         (did, int(y)): set(boards)
         for did, y, boards in grouped[["DirectorID", "year", "BoardName"]].itertuples(index=False)
     }
 
-    # 4. Process valid transitions step-by-step
+    # Build directional transitions from prior boards A to new boards B.
     rows = []
     for did, year, current in grouped[["DirectorID", "year", "BoardName"]].itertuples(index=False):
         year = int(year)
         
-        # Use EXACT previous year! (not just the last observed record via shift)
+        # Require exact previous year to avoid backfilling across missing years.
         previous = board_lookup.get((did, year - 1))
         if not previous:
             continue
@@ -141,9 +160,9 @@ def build_transition_rows(pharma: pd.DataFrame, stay_x_years: int = 3) -> pd.Dat
         if not new_boards:
             continue
             
-        # Check all transitions from previous year's boards to current year's NEW boards
+        # Evaluate all A -> B combinations in this director-year.
         for b_last, b_new in product(previous, new_boards):
-            # Apply inSSR filter AT THE END: both A and B must be pharma
+            # Keep only pharma-to-pharma transitions.
             if board_inssr.get(b_last, 0) != 1 or board_inssr.get(b_new, 0) != 1:
                 continue
                 
@@ -178,7 +197,7 @@ def build_transition_rows(pharma: pd.DataFrame, stay_x_years: int = 3) -> pd.Dat
 
 
 def build_transition_events(stay_x_years: int = 3) -> pd.DataFrame:
-    """Build movement events from A-B pair level, keeping only stay-qualified A."""
+    """Build to_B_still_in_A and to_B_not_in_A events with stay_x_years filter."""
     pharma = pd.read_stata(INTERIM_DATA_PATH / "boardex_pharma.dta")
     transitions = build_transition_rows(pharma, stay_x_years=stay_x_years)
 
@@ -188,7 +207,7 @@ def build_transition_events(stay_x_years: int = 3) -> pd.DataFrame:
     stay_still_col = f"stay_{stay_x_years}_years_still"
     stay_not_col = f"stay_{stay_x_years}_years_not"
 
-    # Aggregate at A-B-year level first, then collapse to B-year list of qualified A.
+    # Aggregate at A-B-year level, then collapse to B-year partner lists.
     pair_level = (
         transitions.groupby(["year", "A", "B"], as_index=False)
         .agg(
@@ -225,6 +244,7 @@ def build_transition_events(stay_x_years: int = 3) -> pd.DataFrame:
 
 
 def build_all_events(stay_x_years: int = 3) -> pd.DataFrame:
+    """Build and combine all event types under one persistence setting."""
     ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv", usecols=["BoardName"])
     valid_boards = set(ssr["BoardName"].dropna().unique())
 
@@ -243,19 +263,22 @@ def build_all_events(stay_x_years: int = 3) -> pd.DataFrame:
     transition = build_transition_events(stay_x_years=stay_x_years)
 
     events = pd.concat([direct, indirect, transition], ignore_index=True)
-    # Guarantee uniqueness in case raw source has duplicated pair records.
+    # Deduplicate in case source files contain repeated pair-year entries.
     events = events.drop_duplicates(subset=["BoardName", "year", "event"]).reset_index(drop=True)
     return events
 
 
-def main(stay_x_years: int = 1) -> None:
+def main() -> None:
+    """Run event-table construction using USER CONFIG."""
+    stay_x_years = int(RUN_CONFIG["stay_x_years"])
+
     base = build_base_timeline()
     events = build_all_events(stay_x_years=stay_x_years)
 
-    # Left merge keeps full BoardName-year timeline.
+    # Keep the full timeline even when no event exists in a given year.
     result = base.merge(events, on=["BoardName", "year"], how="left")
 
-    # Keep requested column order.
+    # Export schema for downstream scripts.
     result = result[["BoardName", "product", "year", "event", "BoardNamePair"]]
     result = result.sort_values(["BoardName", "year", "event"], na_position="last").reset_index(drop=True)
 
@@ -266,4 +289,4 @@ def main(stay_x_years: int = 1) -> None:
 
 
 if __name__ == "__main__":
-    main(stay_x_years=3)
+    main()
