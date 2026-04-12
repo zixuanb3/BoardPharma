@@ -1,33 +1,25 @@
 clear all
 set trace off
 
-* ================================================================
-* StackedEventStudy_v4.do
-* Based on v3, but splits results by atc3_sharing (0 vs 1).
-*
-* Data source: data/cohort_data_with_atc3sharing/
-* Output:      figures/stacked_event_study_v4/
-*              logs/stacked_event_study_v4/
-*
-* For each configuration, TWO event-study plots are produced:
-*   - one for atc3_sharing == 1
-*   - one for atc3_sharing == 0
-*
-* Estimators:
-*   csdid              – run separately on each subsample
-*   did_imputation     – hetby(atc3_sharing)
-*   eventstudyinteract – interacted dummies for the two groups
-*   TWFE               – interaction terms event_dummy * atc3_sharing
-* ================================================================
-
-* ================= parameter =================
-* 0: keep original pre-period setting
-* 1: for quarter level, shorten pre-periods to 8 quarters (t-2 years to t-1)
-local shortened_preperiords 0
-if !inlist(`shortened_preperiords', 0, 1) {
-    di as error "shortened_preperiords must be 0 or 1"
-    exit 198
-}
+// ================================================================
+// Purpose:
+// Run stacked event-study estimation on cohort panels with atc3_sharing labels,
+// and report dynamic effects separately for atc3_sharing=0 and atc3_sharing=1.
+//
+// Process:
+// - Loop over panel, event, control, target, standardization, and event_type.
+// - Stack eligible cohort files and build event-time dummies with pre_1 baseline.
+// - Estimate csdid, did_imputation, TWFE, and eventstudyinteract under group split.
+// - Rebuild group-specific coefficient and variance matrices, then export logs and figures.
+//
+// Input:
+// - data/cohort_data_with_atc3sharing/{panel}/{event_type}/{control_folder}/
+//   {event}_{panel}_cohort_{year} with optional first_event suffix and balanced suffix
+//
+// Output:
+// - png figure files under figures/stacked_event_study_sharingatc3/
+// - log files under logs/stacked_event_study_sharingatc3/
+// ================================================================
 
 * ================= path =================
 local code_path "`c(pwd)'"
@@ -51,9 +43,6 @@ local event_types event first_event
 foreach panel_level of local panel_levels {
     local data_path "`data_root'/`panel_level'"
     local output_panel_level "`panel_level'"
-    if "`panel_level'" == "quarter" & `shortened_preperiords' == 1 {
-        local output_panel_level "`panel_level'_shortened"
-    }
     local fig_base_path "`fig_root'/`output_panel_level'"
     local log_base_path "`log_root'/`output_panel_level'"
 
@@ -179,11 +168,6 @@ foreach panel_level of local panel_levels {
                             * -------- import data --------
                             import delimited "`data_file'", clear
 
-                            * -------- optional sample restriction for quarter --------
-                            if "`panel_level'" == "quarter" & `shortened_preperiords' == 1 {
-                                drop if year < (`cohort' - 2)
-                            }
-
                             * -------- standardization --------
                             if "`std'" == "standardize" {
                                 bysort boardname product: egen temp = std(`target')
@@ -191,7 +175,6 @@ foreach panel_level of local panel_levels {
                                 drop temp
                             }
                             else if "`std'" == "normalize" {
-                                * ================= MODIFICATION 2 START =================
                                 * Quarter normalization now uses cohort-year Q1 only.
                                 if "`panel_level'" == "quarter" {
                                     bysort boardname product: gen baseline = `target' if year == `cohort' & quarter == 1
@@ -199,7 +182,6 @@ foreach panel_level of local panel_levels {
                                 else {
                                     bysort boardname product: gen baseline = `target' if year == `cohort'
                                 }
-                                * ================= MODIFICATION 2 END ===================
                                 bysort boardname product: egen baseline_value = max(baseline)
                                 replace `target' = `target' / baseline_value
                                 drop baseline baseline_value
@@ -220,10 +202,6 @@ foreach panel_level of local panel_levels {
                             }
 
                             * -------- generate event dummies --------
-                            * ================= MODIFICATION 1 START =================
-                            * Use the current cohort as the event-time anchor, but
-                            * only light up event-time dummies for the treated units
-                            * in the current stack. Controls must stay at 0.
                             local event_anchor_year `cohort'
 
                             if "`panel_level'" == "year" {
@@ -242,8 +220,7 @@ foreach panel_level of local panel_levels {
                             else {
                                 local event_anchor_q = yq(`event_anchor_year', 1)
                                 gen rel_quarter = yq(year, quarter) - `event_anchor_q' if treated_in_stack == 1
-
-                                local pre_max = cond(`shortened_preperiords' == 1, 8, 4)
+								
                                 forvalues i = 1/4 {
                                     gen pre_`i' = treated_in_stack == 1 & rel_quarter == -`i'
                                 }
@@ -252,7 +229,6 @@ foreach panel_level of local panel_levels {
                                 }
                                 drop rel_quarter
                             }
-                            * ================= MODIFICATION 1 END ===================
 
                             gen data_cohort = `cohort'
 
@@ -293,45 +269,26 @@ foreach panel_level of local panel_levels {
                             gen q_time = yq(year, quarter)
                             format q_time %tq
                             gen event_cohort_q = yq(event_cohort, 1) if !missing(event_cohort)
-
-                            if `shortened_preperiords' == 1 {
-                                local twfe_terms ///
-                                    pre_8 pre_7 pre_6 pre_5 pre_4 pre_3 pre_2 ///
-                                    post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7 ///
-                                    post_8 post_9 post_10 post_11 post_12 post_13 post_14 post_15
-                                local coef_names ///
-                                    pre_8 pre_7 pre_6 pre_5 pre_4 pre_3 pre_2 pre_1 ///
-                                    post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7 ///
-                                    post_8 post_9 post_10 post_11 post_12 post_13 post_14 post_15
-                                local n_pre_nonref 7
-                                local n_post 16
-                                local trimlead 8
-                                local trimlag 15
-                                local xlabel_spec -8(1)15
-                                local did_horizons 0/15
-                                local did_pretrend 8
-                            }
-                            else {
-                                local twfe_terms ///
-                                    pre_4 pre_3 pre_2 ///
-                                    post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
-                                local coef_names ///
-                                    pre_4 pre_3 pre_2 pre_1 ///
-                                    post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7 
-                                local n_pre_nonref 3
-                                local n_post 8
-                                local trimlead 4
-                                local trimlag 7
-                                local xlabel_spec -4(1)7
-                                local did_horizons 0/7
-                                local did_pretrend 2
-                            }
-
+							
+							local twfe_terms ///
+								pre_4 pre_3 pre_2 ///
+								post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
+							local coef_names ///
+								pre_4 pre_3 pre_2 pre_1 ///
+								post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7 
+							local n_pre_nonref 3
+							local n_post 8
+							local trimlead 4
+							local trimlag 7
+							local xlabel_spec -4(1)7
+							local did_horizons 0/7
+							local did_pretrend 2
                             local timevar q_time
                             local gvar event_cohort_q
                             local graph_width 3000
                             local perturb_step 0.15
                         }
+						
                         local n_old = `n_pre_nonref' + `n_post'
                         local n_total = `n_pre_nonref' + 1 + `n_post'
 
@@ -357,51 +314,86 @@ foreach panel_level of local panel_levels {
                             * --- csdid: atc3_sharing == 1 subsample (treated with sharing + all controls) ---
                             preserve
                             drop if treated == 1 & atc3_sharing == 0
-                            cap noi csdid `target', ivar(id) time(`timevar') gvar(`gvar_csdid') agg(event) notyet method(dripw) long rseed(1)
-                            if _rc == 0 {
-                                est store did1_s1
-                            }
-                            else {
-                                di as text "csdid failed for atc3_sharing==1, skipping"
-                            }
+                            csdid `target', ivar(id) time(`timevar') gvar(`gvar_csdid') agg(event) notyet method(dripw) long rseed(1)
+                            est store did1_s1
                             restore
 
                             * --- csdid: atc3_sharing == 0 subsample (treated with no sharing + all controls) ---
                             preserve
                             drop if treated == 1 & atc3_sharing == 1
-                            cap noi csdid `target', ivar(id) time(`timevar') gvar(`gvar_csdid') agg(event) notyet method(dripw) long rseed(1)
-                            if _rc == 0 {
-                                est store did1_s0
-                            }
-                            else {
-                                di as text "csdid failed for atc3_sharing==0, skipping"
-                            }
+                            csdid `target', ivar(id) time(`timevar') gvar(`gvar_csdid') agg(event) notyet method(dripw) long rseed(1)
+                            est store did1_s0
                             restore
                         }
-                        else {
-                            di as text "control=not, skipping csdid"
-                        }
+						
+
 
                         * ============================================================
                         *  2. did_imputation — hetby(atc3_sharing)
                         * ============================================================
-                        * Note: atc3_sharing for controls is 0, so hetby splits treated
-                        * observations by their atc3_sharing status. Controls are shared.
-                        * We make a copy of atc3_sharing that is missing for controls
-                        * so hetby only applies to treated units.
                         gen atc3_sharing_het = atc3_sharing if treated == 1
                         replace atc3_sharing_het = 0 if treated == 0
-
-                        cap noi did_imputation `target' id `timevar' event_cohort_did_imputation, ///
+						
+                        did_imputation `target' id `timevar' event_cohort_did_imputation, ///
                             fe(id `timevar') horizons(`did_horizons') pretrends(`did_pretrend') ///
                             hetby(atc3_sharing_het) autosample tol(0.1)
-                        local did2_ok = (_rc == 0)
-                        if `did2_ok' {
-                            est store did2
-                        }
-                        else {
-                            di as text "did_imputation with hetby failed, skipping"
-                        }
+                        
+                        est store did2
+						matrix did2_b_full = e(b)
+						matrix did2_V_full = e(V)
+
+						* Identify column positions for each group
+						local did2_ncol = colsof(did2_b_full)
+						local did2_names : colnames did2_b_full
+
+						foreach sval in 0 1 {
+							matrix did2_b_s`sval' = J(1, `n_total', .)
+							matrix did2_V_s`sval' = J(`n_total', `n_total', 0)
+
+							tempname col_map
+							matrix `col_map' = J(1, `n_total', 0)
+
+							* Unified mapping: pre_K -> preK, post_h -> tauh_s
+							forvalues i = 1/`n_total' {
+								local col_name : word `i' of `coef_names'
+								local cname ""
+
+								if substr("`col_name'", 1, 4) == "pre_" {
+									local k = substr("`col_name'", 5, .)
+									local cname "pre`k'"
+								}
+								else if substr("`col_name'", 1, 5) == "post_" {
+									local h = substr("`col_name'", 6, .)
+									local cname "tau`h'_`sval'"
+								}
+
+								if "`cname'" != "" {
+									forvalues c = 1/`did2_ncol' {
+										local cn : word `c' of `did2_names'
+										if "`cn'" == "`cname'" {
+											matrix `col_map'[1, `i'] = `c'
+											matrix did2_b_s`sval'[1, `i'] = did2_b_full[1, `c']
+											continue, break
+										}
+									}
+								}
+							}
+
+							forvalues i = 1/`n_total' {
+								local ci = `col_map'[1, `i']
+								if `ci' == 0 continue
+								forvalues j = 1/`n_total' {
+									local cj = `col_map'[1, `j']
+									if `cj' == 0 continue
+									matrix did2_V_s`sval'[`i', `j'] = did2_V_full[`ci', `cj']
+								}
+							}
+
+							matrix colnames did2_b_s`sval' = `coef_names'
+							matrix colnames did2_V_s`sval' = `coef_names'
+							matrix rownames did2_V_s`sval' = `coef_names'
+						}
+                     
 
                         * ============================================================
                         *  3. TWFE — interaction terms
@@ -533,60 +525,50 @@ foreach panel_level of local panel_levels {
                         local controlcohort never_treated
 
                         if `run_esi' {
-                            cap noi eventstudyinteract `target' `esi_vars_s0' `esi_vars_s1', ///
+                            eventstudyinteract `target' `esi_vars_s0' `esi_vars_s1', ///
                                 cohort(event_cohort_did_imputation) ///
                                 control_cohort(`controlcohort') ///
                                 absorb(i.id i.`timevar')
-                            local esi_ok = (_rc == 0)
 
-                            if `esi_ok' {
-                                matrix sa_b_all = e(b_iw)
-                                matrix sa_V_all = e(V_iw)
+							matrix sa_b_all = e(b_iw)
+							matrix sa_V_all = e(V_iw)
 
-                                * The first n_old columns correspond to _s0 vars,
-                                * the next n_old columns correspond to _s1 vars.
-                                foreach sval in 0 1 {
-                                    local offset = `sval' * `n_old'
+							* The first n_old columns correspond to _s0 vars,
+							* the next n_old columns correspond to _s1 vars.
+							foreach sval in 0 1 {
+								local offset = `sval' * `n_old'
 
-                                    matrix sa_b_s`sval' = J(1, `n_total', .)
-                                    forvalues i = 1/`n_pre_nonref' {
-                                        matrix sa_b_s`sval'[1, `i'] = sa_b_all[1, `offset' + `i']
-                                    }
-                                    matrix sa_b_s`sval'[1, `=`n_pre_nonref' + 1'] = 0
-                                    forvalues i = `=`n_pre_nonref' + 1'/`n_old' {
-                                        matrix sa_b_s`sval'[1, `i' + 1] = sa_b_all[1, `offset' + `i']
-                                    }
-                                    matrix colnames sa_b_s`sval' = `coef_names'
+								matrix sa_b_s`sval' = J(1, `n_total', .)
+								forvalues i = 1/`n_pre_nonref' {
+									matrix sa_b_s`sval'[1, `i'] = sa_b_all[1, `offset' + `i']
+								}
+								matrix sa_b_s`sval'[1, `=`n_pre_nonref' + 1'] = 0
+								forvalues i = `=`n_pre_nonref' + 1'/`n_old' {
+									matrix sa_b_s`sval'[1, `i' + 1] = sa_b_all[1, `offset' + `i']
+								}
+								matrix colnames sa_b_s`sval' = `coef_names'
 
-                                    matrix sa_V_s`sval' = J(`n_total', `n_total', 0)
-                                    forvalues i = 1/`n_pre_nonref' {
-                                        forvalues j = 1/`n_pre_nonref' {
-                                            matrix sa_V_s`sval'[`i', `j'] = sa_V_all[`offset' + `i', `offset' + `j']
-                                        }
-                                    }
-                                    forvalues i = `=`n_pre_nonref' + 1'/`n_old' {
-                                        forvalues j = `=`n_pre_nonref' + 1'/`n_old' {
-                                            matrix sa_V_s`sval'[`i' + 1, `j' + 1] = sa_V_all[`offset' + `i', `offset' + `j']
-                                        }
-                                    }
-                                    forvalues i = 1/`n_pre_nonref' {
-                                        forvalues j = `=`n_pre_nonref' + 1'/`n_old' {
-                                            matrix sa_V_s`sval'[`i', `j' + 1] = sa_V_all[`offset' + `i', `offset' + `j']
-                                            matrix sa_V_s`sval'[`j' + 1, `i'] = sa_V_all[`offset' + `j', `offset' + `i']
-                                        }
-                                    }
-                                    matrix colnames sa_V_s`sval' = `coef_names'
-                                    matrix rownames sa_V_s`sval' = `coef_names'
+								matrix sa_V_s`sval' = J(`n_total', `n_total', 0)
+								forvalues i = 1/`n_pre_nonref' {
+									forvalues j = 1/`n_pre_nonref' {
+										matrix sa_V_s`sval'[`i', `j'] = sa_V_all[`offset' + `i', `offset' + `j']
+									}
+								}
+								forvalues i = `=`n_pre_nonref' + 1'/`n_old' {
+									forvalues j = `=`n_pre_nonref' + 1'/`n_old' {
+										matrix sa_V_s`sval'[`i' + 1, `j' + 1] = sa_V_all[`offset' + `i', `offset' + `j']
+									}
+								}
+								forvalues i = 1/`n_pre_nonref' {
+									forvalues j = `=`n_pre_nonref' + 1'/`n_old' {
+										matrix sa_V_s`sval'[`i', `j' + 1] = sa_V_all[`offset' + `i', `offset' + `j']
+										matrix sa_V_s`sval'[`j' + 1, `i'] = sa_V_all[`offset' + `j', `offset' + `i']
+									}
+								}
+								matrix colnames sa_V_s`sval' = `coef_names'
+								matrix rownames sa_V_s`sval' = `coef_names'
                                 }
                             }
-                            else {
-                                di as text "eventstudyinteract failed, skipping"
-                            }
-                        }
-                        else {
-                            local esi_ok = 0
-                            di as text "control=`control', skipping eventstudyinteract"
-                        }
 
                         * ============================================================
                         *  5. did_imputation — extract per-group estimates

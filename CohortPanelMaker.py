@@ -1,36 +1,26 @@
 r"""
-OVERVIEW:
-Builds stacked cohort panels for treated and control firms based on
-pre‑computed event‑study panels.  The cohorts are defined around either the
-first event year or every event year, and the user can select "pure-control",
-"not yet" or "not" comparisons.  Output files can be visualised with the
-plotting utility provided.
+Purpose:
+Build cohort panels for treated and control firm-product units from pre-built
+firm-level event panels. The script supports first-event and event-year cohorts,
+multiple control definitions, and balanced-window filtering.
 
-INPUT:
-- Pre-generated firm‑level SSR panels located under data/{year,quarter}-level
-  (produced by PanelMaker_FirmLevel.py).
+Process:
+- Load a selected firm-level panel by event_type and panel_level.
+- For each cohort year t, keep observations in [t-window_pre, t+window_post].
+- Build treated units from first_event_year == t or event_t == 1.
+- Build controls from units with no event inside the window, then apply
+    control_type rules (pure_control, not_yet, not).
+- When balanced=1, keep only units with complete window observations and
+    pass through balance_panel_t.
+- Save cohort CSV files and optionally plot treated/control counts by cohort year.
 
-OUTPUT:
-- Cohort CSV files saved to data/cohort_data/{frequency}/{treatment}/{control}/
-- Distribution bar charts saved under figures/cohort_distribution/...
+Input:
+- data/year-level/ssr_firm_panel_*.csv
+- data/quarter-level/ssr_firm_panel_*.csv
 
-FILE STRUCTURE:
-project_root/
-│
-├── codes/
-│   └── CohortPanelMaker.py
-│
-├── data/
-│   ├── year-level/
-│   ├── quarter-level/
-│
-└── figures/
-    ├── cohort_distribution/
-    └──── year/
-    └──── quarter/
-
-ENVIRONMENT:
-- Python 3.12.8 ~\anaconda3\python.exe
+Output:
+- data/cohort_data/{panel_level}/{treat_type}/{control_folder}/*.csv
+- figures/cohort_distribution/{panel_level}/{treat_type}/{control_folder}/*.png
 """
 
 from pathlib import Path
@@ -41,7 +31,7 @@ import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# mapping event keys to their panel filenames
+# Event key to panel filename mapping.
 EVENT_CONFIGS = {
     "direct_interlock": "ssr_firm_panel_direct_interlock.csv",
     "indirect_interlock": "ssr_firm_panel_indirect_interlock.csv",
@@ -56,9 +46,56 @@ CONTROL_FOLDER_MAP = {
 }
 
 
+# ========================== USER CONFIG ==========================
+# panel_levels:
+# - "year" or "quarter"
+# - Changes how many rows each firm-product contributes inside a cohort window.
+# - Year mode requires one row per retained year; quarter mode requires four quarters per retained year.
+#
+# event_types:
+# - Chooses the upstream treatment definition and timing source.
+# - Changing event_type changes which units are treated in cohort year t and the treatment interpretation.
+#
+# treat_types:
+# - "first_event": unit enters treated sample at most once, when first_event_year == t.
+# - "event": unit enters treated sample whenever event_t == 1, so one unit can appear in multiple cohort years.
+#
+# window_pre, window_post:
+# - Retained calendar window is [t - window_pre, t + window_post].
+# - Event year is the first post period; larger window_post extends post support.
+# - Wider windows increase row counts and raise balanced-completeness thresholds.
+#
+# control_types:
+# - Base "not" controls: no event anywhere inside the current window and full window support.
+# - "pure_control": subset of "not" with never-treated units only.
+# - "not_yet": subset of "not" with never-treated or first treatment after window end.
+#
+# balanced_states:
+# - 0 or 1. This filter changes treated selection only.
+# - When 1, treated units must have full window support and satisfy upstream balance_panel_t.
+# - Controls are always required to be complete in-window by design.
+RUN_CONFIG = {
+    "panel_levels": ["quarter"],
+    "event_types": [
+        "direct_interlock",
+        "indirect_interlock",
+        "to_B_not_in_A",
+        "to_B_still_in_A",
+    ],
+    "treat_types": ["first_event", "event"],
+    "control_types": ["pure_control", "not_yet", "not"],
+    "window_pre": 1,
+    "window_post": 1,
+    "balanced_states": [1],
+    "plot_start_year": 2007,
+    "plot_end_year": 2018,
+}
+# ===============================================================
+
+
 def get_data_path(event_type, panel_level):
     """
-    Return filepath for the specified event panel.
+    Return the source panel path for a given event_type and panel_level.
     """
     if event_type not in EVENT_CONFIGS:
         raise ValueError(
@@ -68,16 +105,15 @@ def get_data_path(event_type, panel_level):
     if panel_level not in ["year", "quarter"]:
         raise ValueError("panel_level must be one of: year, quarter")
 
-    # level_folder = "year-level" if panel_level == "year" else "quarter-level"
     level_folder = "year-level" if panel_level == "year" else "quarter-level"
     return PROJECT_ROOT / "data" / level_folder / EVENT_CONFIGS[event_type]
 
 
 def expected_period_count(window_years, panel_level):
     """
-    Compute number of periods in a balanced window.
+    Compute required observation count for one unit in the target window.
     """
-    # yearly panels count years directly; quarterly expand each year to 4
+    # Quarter panels expand each year into four periods.
     return len(window_years) if panel_level == "year" else len(window_years) * 4
 
 
@@ -91,7 +127,7 @@ def build_control_groups(
     balanced=1,
 ):
     """
-    Generate treated/control cohorts within a time window around events.
+    Build cohort-level treated and control samples around each cohort year.
     """
 
     if treat_type not in ["first_event", "event"]:
@@ -99,12 +135,11 @@ def build_control_groups(
     if control_type not in CONTROL_FOLDER_MAP:
         raise ValueError("control_type must be one of: pure_control, not_yet, not")
 
-    # load the relevant event study panel
+    # Source panel already contains event indicators and balance_panel_* tags.
     data_path = get_data_path(event_type, panel_level)
     df = pd.read_csv(data_path)
 
-
-    # identifier columns for firms/products
+    # Unit of analysis used for deduplication and balancing.
     id_cols = ["BoardName", "product"]
 
     output_dir = (
@@ -117,7 +152,7 @@ def build_control_groups(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # determine cohort years depending on treatment definition
+    # Cohort year source depends on treat_type definition.
     if treat_type == "first_event":
         cohorts = (
             df.loc[df["first_event_year"].notna(), "first_event_year"]
@@ -129,7 +164,7 @@ def build_control_groups(
         cohorts = sorted(int(c.split("_")[1]) for c in event_cols)
 
     for t in sorted(cohorts):
-        # define window boundaries and expected observation count
+        # Event-time window for this cohort year t.
         start, end = t - window_pre, t + window_post
         window_years = set(range(start, end + 1))
         expected_n = expected_period_count(window_years, panel_level)
@@ -139,11 +174,12 @@ def build_control_groups(
         if treat_type == "first_event":
             treated = df_window[df_window["first_event_year"] == t]
         else:
+            # event_t treatment: treated units are those with event_t == 1.
             event_col = f"event_{t}"
             treated_ids = df.loc[df[event_col] == 1, id_cols].drop_duplicates()
             treated = df_window.merge(treated_ids, on=id_cols, how="inner")
 
-        # drop treated firms lacking a full set of window observations if balanced is requested
+        # Balanced cohorts require complete window coverage and balance_panel_t == 1.
         if balanced == 1:
             treated_obs = treated.groupby(id_cols).size()
             treated = treated[
@@ -154,12 +190,12 @@ def build_control_groups(
             balance_col = f"balance_panel_{t}"
             treated = treated[treated[balance_col] == 1]
 
-        # identify units without any event in the window (candidates for control)
+        # Candidate controls must have no event inside the cohort window.
         treated_in_window = df_window.groupby(id_cols)["event"].max()
         valid_controls = treated_in_window[treated_in_window == 0].index
         controls = df_window[df_window.set_index(id_cols).index.isin(valid_controls)]
 
-        # enforce balanced panel on control group
+        # Keep control units with full window observations.
         controls_obs = controls.groupby(id_cols).size()
         controls = controls[
             controls.set_index(id_cols).index.isin(
@@ -167,17 +203,17 @@ def build_control_groups(
             )
         ]
 
-        # apply selection rules per control_type
+        # control_type narrows controls by future treatment timing.
         if control_type == "pure_control":
             controls = controls[controls["first_event_year"].isna()]
         elif control_type == "not_yet":
-            # include firms that are untreated or whose first event occurs after window
+            # Allow never-treated and future-treated units after this window.
             controls = controls[
                 (controls["first_event_year"].isna())
                 | (controls["first_event_year"] > end)
             ]
 
-        # combine treated and control observations and sort for convenience
+        # Final cohort sample for year t.
         cohort_df = pd.concat([treated, controls], axis=0)
         cohort_df = cohort_df.sort_values(id_cols + ["year"])
 
@@ -198,7 +234,7 @@ def build_control_groups(
 
 def plot_treated_control_counts(panel_level="year", start_year=2007, end_year=2018):
     """
-    Draw bar charts showing treated vs. control counts by cohort year.
+    Plot treated/control unit counts by cohort year and configuration.
     """
     treat_types = ["first_event", "event"]
     control_types = ["pure_control", "not_yet", "not"]
@@ -215,7 +251,7 @@ def plot_treated_control_counts(panel_level="year", start_year=2007, end_year=20
                 folder_name = CONTROL_FOLDER_MAP[control_type]
 
                 for balanced, bal_name in balanced_states.items():
-                    # accumulate counts for each year in this configuration
+                    # Collect yearly treated/control counts for one configuration.
                     treated_counts = []
                     control_counts = []
 
@@ -251,14 +287,14 @@ def plot_treated_control_counts(panel_level="year", start_year=2007, end_year=20
                         treated = df[df[event_col] == 1]
                         control = df[df[event_col] == 0]
 
-                        # count unique firm-product pairs in each group
+                        # Count unique firm-product units.
                         treated_n = treated[id_cols].drop_duplicates().shape[0]
                         control_n = control[id_cols].drop_duplicates().shape[0]
 
                         treated_counts.append(treated_n)
                         control_counts.append(control_n)
 
-                    # build bar chart positions and set figure size
+                    # Build grouped bars for treated vs control.
                     x = range(len(years))
                     width = 0.35
                     plt.figure(figsize=(14, 6))
@@ -298,7 +334,7 @@ def plot_treated_control_counts(panel_level="year", start_year=2007, end_year=20
                             fontsize=10,
                         )
 
-                    # finalize axis labels and title before saving
+                    # Apply labels and save figure.
                     plt.xticks(x, years, rotation=45)
                     plt.ylabel("Number of BoardName-Product Pairs")
                     plt.title(
@@ -328,17 +364,20 @@ def plot_treated_control_counts(panel_level="year", start_year=2007, end_year=20
 
 
 if __name__ == "__main__":
-    # combinations to iterate when running as script
-    panel_levels = ["quarter"] # "year"
-    event_types = [
-        "direct_interlock",
-        "indirect_interlock",
-        "to_B_not_in_A",
-        "to_B_still_in_A",
-    ]
-    treat_types = ["first_event", "event"]
-    control_types = ["pure_control", "not_yet", "not"]
-    balanced_states = [1]
+    def ensure_list(v):
+        if isinstance(v, str):
+            return [v]
+        return list(v)
+
+    panel_levels = ensure_list(RUN_CONFIG["panel_levels"])
+    event_types = ensure_list(RUN_CONFIG["event_types"])
+    treat_types = ensure_list(RUN_CONFIG["treat_types"])
+    control_types = ensure_list(RUN_CONFIG["control_types"])
+    balanced_states = ensure_list(RUN_CONFIG["balanced_states"])
+    window_pre = int(RUN_CONFIG["window_pre"])
+    window_post = int(RUN_CONFIG["window_post"])
+    plot_start_year = int(RUN_CONFIG["plot_start_year"])
+    plot_end_year = int(RUN_CONFIG["plot_end_year"])
 
     for panel_level in panel_levels:
         for event_type in event_types:
@@ -357,10 +396,14 @@ if __name__ == "__main__":
                             event_type=event_type,
                             panel_level=panel_level,
                             treat_type=treat_type,
-                            window_pre=1,
-                            window_post=1,
+                            window_pre=window_pre,
+                            window_post=window_post,
                             control_type=control_type,
                             balanced=balanced,
                         )
 
-        plot_treated_control_counts(panel_level=panel_level)
+        plot_treated_control_counts(
+            panel_level=panel_level,
+            start_year=plot_start_year,
+            end_year=plot_end_year,
+        )
