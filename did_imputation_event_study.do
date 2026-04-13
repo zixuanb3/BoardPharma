@@ -13,11 +13,31 @@ set trace off
 // - separate = 1: split treated units by sharingatc3, combine each treated
 //                 subgroup with the common control group, and run two separate
 //                 did_imputation regressions; pretrends differ by subgroup.
+// - trail = 0: run both standardize and normalize (baseline behavior).
+// - trail = 1: run normalize only; after normalization, compute within-group
+//              max/min ratio for each (boardname, product, data_cohort) group,
+//              then drop the top 5% groups by this ratio in full sample.
 //
 // Output:
-// - png figure files under figures/did_imputation_event_study_sharingatc3/
-// - log files under logs/did_imputation_event_study_sharingatc3/
+// - trail = 0: figures/did_imputation_event_study_sharingatc3/
+//              logs/did_imputation_event_study_sharingatc3/
+// - trail = 1: figures/did_imputation_event_study_sharingatc3_trail/
+//              logs/did_imputation_event_study_sharingatc3_trail/
 // ================================================================
+
+* ================= user config =================
+local trail 1
+local separate 0
+
+if !inlist(`trail', 0, 1) {
+    di as error "local trail must be 0 or 1"
+    exit 198
+}
+
+if !inlist(`separate', 0, 1) {
+    di as error "local separate must be 0 or 1"
+    exit 198
+}
 
 * ================= path =================
 local code_path "`c(pwd)'"
@@ -25,30 +45,32 @@ local project_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
 local project_path = subinstr("`project_path'", "\", "/", .)
 
 local data_root "`project_path'/data/cohort_data_with_atc3sharing/quarter"
-local fig_root "`project_path'/figures/did_imputation_event_study_sharingatc3/quarter"
-local log_root "`project_path'/logs/did_imputation_event_study_sharingatc3/quarter"
+if `trail' == 1 {
+    local output_tag "did_imputation_event_study_sharingatc3_trail"
+}
+else {
+    local output_tag "did_imputation_event_study_sharingatc3"
+}
+local fig_root "`project_path'/figures/`output_tag'/quarter"
+local log_root "`project_path'/logs/`output_tag'/quarter"
 
 cap mkdir "`project_path'/figures"
 cap mkdir "`project_path'/logs"
-cap mkdir "`project_path'/figures/did_imputation_event_study_sharingatc3"
-cap mkdir "`project_path'/logs/did_imputation_event_study_sharingatc3"
+cap mkdir "`project_path'/figures/`output_tag'"
+cap mkdir "`project_path'/logs/`output_tag'"
 cap mkdir "`fig_root'"
 cap mkdir "`log_root'"
-
-* ================= user config =================
-local separate 1
-
-if !inlist(`separate', 0, 1) {
-    di as error "local separate must be 0 or 1"
-    exit 198
-}
 
 local events to_B_not_in_A direct_interlock to_B_still_in_A indirect_interlock
 local controls not notyet purecontrol
 local targets revenue price quantity
-local standardize_types standardize normalize
-local event_types first_event
-* event
+if `trail' == 1 {
+    local standardize_types normalize
+}
+else {
+    local standardize_types standardize normalize
+}
+local event_types event first_event
 
 local coef_names pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
 local n_pre_nonref 2
@@ -212,6 +234,24 @@ foreach event of local events {
 
                     use `master', clear
 
+                    if `trail' == 1 & "`std'" == "normalize" {
+                        bysort boardname product data_cohort: egen group_max_norm = max(`target')
+                        bysort boardname product data_cohort: egen group_min_norm = min(`target')
+                        gen group_ratio_norm = .
+                        replace group_ratio_norm = group_max_norm / group_min_norm if group_min_norm != 0 & !missing(group_min_norm)
+
+                        preserve
+                        keep boardname product data_cohort group_ratio_norm
+                        bysort boardname product data_cohort: keep if _n == 1
+                        quietly summarize group_ratio_norm, detail
+                        local p95_group_ratio = r(p95)
+                        restore
+
+                        drop if group_ratio_norm > `p95_group_ratio' & !missing(group_ratio_norm)
+                        drop group_max_norm group_min_norm group_ratio_norm
+                    }
+
+					
                     egen id = group(boardname product data_cohort)
                     gen q_time = yq(year, quarter)
                     format q_time %tq

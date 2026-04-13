@@ -162,6 +162,22 @@ foreach panel_level of local panel_levels {
 
                         use `master', clear
 
+                        if "`std'" == "normalize" {
+                            bysort boardname product data_cohort: egen group_max_norm = max(`target')
+                            bysort boardname product data_cohort: egen group_min_norm = min(`target')
+                            gen group_gap_norm = group_max_norm - group_min_norm
+
+                            preserve
+                            keep boardname product data_cohort group_gap_norm
+                            bysort boardname product data_cohort: keep if _n == 1
+                            quietly summarize group_gap_norm, detail
+                            local p95_group_gap = r(p95)
+                            restore
+
+                            drop if group_gap_norm > `p95_group_gap' & !missing(group_gap_norm)
+                            drop group_max_norm group_min_norm group_gap_norm
+                        }
+
                         egen id = group(boardname product data_cohort)
                         gen q_time = yq(year, quarter)
                         format q_time %tq
@@ -172,11 +188,47 @@ foreach panel_level of local panel_levels {
                         gen g = atc3_sharing if treat == 1
                         replace g = 0 if missing(g)
                         gen did_g = did * g
+                        gen pre_period = q_time < yq(data_cohort, 1)
+
+                        quietly summarize `target' if treat == 1 & atc3_sharing == 0 & pre_period == 1, meanonly
+                        local premean_notshare = r(mean)
+                        quietly summarize `target' if treat == 1 & atc3_sharing == 1 & pre_period == 1, meanonly
+                        local premean_share = r(mean)
+
+                        quietly count if treat == 1 & atc3_sharing == 0
+                        local N_notshare = r(N)
+                        quietly count if treat == 1 & atc3_sharing == 1
+                        local N_share = r(N)
+
+                        egen tag_id_notshare = tag(id) if treat == 1 & atc3_sharing == 0
+                        quietly count if tag_id_notshare == 1
+                        local product_notshare = r(N)
+                        drop tag_id_notshare
+
+                        egen tag_id_share = tag(id) if treat == 1 & atc3_sharing == 1
+                        quietly count if tag_id_share == 1
+                        local product_share = r(N)
+                        drop tag_id_share
+
                         gen event_cohort_did_imputation = yq(event_cohort, 1) if !missing(event_cohort)
                         gen atc3_sharing_het = atc3_sharing if treat == 1
                         replace atc3_sharing_het = 0 if treat == 0
 
                         reghdfe `target' did did_g, absorb(i.id i.q_time)
+                        local beta0 = _b[did]
+                        local beta1 = _b[did_g]
+                        local te_share = `beta0' + `beta1'
+
+                        local pcteff_notshare = .
+                        if !missing(`premean_notshare') & `premean_notshare' != 0 {
+                            local pcteff_notshare = 100 * `beta0' / abs(`premean_notshare')
+                        }
+
+                        local pcteff_share = .
+                        if !missing(`premean_share') & `premean_share' != 0 {
+                            local pcteff_share = 100 * `te_share' / abs(`premean_share')
+                        }
+
                         estimates store m_`target'
 
                         did_imputation `target' id q_time event_cohort_did_imputation, ///
@@ -189,7 +241,32 @@ foreach panel_level of local panel_levels {
                         local didimp_diff_se = r(se)
                         local didimp_diff_p = r(p)
 
+                        local didimp_star ""
+                        if !missing(`didimp_diff_p') {
+                            if `didimp_diff_p' < 0.01 {
+                                local didimp_star "***"
+                            }
+                            else if `didimp_diff_p' < 0.05 {
+                                local didimp_star "**"
+                            }
+                            else if `didimp_diff_p' < 0.10 {
+                                local didimp_star "*"
+                            }
+                        }
+                        local didimp_diff_disp : display %9.3f `didimp_diff'
+                        local didimp_diff_disp = strtrim("`didimp_diff_disp'")
+                        local didimp_diff_star "`didimp_diff_disp'`didimp_star'"
+
                         estimates restore m_`target'
+                        estadd scalar premean_notshare = `premean_notshare'
+                        estadd scalar premean_share = `premean_share'
+                        estadd scalar pcteff_notshare = `pcteff_notshare'
+                        estadd scalar pcteff_share = `pcteff_share'
+                        estadd scalar N_notshare = `N_notshare'
+                        estadd scalar N_share = `N_share'
+                        estadd scalar product_notshare = `product_notshare'
+                        estadd scalar product_share = `product_share'
+                        estadd local didimp_diff_star = "`didimp_diff_star'"
                         estadd scalar didimp_diff = `didimp_diff'
                         estadd scalar didimp_diff_se = `didimp_diff_se'
                         estadd scalar didimp_diff_p = `didimp_diff_p'
@@ -204,14 +281,30 @@ foreach panel_level of local panel_levels {
                         ) ///
                         mtitles("Revenue" "Price" "Quantity") ///
                         stats( ///
+                            premean_notshare ///
+                            premean_share ///
+                            pcteff_notshare ///
+                            pcteff_share ///
                             N ///
-                            didimp_diff ///
+                            N_notshare ///
+                            N_share ///
+                            product_notshare ///
+                            product_share ///
+                            didimp_diff_star ///
                             didimp_diff_se ///
                             didimp_diff_p, ///
-                            fmt(0 3 3 3) ///
+                            fmt(3 3 2 2 0 0 0 0 0 %9s 3 3) ///
                             labels( ///
+                                "Pre-treatment mean Y (Not Share)" ///
+                                "Pre-treatment mean Y (Share)" ///
+                                "Percent effect (Not Share)" ///
+                                "Percent effect (Share)" ///
                                 "Observations" ///
-                                "did\_imputation: $\tau_1-\tau_0$" ///
+                                "N (Not Share, treated)" ///
+                                "N (Share, treated)" ///
+                                "Product count (Not Share, treated)" ///
+                                "Product count (Share, treated)" ///
+                                "\\midrule did\_imputation: $\tau_1-\tau_0$" ///
                                 "did\_imputation SE" ///
                                 "did\_imputation p-value" ///
                             ) ///
