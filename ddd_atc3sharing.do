@@ -9,29 +9,14 @@ local project_path = subinstr("`project_path'", "\", "/", .)
 local data_root "`project_path'/data/cohort_data_with_atc3sharing"
 local log_root "`project_path'/logs/ddd_atc3sharing"
 local tex_root "`project_path'/tex/ddd_atc3sharing"
+local csv_root "`project_path'/csv/ddd_atc3sharing"
 
 cap mkdir "`project_path'/logs"
 cap mkdir "`project_path'/tex"
+cap mkdir "`project_path'/csv"
 cap mkdir "`log_root'"
 cap mkdir "`tex_root'"
-
-cap which reghdfe
-if _rc {
-    di as error "reghdfe is not installed."
-    exit 199
-}
-
-cap which did_imputation
-if _rc {
-    di as error "did_imputation is not installed."
-    exit 199
-}
-
-cap which esttab
-if _rc {
-    di as error "esttab is not installed."
-    exit 199
-}
+cap mkdir "`csv_root'"
 
 local panel_levels quarter
 local events to_B_not_in_A direct_interlock to_B_still_in_A indirect_interlock
@@ -44,10 +29,12 @@ foreach panel_level of local panel_levels {
     local data_path "`data_root'/`panel_level'"
     cap mkdir "`log_root'/`panel_level'"
     cap mkdir "`tex_root'/`panel_level'"
+    cap mkdir "`csv_root'/`panel_level'"
 
     foreach event of local events {
         cap mkdir "`log_root'/`panel_level'/`event'"
         cap mkdir "`tex_root'/`panel_level'/`event'"
+        cap mkdir "`csv_root'/`panel_level'/`event'"
 
         foreach control of local controls {
             foreach std of local standardize_types {
@@ -110,6 +97,28 @@ foreach panel_level of local panel_levels {
 
                     estimates clear
 
+                    local csv_file "`csv_root'/`panel_level'/`event'/`file_stub'.csv"
+                    tempfile run_results
+                    tempname posth
+
+                    postfile `posth' ///
+                        str12 panel_level ///
+                        str30 event ///
+                        str15 control ///
+                        str15 std ///
+                        str15 event_type ///
+                        str20 target ///
+                        str20 model ///
+                        double beta0 beta0_se beta0_p ///
+                        double beta1 beta1_se beta1_p ///
+                        double te_share te_share_se te_share_p ///
+                        double didimp_diff didimp_diff_se didimp_diff_p ///
+                        double pcteff_notshare pcteff_share ///
+                        double premean_notshare premean_share ///
+                        double N_obs N_notshare N_share ///
+                        double product_notshare product_share ///
+                        using `run_results', replace
+
                     foreach target of local targets {
                         local first 1
 
@@ -117,6 +126,7 @@ foreach panel_level of local panel_levels {
                             local data_file "`data_path'/`event_type'/`control_folder'/`event'_`panel_level'_cohort_`cohort'`suffix'_balanced.csv"
 
                             import delimited "`data_file'", clear
+                            gen target_raw = `target'
 
                             if "`std'" == "standardize" {
                                 bysort boardname product: egen temp = std(`target')
@@ -190,10 +200,26 @@ foreach panel_level of local panel_levels {
                         gen did_g = did * g
                         gen pre_period = q_time < yq(data_cohort, 1)
 
-                        quietly summarize `target' if treat == 1 & atc3_sharing == 0 & pre_period == 1, meanonly
-                        local premean_notshare = r(mean)
-                        quietly summarize `target' if treat == 1 & atc3_sharing == 1 & pre_period == 1, meanonly
-                        local premean_share = r(mean)
+                        local premean_notshare = .
+                        local premean_share = .
+                        local basesd_notshare = .
+                        local basesd_share = .
+
+                        if "`std'" == "standardize" {
+                            quietly summarize target_raw if treat == 1 & atc3_sharing == 0 & pre_period == 1
+                            local premean_notshare = r(mean)
+                            local basesd_notshare = r(sd)
+
+                            quietly summarize target_raw if treat == 1 & atc3_sharing == 1 & pre_period == 1
+                            local premean_share = r(mean)
+                            local basesd_share = r(sd)
+                        }
+                        else {
+                            quietly summarize `target' if treat == 1 & atc3_sharing == 0 & pre_period == 1, meanonly
+                            local premean_notshare = r(mean)
+                            quietly summarize `target' if treat == 1 & atc3_sharing == 1 & pre_period == 1, meanonly
+                            local premean_share = r(mean)
+                        }
 
                         quietly count if treat == 1 & atc3_sharing == 0
                         local N_notshare = r(N)
@@ -215,17 +241,40 @@ foreach panel_level of local panel_levels {
                         replace atc3_sharing_het = 0 if treat == 0
 
                         reghdfe `target' did did_g, absorb(i.id i.q_time)
-                        local beta0 = _b[did]
-                        local beta1 = _b[did_g]
-                        local te_share = `beta0' + `beta1'
+                        local N_obs_reghdfe = e(N)
+
+                        lincom did
+                        local beta0 = r(estimate)
+                        local beta0_se = r(se)
+                        local beta0_p = r(p)
+
+                        lincom did_g
+                        local beta1 = r(estimate)
+                        local beta1_se = r(se)
+                        local beta1_p = r(p)
+
+                        lincom did + did_g
+                        local te_share = r(estimate)
+                        local te_share_se = r(se)
+                        local te_share_p = r(p)
 
                         local pcteff_notshare = .
-                        if !missing(`premean_notshare') & `premean_notshare' != 0 {
+                        if "`std'" == "standardize" {
+                            if !missing(`premean_notshare') & `premean_notshare' != 0 & !missing(`basesd_notshare') {
+                                local pcteff_notshare = 100 * (`beta0' * `basesd_notshare') / abs(`premean_notshare')
+                            }
+                        }
+                        else if !missing(`premean_notshare') & `premean_notshare' != 0 {
                             local pcteff_notshare = 100 * `beta0' / abs(`premean_notshare')
                         }
 
                         local pcteff_share = .
-                        if !missing(`premean_share') & `premean_share' != 0 {
+                        if "`std'" == "standardize" {
+                            if !missing(`premean_share') & `premean_share' != 0 & !missing(`basesd_share') {
+                                local pcteff_share = 100 * (`te_share' * `basesd_share') / abs(`premean_share')
+                            }
+                        }
+                        else if !missing(`premean_share') & `premean_share' != 0 {
                             local pcteff_share = 100 * `te_share' / abs(`premean_share')
                         }
 
@@ -236,10 +285,46 @@ foreach panel_level of local panel_levels {
                             hetby(atc3_sharing_het) ///
                             autosample tol(0.1)
 
+                        local N_obs_didimp = e(N)
+
                         lincom tau_1 - tau_0
                         local didimp_diff = r(estimate)
                         local didimp_diff_se = r(se)
                         local didimp_diff_p = r(p)
+
+                        post `posth' ///
+                            ("`panel_level'") ///
+                            ("`event'") ///
+                            ("`control'") ///
+                            ("`std'") ///
+                            ("`event_type'") ///
+                            ("`target'") ///
+                            ("reghdfe") ///
+                            (`beta0') (`beta0_se') (`beta0_p') ///
+                            (`beta1') (`beta1_se') (`beta1_p') ///
+                            (`te_share') (`te_share_se') (`te_share_p') ///
+                            (.) (.) (.) ///
+                            (`pcteff_notshare') (`pcteff_share') ///
+                            (`premean_notshare') (`premean_share') ///
+                            (`N_obs_reghdfe') (`N_notshare') (`N_share') ///
+                            (`product_notshare') (`product_share')
+
+                        post `posth' ///
+                            ("`panel_level'") ///
+                            ("`event'") ///
+                            ("`control'") ///
+                            ("`std'") ///
+                            ("`event_type'") ///
+                            ("`target'") ///
+                            ("did_imputation") ///
+                            (.) (.) (.) ///
+                            (.) (.) (.) ///
+                            (.) (.) (.) ///
+                            (`didimp_diff') (`didimp_diff_se') (`didimp_diff_p') ///
+                            (`pcteff_notshare') (`pcteff_share') ///
+                            (`premean_notshare') (`premean_share') ///
+                            (`N_obs_didimp') (`N_notshare') (`N_share') ///
+                            (`product_notshare') (`product_share')
 
                         local didimp_star ""
                         if !missing(`didimp_diff_p') {
@@ -272,12 +357,21 @@ foreach panel_level of local panel_levels {
                         estadd scalar didimp_diff_p = `didimp_diff_p'
                     }
 
-                    esttab m_revenue m_price m_quantity using "`tex_root'/`panel_level'/`event'/`file_stub'.tex", ///
+                    postclose `posth'
+                    preserve
+                    use `run_results', clear
+                    export delimited using "`csv_file'", replace
+                    restore
+
+                    local tex_file "`tex_root'/`panel_level'/`event'/`file_stub'.tex"
+                    tempfile tex_fragment
+
+                    esttab m_revenue m_price m_quantity using "`tex_fragment'", ///
                         replace booktabs se star(* 0.10 ** 0.05 *** 0.01) ///
                         keep(did did_g) ///
                         coeflabels( ///
-                            did "\$\beta_0$: Treat $\times$ Post" ///
-                            did_g "\$\beta_1$: Treat $\times$ Post $\times$ G" ///
+                            did "beta0: Treat x Post" ///
+                            did_g "beta1: Treat x Post x G" ///
                         ) ///
                         mtitles("Revenue" "Price" "Quantity") ///
                         stats( ///
@@ -304,12 +398,29 @@ foreach panel_level of local panel_levels {
                                 "N (Share, treated)" ///
                                 "Product count (Not Share, treated)" ///
                                 "Product count (Share, treated)" ///
-                                "\\midrule did\_imputation: $\tau_1-\tau_0$" ///
-                                "did\_imputation SE" ///
-                                "did\_imputation p-value" ///
+                                "did-imputation: tau1-tau0" ///
+                                "did-imputation SE" ///
+                                "did-imputation p-value" ///
                             ) ///
                         ) ///
                         title("DDD: `event', `event_type', `control', `std'")
+
+                    tempname fhin fhout
+                    file open `fhin' using "`tex_fragment'", read text
+                    file open `fhout' using "`tex_file'", write text replace
+                    file write `fhout' "\documentclass[11pt]{article}" _n
+                    file write `fhout' "\usepackage{booktabs}" _n
+                    file write `fhout' "\begin{document}" _n
+
+                    file read `fhin' line
+                    while r(eof) == 0 {
+                        file write `fhout' "`line'" _n
+                        file read `fhin' line
+                    }
+
+                    file write `fhout' "\end{document}" _n
+                    file close `fhin'
+                    file close `fhout'
 
                     log close
                 }

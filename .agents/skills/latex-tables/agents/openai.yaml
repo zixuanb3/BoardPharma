@@ -1,0 +1,4 @@
+interface:
+  display_name: "LaTeX Tables"
+  short_description: "Build publication-ready LaTeX tables"
+  default_prompt: "Use $latex-tables to create or refine a publication-ready LaTeX table for regression output, summary statistics, or balance results."

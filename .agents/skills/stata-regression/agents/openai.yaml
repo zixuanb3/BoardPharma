@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stata Regression"
+  short_description: "Build Stata regression workflows"
+  default_prompt: "Use $stata-regression to design, write, and explain a Stata regression workflow with diagnostics and publication-ready output."

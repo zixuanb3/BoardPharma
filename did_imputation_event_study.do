@@ -13,26 +13,18 @@ set trace off
 // - separate = 1: split treated units by sharingatc3, combine each treated
 //                 subgroup with the common control group, and run two separate
 //                 did_imputation regressions; pretrends differ by subgroup.
-// - trail = 0: run both standardize and normalize (baseline behavior).
-// - trail = 1: run normalize only; after normalization, compute within-group
-//              max/min ratio for each (boardname, product, data_cohort) group,
-//              then drop the top 5% groups by this ratio in full sample.
+// - normalize branch: after normalization, compute within-group max/min ratio
+//                     for each (boardname, product, data_cohort) group,
+//                     then drop the top 5% groups by this ratio in full sample.
 //
 // Output:
-// - trail = 0: figures/did_imputation_event_study_sharingatc3/
-//              logs/did_imputation_event_study_sharingatc3/
-// - trail = 1: figures/did_imputation_event_study_sharingatc3_trail/
-//              logs/did_imputation_event_study_sharingatc3_trail/
+// - figures/did_imputation_event_study_sharingatc3/
+// - csv/did_imputation_event_study_sharingatc3/
+// - logs/did_imputation_event_study_sharingatc3/
 // ================================================================
 
 * ================= user config =================
-local trail 1
-local separate 0
-
-if !inlist(`trail', 0, 1) {
-    di as error "local trail must be 0 or 1"
-    exit 198
-}
+local separate 1
 
 if !inlist(`separate', 0, 1) {
     di as error "local separate must be 0 or 1"
@@ -45,31 +37,25 @@ local project_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
 local project_path = subinstr("`project_path'", "\", "/", .)
 
 local data_root "`project_path'/data/cohort_data_with_atc3sharing/quarter"
-if `trail' == 1 {
-    local output_tag "did_imputation_event_study_sharingatc3_trail"
-}
-else {
-    local output_tag "did_imputation_event_study_sharingatc3"
-}
+local output_tag "did_imputation_event_study_sharingatc3"
 local fig_root "`project_path'/figures/`output_tag'/quarter"
+local csv_root "`project_path'/csv/`output_tag'/quarter"
 local log_root "`project_path'/logs/`output_tag'/quarter"
 
 cap mkdir "`project_path'/figures"
+cap mkdir "`project_path'/csv"
 cap mkdir "`project_path'/logs"
 cap mkdir "`project_path'/figures/`output_tag'"
+cap mkdir "`project_path'/csv/`output_tag'"
 cap mkdir "`project_path'/logs/`output_tag'"
 cap mkdir "`fig_root'"
+cap mkdir "`csv_root'"
 cap mkdir "`log_root'"
 
 local events to_B_not_in_A direct_interlock to_B_still_in_A indirect_interlock
 local controls not notyet purecontrol
 local targets revenue price quantity
-if `trail' == 1 {
-    local standardize_types normalize
-}
-else {
-    local standardize_types standardize normalize
-}
+local standardize_types standardize normalize
 local event_types event first_event
 
 local coef_names pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
@@ -166,10 +152,13 @@ foreach event of local events {
 
                     * -------- setup paths for this iteration --------
                     local event_fig_path "`fig_root'/`event'/`target'"
+                    local event_csv_path "`csv_root'/`event'/`target'"
                     local event_log_path "`log_root'/`event'/`target'"
                     cap mkdir "`fig_root'/`event'"
+                    cap mkdir "`csv_root'/`event'"
                     cap mkdir "`log_root'/`event'"
                     cap mkdir "`event_fig_path'"
+                    cap mkdir "`event_csv_path'"
                     cap mkdir "`event_log_path'"
 
                     local file_stub "`event'_`target'_`event_type'_`control_fname'_`std'_`mode_tag'_sharingatc3"
@@ -234,7 +223,7 @@ foreach event of local events {
 
                     use `master', clear
 
-                    if `trail' == 1 & "`std'" == "normalize" {
+                    if "`std'" == "normalize" {
                         bysort boardname product data_cohort: egen group_max_norm = max(`target')
                         bysort boardname product data_cohort: egen group_min_norm = min(`target')
                         gen group_ratio_norm = .
@@ -421,6 +410,82 @@ foreach event of local events {
                             restore
                         }
                     }
+
+                    * -------- export regression results for re-plotting --------
+                    preserve
+                    clear
+                    set obs 0
+
+                    gen str32 event = ""
+                    gen str16 target = ""
+                    gen str16 control = ""
+                    gen str16 standardize = ""
+                    gen str16 event_type = ""
+                    gen str16 mode = ""
+                    gen sharingatc3 = .
+                    gen str16 coef_name = ""
+                    gen rel_quarter = .
+                    gen estimate = .
+                    gen variance = .
+                    gen std_error = .
+                    gen ci_lb_95 = .
+                    gen ci_ub_95 = .
+                    foreach cov_name of local coef_names {
+                        gen cov_`cov_name' = .
+                    }
+
+                    forvalues sval = 0/1 {
+                        forvalues i = 1/`n_total' {
+                            local this_coef : word `i' of `coef_names'
+                            local b = el(did2_b_s`sval', 1, `i')
+                            local v = el(did2_V_s`sval', `i', `i')
+                            local se = .
+                            local lb = .
+                            local ub = .
+                            local rel_q = .
+
+                            if !missing(`v') & `v' >= 0 {
+                                local se = sqrt(`v')
+                            }
+                            if !missing(`b') & !missing(`se') {
+                                local lb = `b' - 1.96 * `se'
+                                local ub = `b' + 1.96 * `se'
+                            }
+
+                            if substr("`this_coef'", 1, 4) == "pre_" {
+                                local rel_q = -real(substr("`this_coef'", 5, .))
+                            }
+                            else if substr("`this_coef'", 1, 5) == "post_" {
+                                local rel_q = real(substr("`this_coef'", 6, .))
+                            }
+
+                            local row = _N + 1
+                            set obs `row'
+                            replace event = "`event'" in `row'
+                            replace target = "`target'" in `row'
+                            replace control = "`control'" in `row'
+                            replace standardize = "`std'" in `row'
+                            replace event_type = "`event_type'" in `row'
+                            replace mode = "`mode_tag'" in `row'
+                            replace sharingatc3 = `sval' in `row'
+                            replace coef_name = "`this_coef'" in `row'
+                            replace rel_quarter = `rel_q' in `row'
+                            replace estimate = `b' in `row'
+                            replace variance = `v' in `row'
+                            replace std_error = `se' in `row'
+                            replace ci_lb_95 = `lb' in `row'
+                            replace ci_ub_95 = `ub' in `row'
+
+                            forvalues j = 1/`n_total' {
+                                local cov_coef : word `j' of `coef_names'
+                                replace cov_`cov_coef' = el(did2_V_s`sval', `i', `j') in `row'
+                            }
+                        }
+                    }
+
+                    sort sharingatc3 rel_quarter
+                    export delimited using "`event_csv_path'/`file_stub'.csv", replace
+                    restore
 
                     * -------- plot two sharing groups together --------
                     local graph_title_size medium

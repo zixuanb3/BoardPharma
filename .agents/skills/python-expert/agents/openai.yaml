@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python Expert"
+  short_description: "Senior Python coding guidance"
+  default_prompt: "Use $python-expert to write, review, or improve this Python code with strong correctness, typing, and readability."
