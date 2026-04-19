@@ -132,13 +132,14 @@ Inputs
 
 Processing
 - Runs dynamic treatment-effect estimation with `did_imputation`.
-- Compares `atc3_sharing=0/1` under hetby or separate-sample modes.
+- Supports both `hetby` and `separate` specifications for `atc3_sharing=0/1` comparisons.
 - Optionally trims extreme normalized groups in trail mode.
 - Produces estimator-comparison event-study plots.
 
 Outputs
 - `logs/did_imputation_event_study_sharingatc3*/quarter/{event}/*.log`
 - `figures/did_imputation_event_study_sharingatc3*/quarter/*.png`
+- `csv/did_imputation_event_study_sharingatc3*/quarter/*.csv`
 
 ## 9) ddd_atc3sharing.do
 
@@ -154,6 +155,7 @@ Processing
 Outputs
 - `logs/ddd_atc3sharing/quarter/{event}/*.log`
 - `tex/ddd_atc3sharing/quarter/{event}/*.tex`
+- `csv/ddd_atc3sharing/quarter/{event}/*.csv`
 
 ## 10) StaggeredEventStudy.do
 
@@ -176,3 +178,4 @@ Outputs
 - Regression logs are written to `logs/`.
 - Figures are written to `figures/`.
 - LaTeX tables are written to `tex/`.
+- CSV summary outputs are written to `csv/`.

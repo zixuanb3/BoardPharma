@@ -17,6 +17,8 @@ This repository contains the Python and Stata scripts used in the BoardPharma pr
 
 - `StaggeredEventStudy.do`: runs dynamic staggered event-study regressions and compares estimators such as `csdid`, `did_imputation`, `TWFE`, and `eventstudyinteract`.
 - `StackedEventStudy_v5.do`: runs stacked event-study estimation on cohort samples with `atc3_sharing` splits and reports results separately for sharing vs. non-sharing groups.
+- `did_imputation_event_study.do`: runs `did_imputation`-based event-study estimation on cohort samples (including `atc3_sharing` splits) and exports comparison plots / logs.
+- `ddd_atc3sharing.do`: runs DDD-style regressions with sharing interactions and exports table outputs to both `tex/` and `csv/`.
 
 ## Workflow
 
@@ -27,7 +29,7 @@ If you are starting from the intermediate data, a typical workflow is:
 3. `python CohortPanelMaker.py` or `python StaggeredPanelMaker.py`
 4. `python ATC3MappingMaker.py`
 5. `python ATC3DistributionPlotter.py`
-6. Run `StaggeredEventStudy.do` or `StackedEventStudy_v5.do` in Stata
+6. Run one or more Stata scripts: `StaggeredEventStudy.do`, `StackedEventStudy_v5.do`, `did_imputation_event_study.do`, `ddd_atc3sharing.do`
 
 Notes:
 
@@ -45,10 +47,12 @@ BoardPharma/
 ├─ InterimData/
 ├─ data/
 ├─ figures/
-└─ logs/
+├─ logs/
+├─ tex/
+└─ csv/
 ```
 
 In other words:
 
 - input data is read from `../InterimData/` or `../data/`
-- outputs are written to `../data/`, `../figures/`, and `../logs/`
+- outputs are written to `../data/`, `../figures/`, `../logs/`, `../tex/`, and `../csv/`
