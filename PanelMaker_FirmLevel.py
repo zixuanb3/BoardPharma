@@ -7,12 +7,13 @@ Process:
 - Build SSR base panel at the selected panel_level (year or quarter).
 - Construct treatment events by event_type:
     direct/indirect interlock use symmetric firm-pair links;
-    to B still in A / to B not in A use directional director-move events on destination firm B.
+    to B still in A / to B not in A use directional director-move events, where
+    treatment_group chooses whether firm A or B is treated.
 - Apply stay_x_years so treatment requires forward persistence.
 - In quarter mode, event and stay flags are placed in Q1 of the event year.
 - Mark first-event and event-year indicators, then compute balance tags using
     balance_window = (start_offset, end_offset), i.e., t+start through t+end.
-- Export panel files to data/{panel_level}-level.
+- Export panel files to data/{panel_level}-level_{A|B}_{with|without}_{B|A}.
 
 Input:
 - InterimData/boardex_ssr_price_sample.csv
@@ -21,8 +22,9 @@ Input:
 - InterimData/boardex_pharma.dta
 
 Output:
-- data/year-level/ssr_firm_panel_*.csv
-- data/quarter-level/ssr_firm_panel_*.csv
+- data/year-level_{A|B}_{with|without}_{B|A}/ssr_firm_panel_*.csv
+- data/quarter-level_{A|B}_{with|without}_{B|A}/ssr_firm_panel_*.csv
+- data/movement_list/*.csv
 """
 
 import pathlib
@@ -59,6 +61,14 @@ OUTPUT_BASE_PATH.mkdir(parents=True, exist_ok=True)
 # balance_window:
 # - balanced-window rule as (start_offset, end_offset)
 # - e.g. (-4, 3) means require periods from t-4 to t+3
+#
+# treatment_groups:
+# - "B": destination firm as treated group (legacy behavior)
+# - "A": origin firm as treated group
+#
+# include_eventpair:
+# - 1: keep counterpart-firm observations in panel
+# - 0: drop counterpart-firm observations from panel
 RUN_CONFIG = {
     "event_types": [
         "direct interlock",
@@ -68,7 +78,8 @@ RUN_CONFIG = {
     ],
     "panel_levels": ["quarter"],
     "stay_x_years": 3,
-    "balance_window": (-4, 3),
+    "balance_window": (-1, 1),
+    "treatment_groups": ["B","A"],
 }
 # ===============================================================
 
@@ -95,12 +106,14 @@ class EventStudyPanelSSR:
         panel_level: str = "year",
         stay_x_years: int = 3,
         balance_window: tuple[int, int] = (-4, 3),
+        treatment_group: str = "B",
     ):
         self.event_type = event_type
         self.panel_level = panel_level.lower()
         self.stay_x_years = stay_x_years
         self.stay_col = f"stay_{stay_x_years}_years"
         self.balance_window = balance_window
+        self.treatment_group = treatment_group.upper()
 
         if self.stay_x_years < 1:
             raise ValueError("stay_x_years must be >= 1")
@@ -108,6 +121,8 @@ class EventStudyPanelSSR:
             raise ValueError("panel_level must be either 'year' or 'quarter'")
         if len(self.balance_window) != 2 or self.balance_window[0] > self.balance_window[1]:
             raise ValueError("balance_window must be a tuple(start_offset, end_offset) with start <= end")
+        if self.treatment_group not in {"A", "B"}:
+            raise ValueError("treatment_group must be either 'A' or 'B'")
             
         self.ssr_yearly = load_ssr_yearly()
         self.ssr_base = self._build_ssr_base()
@@ -258,6 +273,7 @@ class EventStudyPanelSSR:
                 stay_val = int(stay_met)
                 
                 rows.append({
+                    "DirectorID": did,
                     "year": year,
                     "A": b_last,
                     "B": b_new,
@@ -269,13 +285,13 @@ class EventStudyPanelSSR:
 
         return pd.DataFrame(rows)
 
-    def _build_to_b_panel(self, mode: str) -> pd.DataFrame:
+    def _build_to_b_panel(self, mode: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         pharma = self.load_event_data()
         transitions = self._build_board_transitions(pharma)
         
         if transitions.empty:
             print(f"Warning: No transitions generated for mode '{mode}'")
-            return pd.DataFrame()
+            return pd.DataFrame(), pd.DataFrame()
 
         stay_still_col = f"{self.stay_col}_still"
         stay_not_col = f"{self.stay_col}_not"
@@ -287,16 +303,30 @@ class EventStudyPanelSSR:
             stay_not_col: (stay_not_col, "max"),
         }
 
+        treatment_firm_col = self.treatment_group
+        counterpart_col = "A" if treatment_firm_col == "B" else "B"
+
         collapsed = (
-            transitions.groupby(["year", "B"], as_index=False)
+            transitions.groupby(["year", treatment_firm_col], as_index=False)
             .agg(**agg_args)
-            .rename(columns={"B": "BoardName"})
+            .rename(columns={treatment_firm_col: "BoardName"})
         )
 
         if mode == "still":
             event_col, stay_col_src = "to_B_still_in_A", stay_still_col
+            mode_value = "still"
         else:
             event_col, stay_col_src = "to_B_not_in_A", stay_not_col
+            mode_value = "not"
+
+        movement_list = (
+            transitions.loc[transitions[event_col].eq(1), ["DirectorID", "year", "A", "B"]]
+            .rename(columns={"year": "movement_year", "A": "FirmA", "B": "FirmB"})
+            .copy()
+        )
+        movement_list["event_type"] = mode_value
+        movement_list = movement_list[["DirectorID", "movement_year", "FirmA", "FirmB", "event_type"]]
+        movement_list = movement_list.drop_duplicates().reset_index(drop=True)
 
         events = (
             collapsed.loc[collapsed[event_col].eq(1), ["year", "BoardName", event_col, stay_col_src]]
@@ -346,7 +376,10 @@ class EventStudyPanelSSR:
         panel = panel.rename(columns={event_col: "event"})
         ordered = panel.columns.tolist()
         ordered.insert(4, ordered.pop(ordered.index("event")))
-        return panel[ordered]
+        return panel[ordered], movement_list
+
+    def _movement_output_group_label(self) -> str:
+        return f"{self.treatment_group}"
 
     def _build_interlock_panel(self) -> pd.DataFrame:
         event_data = self.load_event_data()
@@ -468,29 +501,30 @@ class EventStudyPanelSSR:
 
         return merged
 
-    def merge_event_data(self) -> None:
-        output_path = OUTPUT_BASE_PATH / f"{self.panel_level}-level"
+    def merge_event_data(self) -> pd.DataFrame:
+        output_group = self._movement_output_group_label()
+        output_path = OUTPUT_BASE_PATH / f"{self.panel_level}-level_{output_group}"
         output_path.mkdir(parents=True, exist_ok=True)
 
         if self.event_type == "to B still in A":
-            still_panel = self._build_to_b_panel(mode="still")
+            still_panel, movement_list = self._build_to_b_panel(mode="still")
             if not still_panel.empty:
                 still_panel.to_csv(output_path / f"ssr_firm_panel_to_B_still_in_A.csv", index=False)
-            return
+            return movement_list
 
         if self.event_type == "to B not in A":
-            not_panel = self._build_to_b_panel(mode="not")
+            not_panel, movement_list = self._build_to_b_panel(mode="not")
             if not not_panel.empty:
                 not_panel.to_csv(output_path / f"ssr_firm_panel_to_B_not_in_A.csv", index=False)
-            return
+            return movement_list
 
         if self.event_type in ["direct interlock", "indirect interlock"]:
             panel = self._build_interlock_panel()
             panel.to_csv(output_path / f"ssr_firm_panel_{self.event_type.replace(' ', '_')}.csv", index=False)
-            return
+            return pd.DataFrame()
 
         if self.event_type == "no event":
-            return
+            return pd.DataFrame()
 
         raise ValueError("Unsupported event type")
 
@@ -506,19 +540,54 @@ def main() -> None:
     event_types = ensure_list(RUN_CONFIG["event_types"])
     stay_req = int(RUN_CONFIG["stay_x_years"])
     balance_window = tuple(RUN_CONFIG["balance_window"])
+    treatment_groups = [str(x).upper() for x in ensure_list(RUN_CONFIG.get("treatment_groups", ["B"]))]
+    movement_event_types = {"to B not in A", "to B still in A"}
+    movement_output_path = OUTPUT_BASE_PATH / "movement_list"
+    movement_output_path.mkdir(parents=True, exist_ok=True)
     
     for panel_level in panel_levels:
-        for event_type in event_types:
-            print(
-                f"Generating panel: '{event_type}' | level={panel_level} | "
-                f"stay_{stay_req}_years | balance_window=t{balance_window[0]:+d}..t{balance_window[1]:+d}"
-            )
-            EventStudyPanelSSR(
-                event_type,
-                panel_level=panel_level,
-                stay_x_years=stay_req,
-                balance_window=balance_window,
-            ).merge_event_data()
+        for treatment_group in treatment_groups:
+            movement_parts = []
+            for event_type in event_types:
+                print(
+                    f"Generating panel: '{event_type}' | level={panel_level} | "
+                    f"treatment_group={treatment_group} | "
+                    f"stay_{stay_req}_years | balance_window=t{balance_window[0]:+d}..t{balance_window[1]:+d}"
+                )
+                movement_rows = EventStudyPanelSSR(
+                    event_type,
+                    panel_level=panel_level,
+                    stay_x_years=stay_req,
+                    balance_window=balance_window,
+                    treatment_group=treatment_group,
+                ).merge_event_data()
+
+                if event_type in movement_event_types and not movement_rows.empty:
+                    movement_parts.append(movement_rows)
+
+            selected_movement_types = [et for et in event_types if et in movement_event_types]
+            if selected_movement_types:
+                if movement_parts:
+                    movement_list = (
+                        pd.concat(movement_parts, ignore_index=True)
+                        .drop_duplicates()
+                        .sort_values(["DirectorID", "movement_year", "FirmA", "FirmB", "event_type"])
+                        .reset_index(drop=True)
+                    )
+                else:
+                    movement_list = pd.DataFrame(
+                        columns=["DirectorID", "movement_year", "FirmA", "FirmB", "event_type"]
+                    )
+
+                if len(set(selected_movement_types)) == 2:
+                    movement_name = "to_B_movement"
+                else:
+                    movement_name = selected_movement_types[0].replace(" ", "_")
+
+                movement_list.to_csv(
+                    movement_output_path / f"{movement_name}.csv",
+                    index=False,
+                )
     
     print("All panels generated!")
 

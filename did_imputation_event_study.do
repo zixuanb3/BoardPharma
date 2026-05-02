@@ -24,39 +24,29 @@ set trace off
 // ================================================================
 
 * ================= user config =================
-local separate 1
-
-if !inlist(`separate', 0, 1) {
-    di as error "local separate must be 0 or 1"
-    exit 198
-}
+local separate_modes 1 0
+local trim_percentile "p95"
 
 * ================= path =================
 local code_path "`c(pwd)'"
 local project_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
 local project_path = subinstr("`project_path'", "\", "/", .)
 
-local data_root "`project_path'/data/cohort_data_with_atc3sharing/quarter"
-local output_tag "did_imputation_event_study_sharingatc3"
-local fig_root "`project_path'/figures/`output_tag'/quarter"
-local csv_root "`project_path'/csv/`output_tag'/quarter"
-local log_root "`project_path'/logs/`output_tag'/quarter"
+local data_root "`project_path'/data/cohort_data_with_atc3sharing"
+local output_tag_base "did_imputation_event_study_sharingatc3"
 
 cap mkdir "`project_path'/figures"
 cap mkdir "`project_path'/csv"
 cap mkdir "`project_path'/logs"
-cap mkdir "`project_path'/figures/`output_tag'"
-cap mkdir "`project_path'/csv/`output_tag'"
-cap mkdir "`project_path'/logs/`output_tag'"
-cap mkdir "`fig_root'"
-cap mkdir "`csv_root'"
-cap mkdir "`log_root'"
 
-local events to_B_not_in_A direct_interlock to_B_still_in_A indirect_interlock
+local events to_B_still_in_A to_B_not_in_A direct_interlock indirect_interlock 
 local controls not notyet purecontrol
-local targets revenue price quantity
+local targets price revenue quantity
 local standardize_types standardize normalize
 local event_types event first_event
+local treatment_groups A B
+local include_eventpair_values 1 0
+local fe_levels 1 2
 
 local coef_names pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
 local n_pre_nonref 2
@@ -73,451 +63,530 @@ local did_pretrend 2
 local timevar q_time
 local gvar event_cohort_q
 
-if `separate' == 0 {
-    local mode_tag hetby
-    local mode_title "hetby"
-}
-else {
-    local mode_tag separate
-    local mode_title "separate samples"
-}
-
 * ================= loop =================
-foreach event of local events {
-    foreach target of local targets {
-        foreach control of local controls {
-            foreach std of local standardize_types {
-                foreach event_type of local event_types {
+foreach treatment_group of local treatment_groups {
+    local treatment_group = upper("`treatment_group'")
+    if !inlist("`treatment_group'", "A", "B") {
+        di as error "treatment_group must be one of: A, B"
+        exit 198
+    }
 
-                    * -------- determine quarter cohort list --------
-                    local cohort_list ""
+    local counterpart "A"
+    if "`treatment_group'" == "A" {
+        local counterpart "B"
+    }
 
-                    if "`event'" == "direct_interlock" & "`event_type'" == "first_event" {
-                        local cohort_list 2008 2009 2010 2011 2012 2013 2014 2017 2018
-                    }
-                    else if "`event'" == "direct_interlock" & "`event_type'" == "event" {
-                        local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                    }
-                    else if "`event'" == "indirect_interlock" & "`event_type'" == "first_event" {
-                        local cohort_list 2008 2010 2011 2012 2013 2014
-                    }
-                    else if "`event'" == "indirect_interlock" & "`event_type'" == "event" {
-                        local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                    }
-                    else if "`event'" == "to_B_not_in_A" & "`event_type'" == "first_event" {
-                        local cohort_list 2009 2010 2012 2013 2014 2016 2017 2018
-                    }
-                    else if "`event'" == "to_B_not_in_A" & "`event_type'" == "event" {
-                        local cohort_list 2009 2010 2011 2012 2013 2014 2016 2017 2018
-                    }
-                    else if "`event'" == "to_B_still_in_A" & "`event_type'" == "first_event" {
-                        local cohort_list 2008 2009 2010 2011 2013 2014 2017 2018
-                    }
-                    else if "`event'" == "to_B_still_in_A" & "`event_type'" == "event" {
-                        local cohort_list 2008 2009 2010 2011 2013 2014 2015 2017 2018
-                    }
+    foreach include_eventpair of local include_eventpair_values {
+        if !inlist(`include_eventpair', 0, 1) {
+            di as error "include_eventpair must be one of: 0, 1"
+            exit 198
+        }
 
-                    if "`cohort_list'" == "" {
+        local relation "without"
+        if `include_eventpair' == 1 {
+            local relation "with"
+        }
+
+        local group_label "`treatment_group'_`relation'_`counterpart'"
+        local panel_group_folder "quarter-level_`group_label'"
+        local data_path "`data_root'/`panel_group_folder'"
+
+        foreach fe_level of local fe_levels {
+            foreach separate of local separate_modes {
+                if `separate' == 0 {
+                    local mode_tag hetby
+                    local mode_title "hetby"
+                }
+                else {
+                    local mode_tag separate
+                    local mode_title "separate samples"
+                }
+
+                local fe_output_tag "`output_tag_base'_fe`fe_level'"
+                local fe_fig_root "`project_path'/figures/`fe_output_tag'"
+                local fe_csv_root "`project_path'/csv/`fe_output_tag'"
+                local fe_log_root "`project_path'/logs/`fe_output_tag'"
+
+                cap mkdir "`fe_fig_root'"
+                cap mkdir "`fe_csv_root'"
+                cap mkdir "`fe_log_root'"
+
+                foreach event of local events {
+                    * Interlock events do not vary with treatment/include parameters.
+                    * Keep only one canonical run: treatment_group=B and include_eventpair=1.
+                    if inlist("`event'", "direct_interlock", "indirect_interlock") & ("`treatment_group'" != "B" | `include_eventpair' != 1) {
                         continue
                     }
 
-                    * -------- determine suffix for event_type --------
-                    local suffix ""
-                    if "`event_type'" == "first_event" {
-                        local suffix "_first_event"
-                    }
+                    foreach target of local targets {
+                        foreach control of local controls {
+                            foreach std of local standardize_types {
+                                foreach event_type of local event_types {
 
-                    * -------- determine control folder name --------
-                    if "`control'" == "notyet" {
-                        local control_folder "Not Yet"
-                        local control_fname "not_yet"
-                        local control_title "Not Yet"
-                    }
-                    else if "`control'" == "purecontrol" {
-                        local control_folder "Pure Control"
-                        local control_fname "pure_control"
-                        local control_title "Pure Control"
-                    }
-                    else if "`control'" == "not" {
-                        local control_folder "Not"
-                        local control_fname "not"
-                        local control_title "Not"
-                    }
-                    else {
-                        di as error "Unknown control type"
-                        exit 198
-                    }
+                                * -------- determine quarter cohort list --------
+                                local cohort_list ""
 
-                    local event_name = subinstr("`event'", "_", " ", .)
-
-                    * -------- setup paths for this iteration --------
-                    local event_fig_path "`fig_root'/`event'/`target'"
-                    local event_csv_path "`csv_root'/`event'/`target'"
-                    local event_log_path "`log_root'/`event'/`target'"
-                    cap mkdir "`fig_root'/`event'"
-                    cap mkdir "`csv_root'/`event'"
-                    cap mkdir "`log_root'/`event'"
-                    cap mkdir "`event_fig_path'"
-                    cap mkdir "`event_csv_path'"
-                    cap mkdir "`event_log_path'"
-
-                    local file_stub "`event'_`target'_`event_type'_`control_fname'_`std'_`mode_tag'_sharingatc3"
-
-                    log using "`event_log_path'/`file_stub'.log", text replace
-
-                    local first = 1
-
-                    foreach cohort of local cohort_list {
-                        local data_file "`data_root'/`event_type'/`control_folder'/`event'_quarter_cohort_`cohort'`suffix'_balanced.csv"
-
-                        import delimited "`data_file'", clear
-
-                        if "`std'" == "standardize" {
-                            bysort boardname product: egen temp = std(`target')
-                            replace `target' = temp
-                            drop temp
-                        }
-                        else if "`std'" == "normalize" {
-                            bysort boardname product: gen baseline = `target' if year == `cohort' & quarter == 1
-                            bysort boardname product: egen baseline_value = max(baseline)
-                            replace `target' = `target' / baseline_value
-                            drop baseline baseline_value
-                        }
-
-                        gen event_cohort = .
-                        gen treated_in_stack = 0
-
-                        if "`event_type'" == "event" {
-                            replace event_cohort = `cohort' if event_`cohort' == 1
-                            replace treated_in_stack = (event_`cohort' == 1)
-                        }
-
-                        if "`event_type'" == "first_event" {
-                            replace event_cohort = `cohort' if first_event_year == `cohort'
-                            replace treated_in_stack = first_event_year == `cohort'
-                        }
-
-                        local event_anchor_q = yq(`cohort', 1)
-                        gen rel_quarter = yq(year, quarter) - `event_anchor_q' if treated_in_stack == 1
-
-                        forvalues i = 1/4 {
-                            gen pre_`i' = treated_in_stack == 1 & rel_quarter == -`i'
-                        }
-                        forvalues i = 0/7 {
-                            gen post_`i' = treated_in_stack == 1 & rel_quarter == `i'
-                        }
-                        drop rel_quarter
-
-                        gen data_cohort = `cohort'
-
-                        if `first' {
-                            tempfile master
-                            save `master', replace
-                            local first = 0
-                        }
-                        else {
-                            append using `master'
-                            save `master', replace
-                        }
-                    }
-
-                    use `master', clear
-
-                    if "`std'" == "normalize" {
-                        bysort boardname product data_cohort: egen group_max_norm = max(`target')
-                        bysort boardname product data_cohort: egen group_min_norm = min(`target')
-                        gen group_ratio_norm = .
-                        replace group_ratio_norm = group_max_norm / group_min_norm if group_min_norm != 0 & !missing(group_min_norm)
-
-                        preserve
-                        keep boardname product data_cohort group_ratio_norm
-                        bysort boardname product data_cohort: keep if _n == 1
-                        quietly summarize group_ratio_norm, detail
-                        local p95_group_ratio = r(p95)
-                        restore
-
-                        drop if group_ratio_norm > `p95_group_ratio' & !missing(group_ratio_norm)
-                        drop group_max_norm group_min_norm group_ratio_norm
-                    }
-
-					
-                    egen id = group(boardname product data_cohort)
-                    gen q_time = yq(year, quarter)
-                    format q_time %tq
-                    gen event_cohort_q = yq(event_cohort, 1) if !missing(event_cohort)
-
-                    gen treated = !missing(event_cohort) & event_cohort != 0
-                    gen event_cohort_did_imputation = `gvar'
-                    replace event_cohort_did_imputation = . if event_cohort_did_imputation == 0
-
-                    foreach sval in 0 1 {
-                        matrix did2_b_s`sval' = J(1, `n_total', .)
-                        matrix did2_V_s`sval' = J(`n_total', `n_total', 0)
-                        matrix colnames did2_b_s`sval' = `coef_names'
-                        matrix colnames did2_V_s`sval' = `coef_names'
-                        matrix rownames did2_V_s`sval' = `coef_names'
-                    }
-
-                    * ============================================================
-                    * 1. separate = 0: one did_imputation with hetby
-                    * ============================================================
-                    if `separate' == 0 {
-                        gen atc3_sharing_het = atc3_sharing if treated == 1
-                        replace atc3_sharing_het = 0 if treated == 0
-
-                        did_imputation `target' id `timevar' event_cohort_did_imputation, ///
-                            fe(id `timevar') horizons(`did_horizons') pretrends(`did_pretrend') ///
-                            hetby(atc3_sharing_het) autosample tol(0.1) minn(0)
-
-                        matrix did2_b_full = e(b)
-                        matrix did2_V_full = e(V)
-                        local did2_ncol = colsof(did2_b_full)
-                        local did2_names : colnames did2_b_full
-
-                        foreach sval in 0 1 {
-                            tempname col_map
-                            matrix `col_map' = J(1, `n_total', 0)
-
-                            forvalues i = 1/`n_total' {
-                                local coef_name : word `i' of `coef_names'
-                                local found_col 0
-
-                                local candidate_list ""
-
-                                if substr("`coef_name'", 1, 4) == "pre_" {
-                                    local k = substr("`coef_name'", 5, .)
-                                    local candidate_list pre`k'
+                                * Interlock events are unchanged by treatment_group/include_eventpair.
+                                if "`event'" == "direct_interlock" & "`event_type'" == "first_event" {
+                                    local cohort_list 2008 2009 2010 2011 2012 2013 2014 2017 2018
                                 }
-                                else if substr("`coef_name'", 1, 5) == "post_" {
-                                    local h = substr("`coef_name'", 6, .)
-                                    local candidate_list tau`h'_`sval'
+                                else if "`event'" == "direct_interlock" & "`event_type'" == "event" {
+                                    local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                }
+                                else if "`event'" == "indirect_interlock" & "`event_type'" == "first_event" {
+                                    local cohort_list 2008 2010 2011 2012 2013 2014
+                                }
+                                else if "`event'" == "indirect_interlock" & "`event_type'" == "event" {
+                                    local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
                                 }
 
-                                foreach candidate of local candidate_list {
-                                    forvalues c = 1/`did2_ncol' {
-                                        local cn : word `c' of `did2_names'
-                                        if `found_col' == 0 & "`cn'" == "`candidate'" {
-                                            local found_col `c'
+                                * Movement events use treatment_group-specific cohort windows.
+                                else if "`event'" == "to_B_not_in_A" & "`event_type'" == "first_event" {
+                                    if "`treatment_group'" == "A" {
+                                        local cohort_list 2008 2009 2010 2012 2013 2016 2017 2018
+                                    }
+                                    else {
+                                        local cohort_list 2009 2010 2012 2013 2014 2016 2017 2018
+                                    }
+                                }
+                                else if "`event'" == "to_B_not_in_A" & "`event_type'" == "event" {
+                                    if "`treatment_group'" == "A" {
+                                        local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                    }
+                                    else {
+                                        local cohort_list 2009 2010 2011 2012 2013 2014 2016 2017 2018
+                                    }
+                                }
+                                else if "`event'" == "to_B_still_in_A" & "`event_type'" == "first_event" {
+                                    if "`treatment_group'" == "A" {
+                                        local cohort_list 2009 2010 2011 2012 2013 2015 2017
+                                    }
+                                    else {
+                                        local cohort_list 2008 2009 2010 2011 2013 2014 2017 2018
+                                    }
+                                }
+                                else if "`event'" == "to_B_still_in_A" & "`event_type'" == "event" {
+                                    if "`treatment_group'" == "A" {
+                                        local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                    }
+                                    else {
+                                        local cohort_list 2008 2009 2010 2011 2013 2014 2015 2017 2018
+                                    }
+                                }
+
+                                if "`cohort_list'" == "" {
+                                    continue
+                                }
+
+                                * -------- determine suffix for event_type --------
+                                local suffix ""
+                                if "`event_type'" == "first_event" {
+                                    local suffix "_first_event"
+                                }
+
+                                * -------- determine control folder name --------
+                                if "`control'" == "notyet" {
+                                    local control_folder "Not Yet"
+                                    local control_fname "not_yet"
+                                    local control_title "Not Yet"
+                                }
+                                else if "`control'" == "purecontrol" {
+                                    local control_folder "Pure Control"
+                                    local control_fname "pure_control"
+                                    local control_title "Pure Control"
+                                }
+                                else if "`control'" == "not" {
+                                    local control_folder "Not"
+                                    local control_fname "not"
+                                    local control_title "Not"
+                                }
+                                else {
+                                    di as error "Unknown control type"
+                                    exit 198
+                                }
+
+                                local event_name = subinstr("`event'", "_", " ", .)
+
+                                * -------- setup paths for this iteration --------
+                                local event_fig_path "`fe_fig_root'/`panel_group_folder'/`event'/`target'"
+                                local event_csv_path "`fe_csv_root'/`panel_group_folder'/`event'/`target'"
+                                local event_log_path "`fe_log_root'/`panel_group_folder'/`event'/`target'"
+                                cap mkdir "`fe_fig_root'/`panel_group_folder'"
+                                cap mkdir "`fe_csv_root'/`panel_group_folder'"
+                                cap mkdir "`fe_log_root'/`panel_group_folder'"
+                                cap mkdir "`fe_fig_root'/`panel_group_folder'/`event'"
+                                cap mkdir "`fe_csv_root'/`panel_group_folder'/`event'"
+                                cap mkdir "`fe_log_root'/`panel_group_folder'/`event'"
+                                cap mkdir "`event_fig_path'"
+                                cap mkdir "`event_csv_path'"
+                                cap mkdir "`event_log_path'"
+
+                                local file_stub "`event'_`target'_`event_type'_`control_fname'_`std'_`mode_tag'_sharingatc3_fe`fe_level'_`group_label'"
+
+                                cap log close
+                                log using "`event_log_path'/`file_stub'.log", text replace
+
+                                local first = 1
+
+                                foreach cohort of local cohort_list {
+                                    local data_file "`data_path'/`event_type'/`control_folder'/`event'_quarter_cohort_`cohort'`suffix'_balanced.csv"
+
+                                    import delimited "`data_file'", clear
+
+                                    gen event_cohort = .
+                                    gen treated_in_stack = 0
+
+                                    if "`event_type'" == "event" {
+                                        replace event_cohort = `cohort' if event_`cohort' == 1
+                                        replace treated_in_stack = (event_`cohort' == 1)
+                                    }
+
+                                    if "`event_type'" == "first_event" {
+                                        replace event_cohort = `cohort' if first_event_year == `cohort'
+                                        replace treated_in_stack = first_event_year == `cohort'
+                                    }
+
+                                    local event_anchor_q = yq(`cohort', 1)
+                                    gen rel_quarter = yq(year, quarter) - `event_anchor_q' if treated_in_stack == 1
+
+                                    forvalues i = 1/4 {
+                                        gen pre_`i' = treated_in_stack == 1 & rel_quarter == -`i'
+                                    }
+                                    drop if pre_4 == 1
+                                    forvalues i = 0/7 {
+                                        gen post_`i' = treated_in_stack == 1 & rel_quarter == `i'
+                                    }
+                                    drop rel_quarter
+
+                                    gen data_cohort = `cohort'
+
+                                    if `first' {
+                                        tempfile master
+                                        save `master', replace
+                                        local first = 0
+                                    }
+                                    else {
+                                        append using `master'
+                                        save `master', replace
+                                    }
+                                }
+
+                                use `master', clear
+
+                                bysort boardname product data_cohort: egen group_max_norm = max(`target')
+                                bysort boardname product data_cohort: egen group_min_norm = min(`target')
+                                gen group_ratio_norm = .
+                                replace group_ratio_norm = group_max_norm / group_min_norm if group_min_norm != 0 & !missing(group_min_norm)
+
+                                preserve
+                                keep boardname product data_cohort group_ratio_norm
+                                bysort boardname product data_cohort: keep if _n == 1
+                                quietly summarize group_ratio_norm, detail
+                                local p95_group_ratio = r(`trim_percentile')
+                                restore
+
+                                drop if group_ratio_norm > `p95_group_ratio' & !missing(group_ratio_norm)
+                                drop group_max_norm group_min_norm group_ratio_norm
+
+                                if "`std'" == "standardize" {
+                                    bysort boardname product data_cohort: egen temp = std(`target')
+                                    replace `target' = temp
+                                    drop temp
+                                }
+                                else if "`std'" == "normalize" {
+                                    bysort boardname product data_cohort: gen baseline = `target' if year == data_cohort & quarter == 1
+                                    bysort boardname product data_cohort: egen baseline_value = max(baseline)
+                                    replace `target' = `target' / baseline_value
+                                    drop baseline baseline_value
+                                }
+
+                                egen id = group(boardname product data_cohort)
+                                gen q_time = yq(year, quarter)
+                                format q_time %tq
+                                gen event_cohort_q = yq(event_cohort, 1) if !missing(event_cohort)
+
+                                egen cohort_q_time_fe = group(data_cohort q_time)
+
+                                local fe_spec "id `timevar'"
+                                if `fe_level' == 2 {
+                                    local fe_spec "id cohort_q_time_fe"
+                                }
+
+                                gen treated = !missing(event_cohort) & event_cohort != 0
+                                gen event_cohort_did_imputation = `gvar'
+                                replace event_cohort_did_imputation = . if event_cohort_did_imputation == 0
+
+                                foreach sval in 0 1 {
+                                    matrix did2_b_s`sval' = J(1, `n_total', .)
+                                    matrix did2_V_s`sval' = J(`n_total', `n_total', 0)
+                                    matrix colnames did2_b_s`sval' = `coef_names'
+                                    matrix colnames did2_V_s`sval' = `coef_names'
+                                    matrix rownames did2_V_s`sval' = `coef_names'
+                                }
+
+                                * ============================================================
+                                * 1. separate = 0: one did_imputation with hetby
+                                * ============================================================
+                                if `separate' == 0 {
+                                    gen atc3_sharing_het = atc3_sharing if treated == 1
+                                    replace atc3_sharing_het = 0 if treated == 0
+
+                                    did_imputation `target' id `timevar' event_cohort_did_imputation, ///
+                                        fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') ///
+                                        hetby(atc3_sharing_het) autosample tol(0.1) minn(0)
+
+                                    matrix did2_b_full = e(b)
+                                    matrix did2_V_full = e(V)
+                                    local did2_ncol = colsof(did2_b_full)
+                                    local did2_names : colnames did2_b_full
+
+                                    foreach sval in 0 1 {
+                                        tempname col_map
+                                        matrix `col_map' = J(1, `n_total', 0)
+
+                                        forvalues i = 1/`n_total' {
+                                            local coef_name : word `i' of `coef_names'
+                                            local found_col 0
+
+                                            local candidate_list ""
+
+                                            if substr("`coef_name'", 1, 4) == "pre_" {
+                                                local k = substr("`coef_name'", 5, .)
+                                                local candidate_list pre`k'
+                                            }
+                                            else if substr("`coef_name'", 1, 5) == "post_" {
+                                                local h = substr("`coef_name'", 6, .)
+                                                local candidate_list tau`h'_`sval'
+                                            }
+
+                                            foreach candidate of local candidate_list {
+                                                forvalues c = 1/`did2_ncol' {
+                                                    local cn : word `c' of `did2_names'
+                                                    if `found_col' == 0 & "`cn'" == "`candidate'" {
+                                                        local found_col `c'
+                                                    }
+                                                }
+                                            }
+
+                                            if `found_col' > 0 {
+                                                matrix `col_map'[1, `i'] = `found_col'
+                                                matrix did2_b_s`sval'[1, `i'] = did2_b_full[1, `found_col']
+                                            }
+                                            else {
+                                                di as error "Coefficient not estimated in hetby mode: `coef_name' for sharingatc3=`sval'"
+                                                exit 498
+                                            }
+                                        }
+
+                                        forvalues i = 1/`n_total' {
+                                            local ci = el(`col_map', 1, `i')
+                                            if `ci' == 0 {
+                                                continue
+                                            }
+                                            forvalues j = 1/`n_total' {
+                                                local cj = el(`col_map', 1, `j')
+                                                if `cj' == 0 {
+                                                    continue
+                                                }
+                                                matrix did2_V_s`sval'[`i', `j'] = did2_V_full[`ci', `cj']
+                                            }
+                                        }
+                                    }
+
+                                    * Common pretrends should be shown only once in the graph.
+                                    forvalues i = 1/`n_total' {
+                                        local coef_name : word `i' of `coef_names'
+                                        if substr("`coef_name'", 1, 4) == "pre_" {
+                                            matrix did2_b_s1[1, `i'] = .
+                                            forvalues j = 1/`n_total' {
+                                                matrix did2_V_s1[`i', `j'] = 0
+                                                matrix did2_V_s1[`j', `i'] = 0
+                                            }
                                         }
                                     }
                                 }
 
-                                if `found_col' > 0 {
-                                    matrix `col_map'[1, `i'] = `found_col'
-                                    matrix did2_b_s`sval'[1, `i'] = did2_b_full[1, `found_col']
-                                }
-                                else {
-                                    di as error "Coefficient not estimated in hetby mode: `coef_name' for sharingatc3=`sval'"
-                                    exit 498
-                                }
-                            }
+                                * ============================================================
+                                * 2. separate = 1: run two separate did_imputation regressions
+                                * ============================================================
+                                if `separate' == 1 {
+                                    foreach sval in 0 1 {
+                                        preserve
+                                        drop if treated == 1 & atc3_sharing != `sval'
 
-                            forvalues i = 1/`n_total' {
-                                local ci = el(`col_map', 1, `i')
-                                if `ci' == 0 {
-                                    continue
-                                }
-                                forvalues j = 1/`n_total' {
-                                    local cj = el(`col_map', 1, `j')
-                                    if `cj' == 0 {
-                                        continue
+                                        did_imputation `target' id `timevar' event_cohort_did_imputation, ///
+                                            fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') ///
+                                            autosample tol(0.1) minn(0)
+
+                                        matrix did2_b_full = e(b)
+                                        matrix did2_V_full = e(V)
+                                        local did2_ncol = colsof(did2_b_full)
+                                        local did2_names : colnames did2_b_full
+
+                                        tempname col_map
+                                        matrix `col_map' = J(1, `n_total', 0)
+
+                                        forvalues i = 1/`n_total' {
+                                            local coef_name : word `i' of `coef_names'
+                                            local found_col 0
+
+                                            local candidate_list ""
+
+                                            if substr("`coef_name'", 1, 4) == "pre_" {
+                                                local k = substr("`coef_name'", 5, .)
+                                                local candidate_list pre`k'
+                                            }
+                                            else if substr("`coef_name'", 1, 5) == "post_" {
+                                                local h = substr("`coef_name'", 6, .)
+                                                local candidate_list tau`h'
+                                            }
+
+                                            foreach candidate of local candidate_list {
+                                                forvalues c = 1/`did2_ncol' {
+                                                    local cn : word `c' of `did2_names'
+                                                    if `found_col' == 0 & "`cn'" == "`candidate'" {
+                                                        local found_col `c'
+                                                    }
+                                                }
+                                            }
+
+                                            if `found_col' > 0 {
+                                                matrix `col_map'[1, `i'] = `found_col'
+                                                matrix did2_b_s`sval'[1, `i'] = did2_b_full[1, `found_col']
+                                            }
+                                            else {
+                                                di as error "Coefficient not estimated in separate mode: `coef_name' for sharingatc3=`sval'"
+                                                exit 498
+                                            }
+                                        }
+
+                                        forvalues i = 1/`n_total' {
+                                            local ci = el(`col_map', 1, `i')
+                                            if `ci' == 0 {
+                                                continue
+                                            }
+                                            forvalues j = 1/`n_total' {
+                                                local cj = el(`col_map', 1, `j')
+                                                if `cj' == 0 {
+                                                    continue
+                                                }
+                                                matrix did2_V_s`sval'[`i', `j'] = did2_V_full[`ci', `cj']
+                                            }
+                                        }
+                                        restore
                                     }
-                                    matrix did2_V_s`sval'[`i', `j'] = did2_V_full[`ci', `cj']
-                                }
-                            }
-                        }
-
-                        * Common pretrends should be shown only once in the graph.
-                        forvalues i = 1/`n_total' {
-                            local coef_name : word `i' of `coef_names'
-                            if substr("`coef_name'", 1, 4) == "pre_" {
-                                matrix did2_b_s1[1, `i'] = .
-                                forvalues j = 1/`n_total' {
-                                    matrix did2_V_s1[`i', `j'] = 0
-                                    matrix did2_V_s1[`j', `i'] = 0
-                                }
-                            }
-                        }
-                    }
-
-                    * ============================================================
-                    * 2. separate = 1: run two separate did_imputation regressions
-                    * ============================================================
-                    if `separate' == 1 {
-                        foreach sval in 0 1 {
-                            preserve
-                            drop if treated == 1 & atc3_sharing != `sval'
-
-                            did_imputation `target' id `timevar' event_cohort_did_imputation, ///
-                                fe(id `timevar') horizons(`did_horizons') pretrends(`did_pretrend') ///
-                                autosample tol(0.1) minn(0)
-
-                            matrix did2_b_full = e(b)
-                            matrix did2_V_full = e(V)
-                            local did2_ncol = colsof(did2_b_full)
-                            local did2_names : colnames did2_b_full
-
-                            tempname col_map
-                            matrix `col_map' = J(1, `n_total', 0)
-
-                            forvalues i = 1/`n_total' {
-                                local coef_name : word `i' of `coef_names'
-                                local found_col 0
-
-                                local candidate_list ""
-
-                                if substr("`coef_name'", 1, 4) == "pre_" {
-                                    local k = substr("`coef_name'", 5, .)
-                                    local candidate_list pre`k'
-                                }
-                                else if substr("`coef_name'", 1, 5) == "post_" {
-                                    local h = substr("`coef_name'", 6, .)
-                                    local candidate_list tau`h'
                                 }
 
-                                foreach candidate of local candidate_list {
-                                    forvalues c = 1/`did2_ncol' {
-                                        local cn : word `c' of `did2_names'
-                                        if `found_col' == 0 & "`cn'" == "`candidate'" {
-                                            local found_col `c'
+                                * -------- export regression results for re-plotting --------
+                                preserve
+                                clear
+                                set obs 0
+
+                                gen str32 event = ""
+                                gen str16 target = ""
+                                gen str16 control = ""
+                                gen str16 standardize = ""
+                                gen str16 event_type = ""
+                                gen str16 mode = ""
+                                gen sharingatc3 = .
+                                gen str16 coef_name = ""
+                                gen rel_quarter = .
+                                gen estimate = .
+                                gen variance = .
+                                gen std_error = .
+                                gen ci_lb_95 = .
+                                gen ci_ub_95 = .
+                                foreach cov_name of local coef_names {
+                                    gen cov_`cov_name' = .
+                                }
+
+                                forvalues sval = 0/1 {
+                                    forvalues i = 1/`n_total' {
+                                        local this_coef : word `i' of `coef_names'
+                                        local b = el(did2_b_s`sval', 1, `i')
+                                        local v = el(did2_V_s`sval', `i', `i')
+                                        local se = .
+                                        local lb = .
+                                        local ub = .
+                                        local rel_q = .
+
+                                        if !missing(`v') & `v' >= 0 {
+                                            local se = sqrt(`v')
+                                        }
+                                        if !missing(`b') & !missing(`se') {
+                                            local lb = `b' - 1.96 * `se'
+                                            local ub = `b' + 1.96 * `se'
+                                        }
+
+                                        if substr("`this_coef'", 1, 4) == "pre_" {
+                                            local rel_q = -real(substr("`this_coef'", 5, .))
+                                        }
+                                        else if substr("`this_coef'", 1, 5) == "post_" {
+                                            local rel_q = real(substr("`this_coef'", 6, .))
+                                        }
+
+                                        local row = _N + 1
+                                        set obs `row'
+                                        replace event = "`event'" in `row'
+                                        replace target = "`target'" in `row'
+                                        replace control = "`control'" in `row'
+                                        replace standardize = "`std'" in `row'
+                                        replace event_type = "`event_type'" in `row'
+                                        replace mode = "`mode_tag'" in `row'
+                                        replace sharingatc3 = `sval' in `row'
+                                        replace coef_name = "`this_coef'" in `row'
+                                        replace rel_quarter = `rel_q' in `row'
+                                        replace estimate = `b' in `row'
+                                        replace variance = `v' in `row'
+                                        replace std_error = `se' in `row'
+                                        replace ci_lb_95 = `lb' in `row'
+                                        replace ci_ub_95 = `ub' in `row'
+
+                                        forvalues j = 1/`n_total' {
+                                            local cov_coef : word `j' of `coef_names'
+                                            replace cov_`cov_coef' = el(did2_V_s`sval', `i', `j') in `row'
                                         }
                                     }
                                 }
 
-                                if `found_col' > 0 {
-                                    matrix `col_map'[1, `i'] = `found_col'
-                                    matrix did2_b_s`sval'[1, `i'] = did2_b_full[1, `found_col']
-                                }
-                                else {
-                                    di as error "Coefficient not estimated in separate mode: `coef_name' for sharingatc3=`sval'"
-                                    exit 498
-                                }
-                            }
+                                sort sharingatc3 rel_quarter
+                                export delimited using "`event_csv_path'/`file_stub'.csv", replace
+                                restore
 
-                            forvalues i = 1/`n_total' {
-                                local ci = el(`col_map', 1, `i')
-                                if `ci' == 0 {
-                                    continue
-                                }
-                                forvalues j = 1/`n_total' {
-                                    local cj = el(`col_map', 1, `j')
-                                    if `cj' == 0 {
-                                        continue
-                                    }
-                                    matrix did2_V_s`sval'[`i', `j'] = did2_V_full[`ci', `cj']
-                                }
-                            }
-                            restore
-                        }
-                    }
+                                * -------- plot two sharing groups together --------
+                                local graph_title_size small
 
-                    * -------- export regression results for re-plotting --------
-                    preserve
-                    clear
-                    set obs 0
+                                event_plot did2_b_s0#did2_V_s0 did2_b_s1#did2_V_s1, ///
+                                    stub_lag(post_# post_#) ///
+                                    stub_lead(pre_# pre_#) ///
+                                    trimlead(`trimlead') trimlag(`trimlag') ///
+                                    plottype(scatter) ciplottype(rcap) ///
+                                    together perturb(-`perturb_step'(`perturb_span')`perturb_step') noautolegend ///
+                                    graph_opt( ///
+                                        title("did_imputation (`mode_title'): `event_name' `event_type' `control_title' `std' | `group_label'", size(`graph_title_size')) ///
+                                        xtitle("Periods since the event", size(small)) ///
+                                        ytitle("`target'", size(`graph_title_size')) ///
+                                        xlabel(`xlabel_spec', nogrid) ///
+                                        legend(order(1 "sharingatc3=0" 3 "sharingatc3=1") ///
+                                            rows(1) position(6) region(style(none))) ///
+                                        xline(-0.5, lcolor(gs8) lpattern(dash)) ///
+                                        yline(0, lcolor(gs8)) ///
+                                        graphregion(color(white)) bgcolor(white) ///
+                                        ylabel(, angle(horizontal)) ///
+                                    ) ///
+                                    lag_opt1(msymbol(O) color(black)) lag_ci_opt1(color(black)) ///
+                                    lag_opt2(msymbol(Th) color(navy)) lag_ci_opt2(color(navy))
 
-                    gen str32 event = ""
-                    gen str16 target = ""
-                    gen str16 control = ""
-                    gen str16 standardize = ""
-                    gen str16 event_type = ""
-                    gen str16 mode = ""
-                    gen sharingatc3 = .
-                    gen str16 coef_name = ""
-                    gen rel_quarter = .
-                    gen estimate = .
-                    gen variance = .
-                    gen std_error = .
-                    gen ci_lb_95 = .
-                    gen ci_ub_95 = .
-                    foreach cov_name of local coef_names {
-                        gen cov_`cov_name' = .
-                    }
+                                graph export "`event_fig_path'/`file_stub'.png", replace width(`graph_width')
 
-                    forvalues sval = 0/1 {
-                        forvalues i = 1/`n_total' {
-                            local this_coef : word `i' of `coef_names'
-                            local b = el(did2_b_s`sval', 1, `i')
-                            local v = el(did2_V_s`sval', `i', `i')
-                            local se = .
-                            local lb = .
-                            local ub = .
-                            local rel_q = .
-
-                            if !missing(`v') & `v' >= 0 {
-                                local se = sqrt(`v')
-                            }
-                            if !missing(`b') & !missing(`se') {
-                                local lb = `b' - 1.96 * `se'
-                                local ub = `b' + 1.96 * `se'
-                            }
-
-                            if substr("`this_coef'", 1, 4) == "pre_" {
-                                local rel_q = -real(substr("`this_coef'", 5, .))
-                            }
-                            else if substr("`this_coef'", 1, 5) == "post_" {
-                                local rel_q = real(substr("`this_coef'", 6, .))
-                            }
-
-                            local row = _N + 1
-                            set obs `row'
-                            replace event = "`event'" in `row'
-                            replace target = "`target'" in `row'
-                            replace control = "`control'" in `row'
-                            replace standardize = "`std'" in `row'
-                            replace event_type = "`event_type'" in `row'
-                            replace mode = "`mode_tag'" in `row'
-                            replace sharingatc3 = `sval' in `row'
-                            replace coef_name = "`this_coef'" in `row'
-                            replace rel_quarter = `rel_q' in `row'
-                            replace estimate = `b' in `row'
-                            replace variance = `v' in `row'
-                            replace std_error = `se' in `row'
-                            replace ci_lb_95 = `lb' in `row'
-                            replace ci_ub_95 = `ub' in `row'
-
-                            forvalues j = 1/`n_total' {
-                                local cov_coef : word `j' of `coef_names'
-                                replace cov_`cov_coef' = el(did2_V_s`sval', `i', `j') in `row'
+                                log close
                             }
                         }
                     }
-
-                    sort sharingatc3 rel_quarter
-                    export delimited using "`event_csv_path'/`file_stub'.csv", replace
-                    restore
-
-                    * -------- plot two sharing groups together --------
-                    local graph_title_size medium
-
-                    event_plot did2_b_s0#did2_V_s0 did2_b_s1#did2_V_s1, ///
-                        stub_lag(post_# post_#) ///
-                        stub_lead(pre_# pre_#) ///
-                        trimlead(`trimlead') trimlag(`trimlag') ///
-                        plottype(scatter) ciplottype(rcap) ///
-                        together perturb(-`perturb_step'(`perturb_span')`perturb_step') noautolegend ///
-                        graph_opt( ///
-                            title("did_imputation (`mode_title'): `event_name' `event_type' `control_title' `std'", size(`graph_title_size')) ///
-                            xtitle("Periods since the event", size(small)) ///
-                            ytitle("`target'", size(`graph_title_size')) ///
-                            xlabel(`xlabel_spec', nogrid) ///
-                            legend(order(1 "sharingatc3=0" 3 "sharingatc3=1") ///
-                                   rows(1) position(6) region(style(none))) ///
-                            xline(-0.5, lcolor(gs8) lpattern(dash)) ///
-                            yline(0, lcolor(gs8)) ///
-                            graphregion(color(white)) bgcolor(white) ///
-                            ylabel(, angle(horizontal)) ///
-                        ) ///
-                        lag_opt1(msymbol(O) color(black)) lag_ci_opt1(color(black)) ///
-                        lag_opt2(msymbol(Th) color(navy)) lag_ci_opt2(color(navy))
-
-                    graph export "`event_fig_path'/`file_stub'.png", replace width(`graph_width')
-
-                    log close
                 }
             }
         }
     }
 }
-
+}
 clear all

@@ -17,7 +17,8 @@ Input:
 - InterimData/boardex_pharma.dta
 
 Output:
-- data/event.xlsx
+- data/event_B.xlsx
+- data/event_A.xlsx
 """
 
 from itertools import product
@@ -29,7 +30,8 @@ import pandas as pd
 CURRENT_PATH = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_PATH.parent
 INTERIM_DATA_PATH = PROJECT_ROOT / "InterimData"
-OUTPUT_PATH = PROJECT_ROOT / "data" / "event.xlsx"
+OUTPUT_PATH_B = PROJECT_ROOT / "data" / "event_B.xlsx"
+OUTPUT_PATH_A = PROJECT_ROOT / "data" / "event_A.xlsx"
 
 
 # ========================== USER CONFIG ==========================
@@ -196,8 +198,12 @@ def build_transition_rows(pharma: pd.DataFrame, stay_x_years: int = 3) -> pd.Dat
     return pd.DataFrame(rows)
 
 
-def build_transition_events(stay_x_years: int = 3) -> pd.DataFrame:
-    """Build to_B_still_in_A and to_B_not_in_A events with stay_x_years filter."""
+def build_transition_events(stay_x_years: int = 3, treatment_group: str = "B") -> pd.DataFrame:
+    """Build movement events with stay_x_years filter for chosen treated group."""
+    treatment_group = str(treatment_group).upper()
+    if treatment_group not in {"A", "B"}:
+        raise ValueError("treatment_group must be one of: A, B")
+
     pharma = pd.read_stata(INTERIM_DATA_PATH / "boardex_pharma.dta")
     transitions = build_transition_rows(pharma, stay_x_years=stay_x_years)
 
@@ -220,19 +226,21 @@ def build_transition_events(stay_x_years: int = 3) -> pd.DataFrame:
         )
     )
 
+    counterpart_group = "A" if treatment_group == "B" else "B"
+
     def collapse(flag_col: str, stay_col: str, event_name: str) -> pd.DataFrame:
         tmp = pair_level.loc[
             pair_level[flag_col].eq(1) & pair_level[stay_col].eq(1),
-            ["year", "B", "A"],
+            ["year", treatment_group, counterpart_group],
         ].dropna()
 
         if tmp.empty:
             return pd.DataFrame(columns=["BoardName", "year", "event", "BoardNamePair"])
 
         out = (
-            tmp.groupby(["B", "year"], as_index=False)["A"]
+            tmp.groupby([treatment_group, "year"], as_index=False)[counterpart_group]
             .agg(_sorted_unique_list)
-            .rename(columns={"B": "BoardName", "A": "BoardNamePair"})
+            .rename(columns={treatment_group: "BoardName", counterpart_group: "BoardNamePair"})
         )
         out["event"] = event_name
         out["year"] = out["year"].astype(int)
@@ -243,7 +251,7 @@ def build_transition_events(stay_x_years: int = 3) -> pd.DataFrame:
     return pd.concat([still, not_in_a], ignore_index=True)
 
 
-def build_all_events(stay_x_years: int = 3) -> pd.DataFrame:
+def build_all_events(stay_x_years: int = 3, treatment_group: str = "B") -> pd.DataFrame:
     """Build and combine all event types under one persistence setting."""
     ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv", usecols=["BoardName"])
     valid_boards = set(ssr["BoardName"].dropna().unique())
@@ -260,7 +268,10 @@ def build_all_events(stay_x_years: int = 3) -> pd.DataFrame:
         valid_boards=valid_boards,
         stay_x_years=stay_x_years,
     )
-    transition = build_transition_events(stay_x_years=stay_x_years)
+    transition = build_transition_events(
+        stay_x_years=stay_x_years,
+        treatment_group=treatment_group,
+    )
 
     events = pd.concat([direct, indirect, transition], ignore_index=True)
     # Deduplicate in case source files contain repeated pair-year entries.
@@ -273,19 +284,27 @@ def main() -> None:
     stay_x_years = int(RUN_CONFIG["stay_x_years"])
 
     base = build_base_timeline()
-    events = build_all_events(stay_x_years=stay_x_years)
 
-    # Keep the full timeline even when no event exists in a given year.
-    result = base.merge(events, on=["BoardName", "year"], how="left")
+    for treatment_group, output_path in (("B", OUTPUT_PATH_B), ("A", OUTPUT_PATH_A)):
+        events = build_all_events(
+            stay_x_years=stay_x_years,
+            treatment_group=treatment_group,
+        )
 
-    # Export schema for downstream scripts.
-    result = result[["BoardName", "product", "year", "event", "BoardNamePair"]]
-    result = result.sort_values(["BoardName", "year", "event"], na_position="last").reset_index(drop=True)
+        # Keep the full timeline even when no event exists in a given year.
+        result = base.merge(events, on=["BoardName", "year"], how="left")
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    result.to_excel(OUTPUT_PATH, index=False)
+        # Export schema for downstream scripts.
+        result = result[["BoardName", "product", "year", "event", "BoardNamePair"]]
+        result = result.sort_values(["BoardName", "year", "event"], na_position="last").reset_index(drop=True)
 
-    print(f"Saved: {OUTPUT_PATH} (stay_{stay_x_years}_years)")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        result.to_excel(output_path, index=False)
+
+        print(
+            f"Saved: {output_path} "
+            f"(stay_{stay_x_years}_years, movement_treatment_group={treatment_group})"
+        )
 
 
 if __name__ == "__main__":
