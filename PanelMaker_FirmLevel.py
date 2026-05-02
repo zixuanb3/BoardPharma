@@ -21,6 +21,18 @@ Input:
 - InterimData/boardex_interlock_indirect_firmpair.dta
 - InterimData/boardex_pharma.dta
 
+Provenance of the `revenue` variable in boardex_ssr_price_sample.csv:
+1. /Dropbox/SSR/Stata/codes/1_clean/2_clean_ssr.do:88-91 — picks `avgnet` from
+   raw revenue_ssr.csv, renames it to `revenue`, and saves
+   data1e_ssr_sample_brand_firm_quarter.dta.
+2. /Dropbox/BoardPharma/codes/2_merge/Task4.1.py:28 — reads
+   data1e_ssr_sample_brand_firm_quarter.dta, uses `revenue` only to compute
+   market-share weights (lines 76-77), then writes boardex_ssr_price_sample.csv
+   (line 298).
+3. This script (PanelMaker_FirmLevel.py) then consumes
+   InterimData/boardex_ssr_price_sample.csv — i.e., the file produced in step 2.
+So the `revenue` carried through every downstream panel here is SSR `avgnet`.
+
 Output:
 - data/year-level_{A|B}_{with|without}_{B|A}/ssr_firm_panel_*.csv
 - data/quarter-level_{A|B}_{with|without}_{B|A}/ssr_firm_panel_*.csv
