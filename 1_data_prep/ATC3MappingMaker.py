@@ -136,7 +136,7 @@ def main():
 if __name__ == "__main__":
     # Resolve project paths for data I/O.
     script_dir = Path(__file__).resolve().parent
-    workspace_root = script_dir.parent
+    workspace_root = script_dir.parent.parent
     
     interim_data_path = workspace_root / "InterimData"
     

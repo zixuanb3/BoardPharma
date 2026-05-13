@@ -97,7 +97,7 @@ def build_staggered_panel(
 
     level_folder = "year-level" if panel_level == "year" else "quarter-level"
 
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parents[2]
     input_path = project_root / "data" / level_folder / EVENT_FILE_MAP[event_type]
 
     # Upstream firm-level panel contains event flags and first_event_year.

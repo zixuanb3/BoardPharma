@@ -30,7 +30,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Event key to panel filename mapping.
 EVENT_CONFIGS = {

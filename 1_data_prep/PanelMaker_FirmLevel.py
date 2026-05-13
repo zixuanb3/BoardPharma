@@ -44,13 +44,14 @@ import warnings
 from itertools import product
 import numpy as np
 import pandas as pd
+from functools import lru_cache
 
 # Suppress future warnings for cleaner output
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Configure project directory paths
 CURRENT_PATH = pathlib.Path(__file__).parent.resolve()
-PROJECT_ROOT = CURRENT_PATH.parent
+PROJECT_ROOT = CURRENT_PATH.parent.parent
 INTERIM_DATA_PATH = PROJECT_ROOT / "InterimData"
 OUTPUT_BASE_PATH = PROJECT_ROOT / "data"
 OUTPUT_BASE_PATH.mkdir(parents=True, exist_ok=True)
@@ -96,20 +97,37 @@ RUN_CONFIG = {
 # ===============================================================
 
 
+@lru_cache(maxsize=1)
 def load_ssr_yearly() -> pd.DataFrame:
     """
     Load and aggregate SSR data to firm-product-year.
     """
     ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv")
-    ssr = ssr[["BoardName", "year", "product", "atc3", "revenue", "quantity"]]
+    ssr = ssr[["BoardName", "year", "product", "atc3", "revenue", "quantity", "price0"]]
     yearly = (
         ssr.groupby(["BoardName", "year", "product", "atc3"], as_index=False)
-        .agg(revenue=("revenue", "sum"), quantity=("quantity", "sum"))
+        .agg(revenue=("revenue", "sum"), quantity=("quantity", "sum"), price0=("price0", "mean"))
         .sort_values(["BoardName", "product", "year"])
     )
     yearly["price"] = yearly["revenue"] * 1_000_000 / yearly["quantity"]
     return yearly
 
+
+@lru_cache(maxsize=1)
+def load_ssr_quarterly() -> pd.DataFrame:
+    """
+    Load and aggregate SSR data to firm-product-year-quarter.
+    """
+    ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv")
+    ssr = ssr[["BoardName", "year", "quarter", "product", "atc3", "revenue", "quantity", "price0"]]
+    quarterly = (
+        ssr.groupby(["BoardName", "year", "quarter", "product", "atc3"], as_index=False)
+        .agg(revenue=("revenue", "sum"), quantity=("quantity", "sum"), price0=("price0", "mean"))
+        .sort_values(["BoardName", "product", "year", "quarter"])
+    )
+    quarterly["price"] = quarterly["revenue"] * 1_000_000 / quarterly["quantity"]
+    quarterly["quarter"] = quarterly["quarter"].astype(np.int8)
+    return quarterly
 
 class EventStudyPanelSSR:
     def __init__(
@@ -136,25 +154,16 @@ class EventStudyPanelSSR:
         if self.treatment_group not in {"A", "B"}:
             raise ValueError("treatment_group must be either 'A' or 'B'")
             
-        self.ssr_yearly = load_ssr_yearly()
+        self.ssr_yearly = load_ssr_yearly().copy()
         self.ssr_base = self._build_ssr_base()
 
     def _build_ssr_base(self) -> pd.DataFrame:
         # Year mode keeps firm-product-year observations as-is.
         if self.panel_level == "year":
-            return self.ssr_yearly
+            return self.ssr_yearly.copy()
 
         # Quarter mode rebuilds the base at firm-product-year-quarter granularity.
-        ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv")
-        ssr = ssr[["BoardName", "year", "quarter", "product", "atc3", "revenue", "quantity"]]
-        quarterly = (
-            ssr.groupby(["BoardName", "year", "quarter", "product", "atc3"], as_index=False)
-            .agg(revenue=("revenue", "sum"), quantity=("quantity", "sum"))
-            .sort_values(["BoardName", "product", "year", "quarter"])
-        )
-        quarterly["price"] = quarterly["revenue"] * 1_000_000 / quarterly["quantity"]
-        quarterly["quarter"] = quarterly["quarter"].astype(np.int8)
-        return quarterly
+        return load_ssr_quarterly().copy()
 
     def _required_periods(self, event_year: int) -> set:
         # Balanced-window requirement: include all periods from t+start to t+end.

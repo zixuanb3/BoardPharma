@@ -38,7 +38,7 @@ mpl.rcParams.update(
     }
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CSV_ROOT = PROJECT_ROOT / "csv" / "did_imputation_event_study_sharingatc3" / "quarter"
 FIG_ROOT = (
     PROJECT_ROOT

@@ -25,11 +25,13 @@ set trace off
 
 * ================= user config =================
 local separate_modes 1 0
-local trim_percentile "p95"
+local trim_percentile "p90"
+*"p95"
 
 * ================= path =================
 local code_path "`c(pwd)'"
-local project_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
+local parent_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
+local project_path = regexr("`parent_path'", "[/\\][^/\\]+$", "")
 local project_path = subinstr("`project_path'", "\", "/", .)
 
 local data_root "`project_path'/data/cohort_data_with_atc3sharing"
@@ -41,12 +43,14 @@ cap mkdir "`project_path'/logs"
 
 local events to_B_still_in_A to_B_not_in_A direct_interlock indirect_interlock 
 local controls not notyet purecontrol
-local targets price revenue quantity
-local standardize_types standardize normalize
+local targets price0
+* price revenue quantity
+local standardize_types log_transform standardize normalize
 local event_types event first_event
 local treatment_groups A B
 local include_eventpair_values 1 0
 local fe_levels 1 2
+* 3
 
 local coef_names pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
 local n_pre_nonref 2
@@ -102,7 +106,7 @@ foreach treatment_group of local treatment_groups {
                     local mode_title "separate samples"
                 }
 
-                local fe_output_tag "`output_tag_base'_fe`fe_level'"
+                local fe_output_tag "`output_tag_base'_trim`trim_percentile'_fe`fe_level'"
                 local fe_fig_root "`project_path'/figures/`fe_output_tag'"
                 local fe_csv_root "`project_path'/csv/`fe_output_tag'"
                 local fe_log_root "`project_path'/logs/`fe_output_tag'"
@@ -299,6 +303,9 @@ foreach treatment_group of local treatment_groups {
                                     replace `target' = `target' / baseline_value
                                     drop baseline baseline_value
                                 }
+                                else if "`std'" == "log_transform" {
+                                    replace `target' = log(`target')
+                                }
 
                                 egen id = group(boardname product data_cohort)
                                 gen q_time = yq(year, quarter)
@@ -306,15 +313,52 @@ foreach treatment_group of local treatment_groups {
                                 gen event_cohort_q = yq(event_cohort, 1) if !missing(event_cohort)
 
                                 egen cohort_q_time_fe = group(data_cohort q_time)
+                                cap egen atc3_q_time_fe = group(atc3 q_time)
 
                                 local fe_spec "id `timevar'"
                                 if `fe_level' == 2 {
                                     local fe_spec "id cohort_q_time_fe"
                                 }
+                                else if `fe_level' == 3 {
+                                    local fe_spec "id atc3_q_time_fe"
+                                }
 
                                 gen treated = !missing(event_cohort) & event_cohort != 0
                                 gen event_cohort_did_imputation = `gvar'
                                 replace event_cohort_did_imputation = . if event_cohort_did_imputation == 0
+
+                                * -------- Compute sample stats --------
+                                count if treated == 0
+                                local obs_control = r(N)
+                                count if treated == 1 & atc3_sharing == 0
+                                local obs_treated0 = r(N)
+                                count if treated == 1 & atc3_sharing == 1
+                                local obs_treated1 = r(N)
+
+                                tempvar tag_brd_c tag_brd_t0 tag_brd_t1
+                                egen `tag_brd_c' = tag(boardname) if treated == 0
+                                egen `tag_brd_t0' = tag(boardname) if treated == 1 & atc3_sharing == 0
+                                egen `tag_brd_t1' = tag(boardname) if treated == 1 & atc3_sharing == 1
+
+                                count if `tag_brd_c' == 1
+                                local brd_control = r(N)
+                                count if `tag_brd_t0' == 1
+                                local brd_treated0 = r(N)
+                                count if `tag_brd_t1' == 1
+                                local brd_treated1 = r(N)
+
+                                tempvar tag_prd_c tag_prd_t0 tag_prd_t1
+                                egen `tag_prd_c' = tag(product) if treated == 0
+                                egen `tag_prd_t0' = tag(product) if treated == 1 & atc3_sharing == 0
+                                egen `tag_prd_t1' = tag(product) if treated == 1 & atc3_sharing == 1
+
+                                count if `tag_prd_c' == 1
+                                local prd_control = r(N)
+                                count if `tag_prd_t0' == 1
+                                local prd_treated0 = r(N)
+                                count if `tag_prd_t1' == 1
+                                local prd_treated1 = r(N)
+                                * --------------------------------------
 
                                 foreach sval in 0 1 {
                                     matrix did2_b_s`sval' = J(1, `n_total', .)
@@ -496,6 +540,15 @@ foreach treatment_group of local treatment_groups {
                                 gen std_error = .
                                 gen ci_lb_95 = .
                                 gen ci_ub_95 = .
+                                gen obs_control = .
+                                gen obs_treated0 = .
+                                gen obs_treated1 = .
+                                gen brd_control = .
+                                gen brd_treated0 = .
+                                gen brd_treated1 = .
+                                gen prd_control = .
+                                gen prd_treated0 = .
+                                gen prd_treated1 = .
                                 foreach cov_name of local coef_names {
                                     gen cov_`cov_name' = .
                                 }
@@ -541,6 +594,15 @@ foreach treatment_group of local treatment_groups {
                                         replace std_error = `se' in `row'
                                         replace ci_lb_95 = `lb' in `row'
                                         replace ci_ub_95 = `ub' in `row'
+                                        replace obs_control = `obs_control' in `row'
+                                        replace obs_treated0 = `obs_treated0' in `row'
+                                        replace obs_treated1 = `obs_treated1' in `row'
+                                        replace brd_control = `brd_control' in `row'
+                                        replace brd_treated0 = `brd_treated0' in `row'
+                                        replace brd_treated1 = `brd_treated1' in `row'
+                                        replace prd_control = `prd_control' in `row'
+                                        replace prd_treated0 = `prd_treated0' in `row'
+                                        replace prd_treated1 = `prd_treated1' in `row'
 
                                         forvalues j = 1/`n_total' {
                                             local cov_coef : word `j' of `coef_names'

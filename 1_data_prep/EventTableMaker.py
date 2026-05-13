@@ -28,7 +28,7 @@ import pandas as pd
 
 
 CURRENT_PATH = Path(__file__).resolve().parent
-PROJECT_ROOT = CURRENT_PATH.parent
+PROJECT_ROOT = CURRENT_PATH.parent.parent
 INTERIM_DATA_PATH = PROJECT_ROOT / "InterimData"
 OUTPUT_PATH_B = PROJECT_ROOT / "data" / "event_B.xlsx"
 OUTPUT_PATH_A = PROJECT_ROOT / "data" / "event_A.xlsx"

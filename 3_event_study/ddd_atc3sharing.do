@@ -34,8 +34,13 @@ set trace off
 // - csv/ddd_atc3sharing_fe*/
 // ================================================================
 
+* ================= user config =================
+local trim_percentile "p90"
+
+* ================= path =================
 local code_path "`c(pwd)'"
-local project_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
+local parent_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
+local project_path = regexr("`parent_path'", "[/\\][^/\\]+$", "")
 local project_path = subinstr("`project_path'", "\", "/", .)
 
 local data_root "`project_path'/data/cohort_data_with_atc3sharing"
@@ -49,11 +54,11 @@ cap mkdir "`project_path'/csv"
 local events to_B_not_in_A direct_interlock to_B_still_in_A indirect_interlock
 local controls not notyet purecontrol
 local targets revenue price quantity
-local standardize_types standardize normalize
+local standardize_types standardize normalize log_transform
 local event_types event first_event
 local treatment_groups B A
 local include_eventpair_values 1 0
-local fe_levels 1 2
+local fe_levels 1 2 3
 
 foreach panel_level of local panel_levels {
     foreach treatment_group of local treatment_groups {
@@ -89,7 +94,7 @@ foreach panel_level of local panel_levels {
                     exit 198
                 }
 
-                local fe_output_tag "`output_tag_base'_fe`fe_level'"
+                local fe_output_tag "`output_tag_base'_trim`trim_percentile'_fe`fe_level'"
                 local fe_log_root "`project_path'/logs/`fe_output_tag'"
                 local fe_tex_root "`project_path'/tex/`fe_output_tag'"
                 local fe_csv_root "`project_path'/csv/`fe_output_tag'"
@@ -246,6 +251,9 @@ foreach panel_level of local panel_levels {
                                             replace `target' = `target' / baseline_value
                                             drop baseline baseline_value
                                         }
+                                        else if "`std'" == "log_transform" {
+                                            replace `target' = log(`target')
+                                        }
 
                                         gen event_cohort = .
                                         gen treated_in_stack = 0
@@ -285,10 +293,10 @@ foreach panel_level of local panel_levels {
                                         keep boardname product data_cohort group_gap_norm
                                         bysort boardname product data_cohort: keep if _n == 1
                                         quietly summarize group_gap_norm, detail
-                                        local p95_group_gap = r(p95)
+                                        local pct_group_gap = r(`trim_percentile')
                                         restore
 
-                                        drop if group_gap_norm > `p95_group_gap' & !missing(group_gap_norm)
+                                        drop if group_gap_norm > `pct_group_gap' & !missing(group_gap_norm)
                                         drop group_max_norm group_min_norm group_gap_norm
                                     }
 
@@ -349,12 +357,16 @@ foreach panel_level of local panel_levels {
                                     replace atc3_sharing_het = 0 if treat == 0
                                     
                                     egen cohort_q_time_fe = group(data_cohort q_time)
+                                    cap egen atc3_q_time_fe = group(atc3 q_time)
 
                                     * FE level 1 uses stack-unit and common calendar-quarter FE.
                                     * FE level 2 replaces common time FE with cohort-by-quarter FE, allowing each stacked cohort to have its own aggregate path.
                                     local fe_spec "id q_time"
                                     if `fe_level' == 2 {
                                         local fe_spec "id cohort_q_time_fe"
+                                    }
+                                    else if `fe_level' == 3 {
+                                        local fe_spec "id atc3_q_time_fe"
                                     }
 
                                     reghdfe `target' did did_g, absorb(`fe_spec')

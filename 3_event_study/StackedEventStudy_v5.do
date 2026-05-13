@@ -1,7 +1,6 @@
 clear all
 set trace off
 
-<<<<<<< Updated upstream
 // ================================================================
 // Purpose:
 // Run stacked event-study estimation on cohort panels with atc3_sharing labels,
@@ -21,44 +20,11 @@ set trace off
 // - png figure files under figures/stacked_event_study_sharingatc3/
 // - log files under logs/stacked_event_study_sharingatc3/
 // ================================================================
-=======
-* ================================================================
-* StackedEventStudy_v5.do
-*
-* atc3sharing mode:
-*   - 1: split treated units by atc3_sharing (current sharing version)
-*   - 0: run the original non-sharing version (single full-sample run)
-*
-* Directory switch by atc3sharing:
-*   - 1: data/cohort_data_with_atc3sharing,
-*        figures/stacked_event_study_sharingatc3,
-*        logs/stacked_event_study_sharingatc3
-*   - 0: data/cohort_data,
-*        figures/stacked_event_study,
-*        logs/stacked_event_study
-* ================================================================
-
-* ================= parameter =================
-* 0: do NOT split by atc3_sharing (original mode)
-* 1: split by atc3_sharing and output two plots per config
-local atc3sharing 1
-if !inlist(`atc3sharing', 0, 1) {
-    di as error "atc3sharing must be 0 or 1"
-    exit 198
-}
-
-* 0: keep original pre-period setting
-* 1: for quarter level, shorten pre-periods to 8 quarters (t-2 years to t-1)
-local shortened_preperiords 0
-if !inlist(`shortened_preperiords', 0, 1) {
-    di as error "shortened_preperiords must be 0 or 1"
-    exit 198
-}
->>>>>>> Stashed changes
 
 * ================= path =================
 local code_path "`c(pwd)'"
-local project_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
+local parent_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
+local project_path = regexr("`parent_path'", "[/\\][^/\\]+$", "")
 local project_path = subinstr("`project_path'", "\", "/", .)
 
 if `atc3sharing' == 1 {
@@ -353,7 +319,6 @@ foreach panel_level of local panel_levels {
                             gen `gvar_csdid' = `gvar'
                             replace `gvar_csdid' = 0 if missing(`gvar_csdid')
 
-<<<<<<< Updated upstream
                             * --- csdid: atc3_sharing == 1 subsample (treated with sharing + all controls) ---
                             preserve
                             drop if treated == 1 & atc3_sharing == 0
@@ -367,42 +332,6 @@ foreach panel_level of local panel_levels {
                             csdid `target', ivar(id) time(`timevar') gvar(`gvar_csdid') agg(event) notyet method(dripw) long rseed(1)
                             est store did1_s0
                             restore
-=======
-                            if `atc3sharing' == 1 {
-                                * sharing mode: two treated-group-specific runs
-                                preserve
-                                drop if treated == 1 & atc3_sharing == 0
-                                cap noi csdid `target', ivar(id) time(`timevar') gvar(`gvar_csdid') agg(event) notyet method(dripw) long rseed(1)
-                                if _rc == 0 {
-                                    est store did1_s1
-                                }
-                                else {
-                                    di as text "csdid failed for atc3_sharing==1, skipping"
-                                }
-                                restore
-
-                                preserve
-                                drop if treated == 1 & atc3_sharing == 1
-                                cap noi csdid `target', ivar(id) time(`timevar') gvar(`gvar_csdid') agg(event) notyet method(dripw) long rseed(1)
-                                if _rc == 0 {
-                                    est store did1_s0
-                                }
-                                else {
-                                    di as text "csdid failed for atc3_sharing==0, skipping"
-                                }
-                                restore
-                            }
-                            else {
-                                * non-sharing mode: single full-sample run
-                                cap noi csdid `target', ivar(id) time(`timevar') gvar(`gvar_csdid') agg(event) notyet method(dripw) long rseed(1)
-                                if _rc == 0 {
-                                    est store did1_s0
-                                }
-                                else {
-                                    di as text "csdid failed in non-sharing mode, skipping"
-                                }
-                            }
->>>>>>> Stashed changes
                         }
 						
 
@@ -410,7 +339,6 @@ foreach panel_level of local panel_levels {
                         * ============================================================
                         *  2. did_imputation
                         * ============================================================
-<<<<<<< Updated upstream
                         gen atc3_sharing_het = atc3_sharing if treated == 1
                         replace atc3_sharing_het = 0 if treated == 0
 						
@@ -548,18 +476,6 @@ foreach panel_level of local panel_levels {
                                         matrix twfe_V_s0[`j' + 1, `i'] = twfe_V_full[`j', `i']
                                     }
                                 }
-=======
-                        if `atc3sharing' == 1 {
-                            gen atc3_sharing_het = atc3_sharing if treated == 1
-                            replace atc3_sharing_het = 0 if treated == 0
-
-                            cap noi did_imputation `target' id `timevar' event_cohort_did_imputation, ///
-                                fe(id `timevar') horizons(`did_horizons') pretrends(`did_pretrend') ///
-                                hetby(atc3_sharing_het) autosample tol(0.1)
-                            local did2_ok = (_rc == 0)
-                            if `did2_ok' {
-                                est store did2
->>>>>>> Stashed changes
                             }
                             else {
                                 di as text "did_imputation with hetby failed, skipping"
@@ -718,7 +634,6 @@ foreach panel_level of local panel_levels {
                         local controlcohort never_treated
 
                         if `run_esi' {
-<<<<<<< Updated upstream
                             eventstudyinteract `target' `esi_vars_s0' `esi_vars_s1', ///
                                 cohort(event_cohort_did_imputation) ///
                                 control_cohort(`controlcohort') ///
@@ -763,119 +678,6 @@ foreach panel_level of local panel_levels {
 								matrix rownames sa_V_s`sval' = `coef_names'
                                 }
                             }
-=======
-                            if `atc3sharing' == 1 {
-                                foreach v of local twfe_terms {
-                                    gen `v'_s0 = `v' * (1 - atc3_sharing)
-                                    gen `v'_s1 = `v' * atc3_sharing
-                                }
-
-                                local esi_vars_s0 ""
-                                local esi_vars_s1 ""
-                                foreach v of local twfe_terms {
-                                    local esi_vars_s0 "`esi_vars_s0' `v'_s0"
-                                    local esi_vars_s1 "`esi_vars_s1' `v'_s1"
-                                }
-
-                                cap noi eventstudyinteract `target' `esi_vars_s0' `esi_vars_s1', ///
-                                    cohort(event_cohort_did_imputation) ///
-                                    control_cohort(`controlcohort') ///
-                                    absorb(i.id i.`timevar')
-                                local esi_ok = (_rc == 0)
-
-                                if `esi_ok' {
-                                    matrix sa_b_all = e(b_iw)
-                                    matrix sa_V_all = e(V_iw)
-
-                                    foreach sval in 0 1 {
-                                        local offset = `sval' * `n_old'
-
-                                        matrix sa_b_s`sval' = J(1, `n_total', .)
-                                        forvalues i = 1/`n_pre_nonref' {
-                                            matrix sa_b_s`sval'[1, `i'] = sa_b_all[1, `offset' + `i']
-                                        }
-                                        matrix sa_b_s`sval'[1, `=`n_pre_nonref' + 1'] = 0
-                                        forvalues i = `=`n_pre_nonref' + 1'/`n_old' {
-                                            matrix sa_b_s`sval'[1, `i' + 1] = sa_b_all[1, `offset' + `i']
-                                        }
-                                        matrix colnames sa_b_s`sval' = `coef_names'
-
-                                        matrix sa_V_s`sval' = J(`n_total', `n_total', 0)
-                                        forvalues i = 1/`n_pre_nonref' {
-                                            forvalues j = 1/`n_pre_nonref' {
-                                                matrix sa_V_s`sval'[`i', `j'] = sa_V_all[`offset' + `i', `offset' + `j']
-                                            }
-                                        }
-                                        forvalues i = `=`n_pre_nonref' + 1'/`n_old' {
-                                            forvalues j = `=`n_pre_nonref' + 1'/`n_old' {
-                                                matrix sa_V_s`sval'[`i' + 1, `j' + 1] = sa_V_all[`offset' + `i', `offset' + `j']
-                                            }
-                                        }
-                                        forvalues i = 1/`n_pre_nonref' {
-                                            forvalues j = `=`n_pre_nonref' + 1'/`n_old' {
-                                                matrix sa_V_s`sval'[`i', `j' + 1] = sa_V_all[`offset' + `i', `offset' + `j']
-                                                matrix sa_V_s`sval'[`j' + 1, `i'] = sa_V_all[`offset' + `j', `offset' + `i']
-                                            }
-                                        }
-                                        matrix colnames sa_V_s`sval' = `coef_names'
-                                        matrix rownames sa_V_s`sval' = `coef_names'
-                                    }
-                                }
-                                else {
-                                    di as text "eventstudyinteract failed, skipping"
-                                }
-                            }
-                            else {
-                                cap noi eventstudyinteract `target' `twfe_terms', ///
-                                    cohort(event_cohort_did_imputation) ///
-                                    control_cohort(`controlcohort') ///
-                                    absorb(i.id i.`timevar')
-                                local esi_ok = (_rc == 0)
-
-                                if `esi_ok' {
-                                    matrix sa_b_all = e(b_iw)
-                                    matrix sa_V_all = e(V_iw)
-
-                                    matrix sa_b_s0 = J(1, `n_total', .)
-                                    forvalues i = 1/`n_pre_nonref' {
-                                        matrix sa_b_s0[1, `i'] = sa_b_all[1, `i']
-                                    }
-                                    matrix sa_b_s0[1, `=`n_pre_nonref' + 1'] = 0
-                                    forvalues i = `=`n_pre_nonref' + 1'/`n_old' {
-                                        matrix sa_b_s0[1, `i' + 1] = sa_b_all[1, `i']
-                                    }
-                                    matrix colnames sa_b_s0 = `coef_names'
-
-                                    matrix sa_V_s0 = J(`n_total', `n_total', 0)
-                                    forvalues i = 1/`n_pre_nonref' {
-                                        forvalues j = 1/`n_pre_nonref' {
-                                            matrix sa_V_s0[`i', `j'] = sa_V_all[`i', `j']
-                                        }
-                                    }
-                                    forvalues i = `=`n_pre_nonref' + 1'/`n_old' {
-                                        forvalues j = `=`n_pre_nonref' + 1'/`n_old' {
-                                            matrix sa_V_s0[`i' + 1, `j' + 1] = sa_V_all[`i', `j']
-                                        }
-                                    }
-                                    forvalues i = 1/`n_pre_nonref' {
-                                        forvalues j = `=`n_pre_nonref' + 1'/`n_old' {
-                                            matrix sa_V_s0[`i', `j' + 1] = sa_V_all[`i', `j']
-                                            matrix sa_V_s0[`j' + 1, `i'] = sa_V_all[`j', `i']
-                                        }
-                                    }
-                                    matrix colnames sa_V_s0 = `coef_names'
-                                    matrix rownames sa_V_s0 = `coef_names'
-                                }
-                                else {
-                                    di as text "eventstudyinteract failed in non-sharing mode, skipping"
-                                }
-                            }
-                        }
-                        else {
-                            local esi_ok = 0
-                            di as text "control=`control', skipping eventstudyinteract"
-                        }
->>>>>>> Stashed changes
 
                         * ============================================================
                         *  5. did_imputation — extract estimates

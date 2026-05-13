@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ATC3_MAP_DIR = PROJECT_ROOT / "data" / "atc3mapping"
 COHORT_ROOT = PROJECT_ROOT / "data" / "cohort_data"
 COHORT_OUT_ROOT = PROJECT_ROOT / "data" / "cohort_data_with_atc3sharing"

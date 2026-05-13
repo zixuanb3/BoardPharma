@@ -29,7 +29,8 @@ set trace off
 * ================= paths =================
 local code_path "`c(pwd)'"
 display "code_path = `code_path'"
-local project_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
+local parent_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
+local project_path = regexr("`parent_path'", "[/\\][^/\\]+$", "")
 display "project_path = `project_path'"
 
 local data_path "`project_path'/data/staggered_data"
