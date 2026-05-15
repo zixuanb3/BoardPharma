@@ -24,9 +24,12 @@ set trace off
 // ================================================================
 
 * ================= user config =================
-local separate_modes 1 0
-local trim_percentile "p90"
-*"p95"
+local shortened_atc3 1
+* 1
+local separate_modes 0
+* 1
+local trim_percentile "p95"
+*90 95
 
 * ================= path =================
 local code_path "`c(pwd)'"
@@ -41,16 +44,21 @@ cap mkdir "`project_path'/figures"
 cap mkdir "`project_path'/csv"
 cap mkdir "`project_path'/logs"
 
-local events to_B_still_in_A to_B_not_in_A direct_interlock indirect_interlock 
-local controls not notyet purecontrol
-local targets price0
-* price revenue quantity
-local standardize_types log_transform standardize normalize
-local event_types event first_event
+local events to_B_still_in_A to_B_not_in_A
+*direct_interlock indirect_interlock 
+local controls not 
+* notyet purecontrol
+local targets revenue quantity
+*revenue quantity price0 price
+local standardize_types normalize log_transform standardize
+* log_transform standardize
+local event_types event 
+* first_event
 local treatment_groups A B
-local include_eventpair_values 1 0
-local fe_levels 1 2
-* 3
+local include_eventpair_values 0
+* 1
+local fe_levels 3
+* 1 2 3
 
 local coef_names pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
 local n_pre_nonref 2
@@ -256,7 +264,7 @@ foreach treatment_group of local treatment_groups {
                                     forvalues i = 1/4 {
                                         gen pre_`i' = treated_in_stack == 1 & rel_quarter == -`i'
                                     }
-                                    drop if pre_4 == 1
+                                    * drop if pre_4 == 1
                                     forvalues i = 0/7 {
                                         gen post_`i' = treated_in_stack == 1 & rel_quarter == `i'
                                     }
@@ -276,6 +284,17 @@ foreach treatment_group of local treatment_groups {
                                 }
 
                                 use `master', clear
+                                
+                                if `shortened_atc3' == 1 {
+                                    capture confirm string variable atc3
+                                    if !_rc {
+                                        replace atc3 = substr(atc3, 1, length(atc3) - 1)
+                                    }
+                                    else {
+                                        tostring atc3, replace
+                                        replace atc3 = substr(atc3, 1, length(atc3) - 1)
+                                    }
+                                }
 
                                 bysort boardname product data_cohort: egen group_max_norm = max(`target')
                                 bysort boardname product data_cohort: egen group_min_norm = min(`target')
@@ -326,6 +345,7 @@ foreach treatment_group of local treatment_groups {
                                 gen treated = !missing(event_cohort) & event_cohort != 0
                                 gen event_cohort_did_imputation = `gvar'
                                 replace event_cohort_did_imputation = . if event_cohort_did_imputation == 0
+								
 
                                 * -------- Compute sample stats --------
                                 count if treated == 0
@@ -374,6 +394,7 @@ foreach treatment_group of local treatment_groups {
                                 if `separate' == 0 {
                                     gen atc3_sharing_het = atc3_sharing if treated == 1
                                     replace atc3_sharing_het = 0 if treated == 0
+									
 
                                     did_imputation `target' id `timevar' event_cohort_did_imputation, ///
                                         fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') ///

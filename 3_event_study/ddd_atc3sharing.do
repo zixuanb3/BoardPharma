@@ -35,7 +35,9 @@ set trace off
 // ================================================================
 
 * ================= user config =================
+local shortened_atc3 1
 local trim_percentile "p90"
+* 90 95
 
 * ================= path =================
 local code_path "`c(pwd)'"
@@ -51,14 +53,20 @@ cap mkdir "`project_path'/logs"
 cap mkdir "`project_path'/tex"
 cap mkdir "`project_path'/csv"
 
-local events to_B_not_in_A direct_interlock to_B_still_in_A indirect_interlock
-local controls not notyet purecontrol
-local targets revenue price quantity
-local standardize_types standardize normalize log_transform
-local event_types event first_event
-local treatment_groups B A
-local include_eventpair_values 1 0
-local fe_levels 1 2 3
+local events to_B_not_in_A to_B_still_in_A 
+* direct_interlock indirect_interlock
+local controls notyet 
+* not notyet purecontrol
+local targets revenue quantity price price0
+local standardize_types normalize log_transform standardize
+* log_transform standardize normalize
+local event_types event
+* first_event
+local treatment_groups A B
+local include_eventpair_values 0
+* 1
+local fe_levels 3
+* 1 2 3
 
 foreach panel_level of local panel_levels {
     foreach treatment_group of local treatment_groups {
@@ -220,8 +228,9 @@ foreach panel_level of local panel_levels {
                                     double didimp_diff didimp_diff_se didimp_diff_p ///
                                     double pcteff_notshare pcteff_share ///
                                     double premean_notshare premean_share ///
-                                    double N_obs N_notshare N_share ///
-                                    double product_notshare product_share ///
+                                    double N_obs N_control N_notshare N_share ///
+                                    double product_control product_notshare product_share ///
+                                    double board_control board_notshare board_share ///
                                     using `run_results', replace
 
                                 foreach target of local targets {
@@ -232,28 +241,6 @@ foreach panel_level of local panel_levels {
 
                                         import delimited "`data_file'", clear
                                         gen target_raw = `target'
-
-                                        if "`std'" == "standardize" {
-                                            bysort boardname product: egen temp = std(`target')
-                                            replace `target' = temp
-                                            drop temp
-                                        }
-                                        else if "`std'" == "normalize" {
-                                            * Normalization rescales each product by its cohort-entry baseline,
-                                            * so post coefficients are interpretable relative to that baseline.
-                                            if "`panel_level'" == "quarter" {
-                                                bysort boardname product: gen baseline = `target' if year == `cohort' & quarter == 1
-                                            }
-                                            else {
-                                                bysort boardname product: gen baseline = `target' if year == `cohort'
-                                            }
-                                            bysort boardname product: egen baseline_value = max(baseline)
-                                            replace `target' = `target' / baseline_value
-                                            drop baseline baseline_value
-                                        }
-                                        else if "`std'" == "log_transform" {
-                                            replace `target' = log(`target')
-                                        }
 
                                         gen event_cohort = .
                                         gen treated_in_stack = 0
@@ -282,22 +269,58 @@ foreach panel_level of local panel_levels {
                                     }
 
                                     use `master', clear
+									
+                                    
+                                    if `shortened_atc3' == 1 {
+                                        capture confirm string variable atc3
+                                        if !_rc {
+                                            replace atc3 = substr(atc3, 1, length(atc3) - 3)
+                                        }
+                                        else {
+                                            tostring atc3, replace
+                                            replace atc3 = substr(atc3, 1, length(atc3) - 3)
+                                        }
+                                    }
+                                    if `shortened_atc3' == 1 {
+                                        drop if atc3 == "Devi"
+                                    }
 
-                                    if "`std'" == "normalize" {
-                                        * Trim stacks with unusually volatile normalized paths so that a few extreme denominator cases do not dominate the estimates.
-                                        bysort boardname product data_cohort: egen group_max_norm = max(`target')
-                                        bysort boardname product data_cohort: egen group_min_norm = min(`target')
-                                        gen group_gap_norm = group_max_norm - group_min_norm
+                                    bysort boardname product data_cohort: egen group_max_raw = max(`target')
+                                    bysort boardname product data_cohort: egen group_min_raw = min(`target')
+                                    gen group_ratio_raw = .
+                                    replace group_ratio_raw = group_max_raw / group_min_raw if group_min_raw != 0 & !missing(group_min_raw)
 
-                                        preserve
-                                        keep boardname product data_cohort group_gap_norm
-                                        bysort boardname product data_cohort: keep if _n == 1
-                                        quietly summarize group_gap_norm, detail
-                                        local pct_group_gap = r(`trim_percentile')
-                                        restore
+                                    preserve
+                                    keep boardname product data_cohort group_ratio_raw
+                                    bysort boardname product data_cohort: keep if _n == 1
+                                    quietly summarize group_ratio_raw, detail
+                                    local p95_group_ratio = r(`trim_percentile')
+                                    restore
 
-                                        drop if group_gap_norm > `pct_group_gap' & !missing(group_gap_norm)
-                                        drop group_max_norm group_min_norm group_gap_norm
+                                    drop if group_ratio_raw > `p95_group_ratio' & !missing(group_ratio_raw)
+                                    drop group_max_raw group_min_raw group_ratio_raw
+
+
+                                    if "`std'" == "standardize" {
+                                        bysort boardname product data_cohort: egen temp = std(`target')
+                                        replace `target' = temp
+                                        drop temp
+                                    }
+                                    else if "`std'" == "normalize" {
+                                        * Normalization rescales each product by its cohort-entry baseline,
+                                        * so post coefficients are interpretable relative to that baseline.
+                                        if "`panel_level'" == "quarter" {
+                                            bysort boardname product data_cohort: gen baseline = `target' if year == data_cohort & quarter == 1
+                                        }
+                                        else {
+                                            bysort boardname product data_cohort: gen baseline = `target' if year == data_cohort
+                                        }
+                                        bysort boardname product data_cohort: egen baseline_value = max(baseline)
+                                        replace `target' = `target' / baseline_value
+                                        drop baseline baseline_value
+                                    }
+                                    else if "`std'" == "log_transform" {
+                                        replace `target' = log(`target')
                                     }
 
                                     * Stack-specific panel id: the same product can reappear in another cohort stack and should be treated as a distinct unit there
@@ -341,6 +364,8 @@ foreach panel_level of local panel_levels {
                                     local N_notshare = r(N)
                                     quietly count if treat == 1 & atc3_sharing == 1
                                     local N_share = r(N)
+                                    quietly count if treat == 0
+                                    local N_control = r(N)
 
                                     egen tag_id_notshare = tag(id) if treat == 1 & atc3_sharing == 0
                                     quietly count if tag_id_notshare == 1
@@ -351,6 +376,27 @@ foreach panel_level of local panel_levels {
                                     quietly count if tag_id_share == 1
                                     local product_share = r(N)
                                     drop tag_id_share
+
+                                    egen tag_id_control = tag(id) if treat == 0
+                                    quietly count if tag_id_control == 1
+                                    local product_control = r(N)
+                                    drop tag_id_control
+
+                                    * Also calculate unique boardnames
+                                    egen tag_board_notshare = tag(boardname) if treat == 1 & atc3_sharing == 0
+                                    quietly count if tag_board_notshare == 1
+                                    local board_notshare = r(N)
+                                    drop tag_board_notshare
+
+                                    egen tag_board_share = tag(boardname) if treat == 1 & atc3_sharing == 1
+                                    quietly count if tag_board_share == 1
+                                    local board_share = r(N)
+                                    drop tag_board_share
+
+                                    egen tag_board_control = tag(boardname) if treat == 0
+                                    quietly count if tag_board_control == 1
+                                    local board_control = r(N)
+                                    drop tag_board_control
 
                                     gen event_cohort_did_imputation = yq(event_cohort, 1) if !missing(event_cohort)
                                     gen atc3_sharing_het = atc3_sharing if treat == 1
@@ -437,8 +483,9 @@ foreach panel_level of local panel_levels {
                                         (.) (.) (.) ///
                                         (`pcteff_notshare') (`pcteff_share') ///
                                         (`premean_notshare') (`premean_share') ///
-                                        (`N_obs_reghdfe') (`N_notshare') (`N_share') ///
-                                        (`product_notshare') (`product_share')
+                                        (`N_obs_reghdfe') (`N_control') (`N_notshare') (`N_share') ///
+                                        (`product_control') (`product_notshare') (`product_share') ///
+                                        (`board_control') (`board_notshare') (`board_share')
 
                                     post `posth' ///
                                         ("`panel_level'") ///
@@ -454,8 +501,9 @@ foreach panel_level of local panel_levels {
                                         (`didimp_diff') (`didimp_diff_se') (`didimp_diff_p') ///
                                         (`pcteff_notshare') (`pcteff_share') ///
                                         (`premean_notshare') (`premean_share') ///
-                                        (`N_obs_didimp') (`N_notshare') (`N_share') ///
-                                        (`product_notshare') (`product_share')
+                                        (`N_obs_didimp') (`N_control') (`N_notshare') (`N_share') ///
+                                        (`product_control') (`product_notshare') (`product_share') ///
+                                        (`board_control') (`board_notshare') (`board_share')
 
                                     local didimp_star ""
                                     if !missing(`didimp_diff_p') {
@@ -478,10 +526,15 @@ foreach panel_level of local panel_levels {
                                     estadd scalar premean_share = `premean_share'
                                     estadd scalar pcteff_notshare = `pcteff_notshare'
                                     estadd scalar pcteff_share = `pcteff_share'
+                                    estadd scalar N_control = `N_control'
                                     estadd scalar N_notshare = `N_notshare'
                                     estadd scalar N_share = `N_share'
+                                    estadd scalar product_control = `product_control'
                                     estadd scalar product_notshare = `product_notshare'
                                     estadd scalar product_share = `product_share'
+                                    estadd scalar board_control = `board_control'
+                                    estadd scalar board_notshare = `board_notshare'
+                                    estadd scalar board_share = `board_share'
                                     estadd local didimp_diff_star = "`didimp_diff_star'"
                                     estadd scalar didimp_diff = `didimp_diff'
                                     estadd scalar didimp_diff_se = `didimp_diff_se'
@@ -497,38 +550,48 @@ foreach panel_level of local panel_levels {
                                 local tex_file "`fe_tex_root'/`panel_group_folder'/`event'/`file_stub'.tex"
                                 tempfile tex_fragment
 
-                                esttab m_revenue m_price m_quantity using "`tex_fragment'", ///
+                                esttab m_revenue m_price m_price0 m_quantity using "`tex_fragment'", ///
                                     replace booktabs se star(* 0.10 ** 0.05 *** 0.01) ///
                                     keep(did did_g) ///
                                     coeflabels( ///
                                         did "beta0: Treat x Post" ///
                                         did_g "beta1: Treat x Post x G" ///
                                     ) ///
-                                    mtitles("Revenue" "Price" "Quantity") ///
+                                    mtitles("Revenue" "Price" "Price0" "Quantity") ///
                                     stats( ///
                                         premean_notshare ///
                                         premean_share ///
                                         pcteff_notshare ///
                                         pcteff_share ///
                                         N ///
-                                        N_notshare ///
+                                        N_control ///
                                         N_share ///
-                                        product_notshare ///
+                                        N_notshare ///
+                                        board_control ///
+                                        board_share ///
+                                        board_notshare ///
+                                        product_control ///
                                         product_share ///
+                                        product_notshare ///
                                         didimp_diff_star ///
                                         didimp_diff_se ///
                                         didimp_diff_p, ///
-                                        fmt(3 3 2 2 0 0 0 0 0 %9s 3 3) ///
+                                        fmt(3 3 2 2 0 0 0 0 0 0 0 0 0 0 %9s 3 3) ///
                                         labels( ///
                                             "Pre-treatment mean Y (Not Share)" ///
                                             "Pre-treatment mean Y (Share)" ///
                                             "Percent effect (Not Share)" ///
                                             "Percent effect (Share)" ///
-                                            "Observations" ///
-                                            "N (Not Share, treated)" ///
-                                            "N (Share, treated)" ///
-                                            "Product count (Not Share, treated)" ///
-                                            "Product count (Share, treated)" ///
+                                            "Observations Total" ///
+                                            "Observations (Control)" ///
+                                            "Observations (Share, Treated)" ///
+                                            "Observations (Not Share, Treated)" ///
+                                            "Unique Boards (Control)" ///
+                                            "Unique Boards (Share, Treated)" ///
+                                            "Unique Boards (Not Share, Treated)" ///
+                                            "Unique Products (Control)" ///
+                                            "Unique Products (Share, Treated)" ///
+                                            "Unique Products (Not Share, Treated)" ///
                                             "did-imputation: tau1-tau0" ///
                                             "did-imputation SE" ///
                                             "did-imputation p-value" ///
@@ -562,3 +625,6 @@ foreach panel_level of local panel_levels {
         }
     }
 }
+
+
+
