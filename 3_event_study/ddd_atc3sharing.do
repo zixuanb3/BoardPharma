@@ -35,9 +35,11 @@ set trace off
 // ================================================================
 
 * ================= user config =================
-local shortened_atc3 1
-local trim_percentile "p90"
-* 90 95
+local shortened_atc3 0
+local outlier_treatment "trim"
+* trim winsorize none
+local outlier_treatment_percentile "p90"
+* 90 95 99
 
 * ================= path =================
 local code_path "`c(pwd)'"
@@ -53,11 +55,11 @@ cap mkdir "`project_path'/logs"
 cap mkdir "`project_path'/tex"
 cap mkdir "`project_path'/csv"
 
-local events to_B_not_in_A to_B_still_in_A 
-* direct_interlock indirect_interlock
-local controls notyet 
+local events interlock_dissolution
+* direct_interlock indirect_interlock to_B_not_in_A to_B_still_in_A
+local controls not 
 * not notyet purecontrol
-local targets revenue quantity price price0
+local targets price price0 revenue quantity
 local standardize_types normalize log_transform standardize
 * log_transform standardize normalize
 local event_types event
@@ -65,7 +67,7 @@ local event_types event
 local treatment_groups A B
 local include_eventpair_values 0
 * 1
-local fe_levels 3
+local fe_levels 1
 * 1 2 3
 
 foreach panel_level of local panel_levels {
@@ -102,7 +104,7 @@ foreach panel_level of local panel_levels {
                     exit 198
                 }
 
-                local fe_output_tag "`output_tag_base'_trim`trim_percentile'_fe`fe_level'"
+                local fe_output_tag "`output_tag_base'_`outlier_treatment'`outlier_treatment_percentile'_fe`fe_level'"
                 local fe_log_root "`project_path'/logs/`fe_output_tag'"
                 local fe_tex_root "`project_path'/tex/`fe_output_tag'"
                 local fe_csv_root "`project_path'/csv/`fe_output_tag'"
@@ -173,6 +175,19 @@ foreach panel_level of local panel_levels {
                                         }
                                         else {
                                             local cohort_list 2008 2009 2010 2011 2013 2014 2015 2017 2018
+                                        }
+                                    }
+                                    else if "`event'" == "interlock_dissolution" {
+                                        if "`treatment_group'" == "A" {
+                                            local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                        }
+                                        else {
+                                            if "`event_type'" == "first_event" {
+                                                local cohort_list 2008 2009 2010 2011 2012 2014 2015 2016 2017 2018
+                                            }
+                                            else {
+                                                local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                            }
                                         }
                                     }
                                 }
@@ -285,20 +300,27 @@ foreach panel_level of local panel_levels {
                                         drop if atc3 == "Devi"
                                     }
 
-                                    bysort boardname product data_cohort: egen group_max_raw = max(`target')
-                                    bysort boardname product data_cohort: egen group_min_raw = min(`target')
-                                    gen group_ratio_raw = .
-                                    replace group_ratio_raw = group_max_raw / group_min_raw if group_min_raw != 0 & !missing(group_min_raw)
+                                    if "`outlier_treatment'" == "trim" {
+                                        bysort boardname product data_cohort: egen group_max_raw = max(`target')
+                                        bysort boardname product data_cohort: egen group_min_raw = min(`target')
+                                        gen group_ratio_raw = .
+                                        replace group_ratio_raw = group_max_raw / group_min_raw if group_min_raw != 0 & !missing(group_min_raw)
 
-                                    preserve
-                                    keep boardname product data_cohort group_ratio_raw
-                                    bysort boardname product data_cohort: keep if _n == 1
-                                    quietly summarize group_ratio_raw, detail
-                                    local p95_group_ratio = r(`trim_percentile')
-                                    restore
+                                        preserve
+                                        keep boardname product data_cohort group_ratio_raw
+                                        bysort boardname product data_cohort: keep if _n == 1
+                                        quietly summarize group_ratio_raw, detail
+                                        local p95_group_ratio = r(`outlier_treatment_percentile')
+                                        restore
 
-                                    drop if group_ratio_raw > `p95_group_ratio' & !missing(group_ratio_raw)
-                                    drop group_max_raw group_min_raw group_ratio_raw
+                                        drop if group_ratio_raw > `p95_group_ratio' & !missing(group_ratio_raw)
+                                        drop group_max_raw group_min_raw group_ratio_raw
+                                    }
+                                    else if "`outlier_treatment'" == "winsorize" {
+                                        quietly summarize `target', detail
+                                        local pt_val = r(`outlier_treatment_percentile')
+                                        replace `target' = `pt_val' if `target' > `pt_val' & !missing(`target')
+                                    }
 
 
                                     if "`std'" == "standardize" {

@@ -80,6 +80,7 @@ RUN_CONFIG = {
         "indirect_interlock",
         "to_B_not_in_A",
         "to_B_still_in_A",
+        "interlock_dissolution",
     ],
     "EVENT_TYPES": ["event", "first_event"],
     "PANEL_LEVELS": ["quarter"],
@@ -167,7 +168,8 @@ def parse_staggered_file_name(file_name: str) -> dict[str, str] | None:
             break
     if control_type is None or event is None:
         return None
-    if event not in EVENTS:
+    # Skip interlock_dissolution for staggered processing as requested
+    if event not in [e for e in EVENTS if e != "interlock_dissolution"]:
         return None
 
     return {

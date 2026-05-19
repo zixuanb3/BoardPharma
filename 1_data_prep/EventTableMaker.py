@@ -251,6 +251,78 @@ def build_transition_events(stay_x_years: int = 3, treatment_group: str = "B") -
     return pd.concat([still, not_in_a], ignore_index=True)
 
 
+def build_dissolution_events(treatment_group: str = "B") -> pd.DataFrame:
+    """Build interlock dissolution events directly from board histories."""
+    treatment_group = str(treatment_group).upper()
+    if treatment_group not in {"A", "B"}:
+        raise ValueError("treatment_group must be one of: A, B")
+    pharma = pd.read_stata(INTERIM_DATA_PATH / "boardex_pharma.dta")
+    pharma = pharma[pharma["inSSR"] == 1].copy()
+
+    pharma_clean = pharma.dropna(subset=["DirectorID", "year", "BoardName"])
+    pharma_clean["year"] = pharma_clean["year"].astype(int)
+
+    grouped = (
+        pharma_clean.groupby(["DirectorID", "year"], as_index=False)
+        .agg(BoardName=("BoardName", lambda x: sorted(set(x.tolist()))))
+        .sort_values(["DirectorID", "year"])
+        .reset_index(drop=True)
+    )
+
+    board_lookup = {
+        (did, int(y)): set(boards)
+        for did, y, boards in grouped[["DirectorID", "year", "BoardName"]].itertuples(index=False)
+    }
+
+    rows = []
+    for did, year, current in grouped[["DirectorID", "year", "BoardName"]].itertuples(index=False):
+        year = int(year)
+        
+        previous = board_lookup.get((did, year - 1))
+        if not previous:
+            continue
+            
+        current_set = set(current)
+        left_boards = previous - current_set
+        
+        if not left_boards:
+            continue
+            
+        stayed_boards = previous & current_set
+        
+        for b_left in left_boards:
+            b_counterparts = stayed_boards.union(left_boards - {b_left})
+            for b_counterpart in b_counterparts:
+                if b_counterpart != b_left:
+                    rows.append({
+                        "year": year,
+                        "FirmA": b_counterpart,
+                        "FirmB": b_left,
+                    })
+
+    transitions = pd.DataFrame(rows)
+    if transitions.empty:
+        return pd.DataFrame(columns=["BoardName", "year", "event", "BoardNamePair"])
+
+    if treatment_group == "B":
+        treated_col = "FirmB"
+        counterpart_col = "FirmA"
+    else:
+        treated_col = "FirmA"
+        counterpart_col = "FirmB"
+
+    grouped_events = (
+        transitions.groupby([treated_col, "year"], as_index=False)[counterpart_col]
+        .agg(_sorted_unique_list)
+        .rename(columns={treated_col: "BoardName", counterpart_col: "BoardNamePair"})
+    )
+    
+    grouped_events["event"] = "interlock_dissolution"
+    grouped_events["year"] = grouped_events["year"].astype(int)
+    
+    return grouped_events[["BoardName", "year", "event", "BoardNamePair"]]
+
+
 def build_all_events(stay_x_years: int = 3, treatment_group: str = "B") -> pd.DataFrame:
     """Build and combine all event types under one persistence setting."""
     ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv", usecols=["BoardName"])
@@ -272,8 +344,11 @@ def build_all_events(stay_x_years: int = 3, treatment_group: str = "B") -> pd.Da
         stay_x_years=stay_x_years,
         treatment_group=treatment_group,
     )
+    dissolution = build_dissolution_events(
+        treatment_group=treatment_group,
+    )
 
-    events = pd.concat([direct, indirect, transition], ignore_index=True)
+    events = pd.concat([direct, indirect, transition, dissolution], ignore_index=True)
     # Deduplicate in case source files contain repeated pair-year entries.
     events = events.drop_duplicates(subset=["BoardName", "year", "event"]).reset_index(drop=True)
     return events

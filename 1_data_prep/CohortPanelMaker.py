@@ -38,6 +38,7 @@ EVENT_CONFIGS = {
     "indirect_interlock": "ssr_firm_panel_indirect_interlock.csv",
     "to_B_not_in_A": "ssr_firm_panel_to_B_not_in_A.csv",
     "to_B_still_in_A": "ssr_firm_panel_to_B_still_in_A.csv",
+    "interlock_dissolution": "ssr_firm_panel_interlock_dissolution_leave_B.csv",
 }
 
 CONTROL_FOLDER_MAP = {
@@ -105,6 +106,7 @@ RUN_CONFIG = {
         "indirect_interlock",
         "to_B_not_in_A",
         "to_B_still_in_A",
+        "interlock_dissolution",
     ],
     "treat_types": ["first_event", "event"],
     "control_types": ["pure_control", "not_yet", "not"],
@@ -147,7 +149,7 @@ def get_data_path(event_type, panel_level, treatment_group="B"):
     if event_type not in EVENT_CONFIGS:
         raise ValueError(
             "event_type must be one of: direct_interlock, indirect_interlock, "
-            "to_B_not_in_A, to_B_still_in_A"
+            "to_B_not_in_A, to_B_still_in_A, interlock_dissolution"
         )
     if panel_level not in ["year", "quarter"]:
         raise ValueError("panel_level must be one of: year, quarter")
@@ -205,16 +207,24 @@ def build_control_groups(
 
     # Load movement list if include_eventpair is 0
     movement_df = None
-    if include_eventpair == 0 and event_type in ["to_B_not_in_A", "to_B_still_in_A"]:
+    if include_eventpair == 0 and event_type in ["to_B_not_in_A", "to_B_still_in_A", "interlock_dissolution"]:
         movement_dir = PROJECT_ROOT / "data" / "movement_list"
-        csv_files = list(movement_dir.glob("*.csv"))
-        if csv_files:
-            movement_df = pd.concat(
-                [pd.read_csv(file_path) for file_path in csv_files],
-                ignore_index=True,
-            )
-            mode_val = "still" if event_type == "to_B_still_in_A" else "not"
-            movement_df = movement_df[movement_df["event_type"] == mode_val]
+        
+        if event_type == "interlock_dissolution":
+            # For interlock_dissolution, we read the specific leave_B_movement.csv
+            dissolution_file = movement_dir / "leave_B_movement.csv"
+            if dissolution_file.exists():
+                movement_df = pd.read_csv(dissolution_file)
+        else:
+            csv_files = list(movement_dir.glob("*.csv"))
+            if csv_files:
+                movement_df = pd.concat(
+                    [pd.read_csv(file_path) for file_path in csv_files],
+                    ignore_index=True,
+                )
+                mode_val = "still" if event_type == "to_B_still_in_A" else "not"
+                if "event_type" in movement_df.columns:
+                    movement_df = movement_df[movement_df["event_type"] == mode_val]
 
     id_cols = ["BoardName", "product"]
     output_group_label = get_output_group_label(treatment_group, include_eventpair)

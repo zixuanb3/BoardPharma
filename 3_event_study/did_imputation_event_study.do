@@ -25,11 +25,13 @@ set trace off
 
 * ================= user config =================
 local shortened_atc3 1
-* 1
+* 1 0
 local separate_modes 0
 * 1
-local trim_percentile "p95"
-*90 95
+local outlier_treatment "winsorize"
+* trim winsorize none
+local outlier_treatment_percentile "p99"
+*p90 p95 p99
 
 * ================= path =================
 local code_path "`c(pwd)'"
@@ -44,11 +46,11 @@ cap mkdir "`project_path'/figures"
 cap mkdir "`project_path'/csv"
 cap mkdir "`project_path'/logs"
 
-local events to_B_still_in_A to_B_not_in_A
-*direct_interlock indirect_interlock 
+local events interlock_dissolution
+*direct_interlock indirect_interlock to_B_still_in_A to_B_not_in_A
 local controls not 
 * notyet purecontrol
-local targets revenue quantity
+local targets price0 price revenue quantity
 *revenue quantity price0 price
 local standardize_types normalize log_transform standardize
 * log_transform standardize
@@ -114,7 +116,13 @@ foreach treatment_group of local treatment_groups {
                     local mode_title "separate samples"
                 }
 
-                local fe_output_tag "`output_tag_base'_trim`trim_percentile'_fe`fe_level'"
+                if "`outlier_treatment'" == "none" {
+                    local fe_output_tag "`output_tag_base'_none_fe`fe_level'"
+                }
+                else {
+                    local fe_output_tag "`output_tag_base'_`outlier_treatment'`outlier_treatment_percentile'_fe`fe_level'"
+                }
+                
                 local fe_fig_root "`project_path'/figures/`fe_output_tag'"
                 local fe_csv_root "`project_path'/csv/`fe_output_tag'"
                 local fe_log_root "`project_path'/logs/`fe_output_tag'"
@@ -183,6 +191,19 @@ foreach treatment_group of local treatment_groups {
                                     }
                                     else {
                                         local cohort_list 2008 2009 2010 2011 2013 2014 2015 2017 2018
+                                    }
+                                }
+                                else if "`event'" == "interlock_dissolution" {
+                                    if "`treatment_group'" == "A" {
+                                        local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                    }
+                                    else {
+                                        if "`event_type'" == "first_event" {
+                                            local cohort_list 2008 2009 2010 2011 2012 2014 2015 2016 2017 2018
+                                        }
+                                        else {
+                                            local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                        }
                                     }
                                 }
 
@@ -288,28 +309,38 @@ foreach treatment_group of local treatment_groups {
                                 if `shortened_atc3' == 1 {
                                     capture confirm string variable atc3
                                     if !_rc {
-                                        replace atc3 = substr(atc3, 1, length(atc3) - 1)
+                                        replace atc3 = substr(atc3, 1, length(atc3) - 3)
                                     }
                                     else {
                                         tostring atc3, replace
-                                        replace atc3 = substr(atc3, 1, length(atc3) - 1)
+                                        replace atc3 = substr(atc3, 1, length(atc3) - 3)
                                     }
                                 }
+                                if `shortened_atc3' == 1 {
+                                    drop if atc3 == "Devi"
+                                }
 
-                                bysort boardname product data_cohort: egen group_max_norm = max(`target')
-                                bysort boardname product data_cohort: egen group_min_norm = min(`target')
-                                gen group_ratio_norm = .
-                                replace group_ratio_norm = group_max_norm / group_min_norm if group_min_norm != 0 & !missing(group_min_norm)
+                                if "`outlier_treatment'" == "trim" {
+                                    bysort boardname product data_cohort: egen group_max_norm = max(`target')
+                                    bysort boardname product data_cohort: egen group_min_norm = min(`target')
+                                    gen group_ratio_norm = .
+                                    replace group_ratio_norm = group_max_norm / group_min_norm if group_min_norm != 0 & !missing(group_min_norm)
 
-                                preserve
-                                keep boardname product data_cohort group_ratio_norm
-                                bysort boardname product data_cohort: keep if _n == 1
-                                quietly summarize group_ratio_norm, detail
-                                local p95_group_ratio = r(`trim_percentile')
-                                restore
+                                    preserve
+                                    keep boardname product data_cohort group_ratio_norm
+                                    bysort boardname product data_cohort: keep if _n == 1
+                                    quietly summarize group_ratio_norm, detail
+                                    local p95_group_ratio = r(`outlier_treatment_percentile')
+                                    restore
 
-                                drop if group_ratio_norm > `p95_group_ratio' & !missing(group_ratio_norm)
-                                drop group_max_norm group_min_norm group_ratio_norm
+                                    drop if group_ratio_norm > `p95_group_ratio' & !missing(group_ratio_norm)
+                                    drop group_max_norm group_min_norm group_ratio_norm
+                                }
+                                else if "`outlier_treatment'" == "winsorize" {
+                                    quietly summarize `target', detail
+                                    local pt_val = r(`outlier_treatment_percentile')
+                                    replace `target' = `pt_val' if `target' > `pt_val' & !missing(`target')
+                                }
 
                                 if "`std'" == "standardize" {
                                     bysort boardname product data_cohort: egen temp = std(`target')

@@ -78,16 +78,13 @@ OUTPUT_BASE_PATH.mkdir(parents=True, exist_ok=True)
 # treatment_groups:
 # - "B": destination firm as treated group (legacy behavior)
 # - "A": origin firm as treated group
-#
-# include_eventpair:
-# - 1: keep counterpart-firm observations in panel
-# - 0: drop counterpart-firm observations from panel
 RUN_CONFIG = {
     "event_types": [
         "direct interlock",
         "indirect interlock",
         "to B not in A",
         "to B still in A",
+        "interlock_dissolution",
     ],
     "panel_levels": ["quarter"],
     "stay_x_years": 3,
@@ -191,6 +188,7 @@ class EventStudyPanelSSR:
             "indirect interlock": "boardex_interlock_indirect_firmpair.dta",
             "to B not in A": "boardex_pharma.dta",
             "to B still in A": "boardex_pharma.dta",
+            "interlock_dissolution": "boardex_pharma.dta",
         }
         if self.event_type not in event_files:
             if self.event_type == "no event":
@@ -238,6 +236,115 @@ class EventStudyPanelSSR:
             return group
 
         return df.groupby("BoardName", group_keys=False).apply(assign)
+
+    def _build_dissolution_transitions(self, pharma: pd.DataFrame) -> pd.DataFrame:
+        pharma = pharma[pharma["inSSR"] == 1].copy()
+        
+        pharma_clean = pharma.dropna(subset=["DirectorID", "year", "BoardName"])
+        grouped = (
+            pharma_clean.groupby(["DirectorID", "year"], as_index=False)
+            .agg(BoardName=("BoardName", lambda x: sorted(set(x.tolist()))))
+            .sort_values(["DirectorID", "year"])
+            .reset_index(drop=True)
+        )
+
+        board_lookup = {
+            (did, int(y)): set(boards)
+            for did, y, boards in grouped[["DirectorID", "year", "BoardName"]].itertuples(index=False)
+        }
+
+        rows = []
+        for did, year, current in grouped[["DirectorID", "year", "BoardName"]].itertuples(index=False):
+            year = int(year)
+            
+            previous = board_lookup.get((did, year - 1))
+            if not previous:
+                continue
+                
+            current_set = set(current)
+            left_boards = previous - current_set
+            
+            if not left_boards:
+                continue
+                
+            stayed_boards = previous & current_set
+            
+            for b_left in left_boards:
+                b_counterparts = stayed_boards.union(left_boards - {b_left})
+                for b_counterpart in b_counterparts:
+                    rows.append({
+                        "DirectorID": did,
+                        "movement_year": year,
+                        "FirmA": b_counterpart,
+                        "FirmB": b_left,
+                    })
+                    
+        return pd.DataFrame(rows)
+
+    def _build_dissolution_panel(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        pharma = self.load_event_data()
+        transitions = self._build_dissolution_transitions(pharma)
+        
+        if transitions.empty:
+            print(f"Warning: No transitions generated for 'interlock_dissolution'")
+            return pd.DataFrame(), pd.DataFrame()
+            
+        transitions["event_type"] = "leave"
+        movement_list = transitions.drop_duplicates().reset_index(drop=True)
+
+        treatment_firm_col = "FirmA" if self.treatment_group == "A" else "FirmB"
+
+        collapsed = (
+            transitions.groupby(["movement_year", treatment_firm_col], as_index=False)
+            .size()
+            .rename(columns={"movement_year": "year", treatment_firm_col: "BoardName"})
+        )
+        
+        # event indicator and stay col (we always set stay_col to 1 for dissolution as not governed by stay_x_years)
+        collapsed["event"] = 1
+        collapsed[self.stay_col] = 1
+        
+        events = collapsed[["year", "BoardName", "event", self.stay_col]].copy()
+
+        if self.panel_level == "quarter":
+            events = events.loc[events.index.repeat(4)].reset_index(drop=True)
+            events["quarter"] = events.groupby(["BoardName", "year"]).cumcount() + 1
+            events["quarter"] = events["quarter"].astype(np.int8)
+            events.loc[events["quarter"] != 1, ["event", self.stay_col]] = 0
+
+        merge_keys = ["BoardName", "year"] + (["quarter"] if self.panel_level == "quarter" else [])
+        panel = self.ssr_base.merge(events, on=merge_keys, how="left")
+        
+        first_event = events.groupby("BoardName", as_index=False)["year"].min().rename(columns={"year": "first_event_year"})
+        panel = panel.merge(first_event, on="BoardName", how="left")
+
+        first_mask = (panel["event"] == 1) & (panel["year"] == panel["first_event_year"])
+        if self.panel_level == "quarter":
+            first_mask = first_mask & panel["quarter"].eq(1)
+        panel["first_event"] = first_mask.astype(int)
+        
+        panel[["event", self.stay_col]] = panel[["event", self.stay_col]].fillna(0).astype(np.int8)
+
+        event_years = sorted(events["year"].unique())
+        for y in event_years:
+            col = f"event_{int(y)}"
+            boards = set(events.loc[events["year"] == y, "BoardName"])
+            panel[col] = self._event_mask(panel, y, boards, self.panel_level).astype(np.int8)
+
+        panel = panel.groupby(["BoardName", "product"], group_keys=False).apply(
+            lambda g: self._mark_balance_panel(g, "first_event")
+        )
+        for col in [c for c in panel.columns if c.startswith("event_")]:
+            panel = panel.groupby(["BoardName", "product"], group_keys=False).apply(
+                lambda g, e=col: self._mark_balance_panel(g, e)
+            )
+
+        panel = panel.drop(columns=[c for c in panel.columns if c.startswith("event_")])
+        panel = self._add_event_year_columns(panel, events, self.panel_level)
+
+        ordered = panel.columns.tolist()
+        ordered.insert(4, ordered.pop(ordered.index("event")))
+        return panel[ordered], movement_list
 
     def _build_board_transitions(self, pharma: pd.DataFrame) -> pd.DataFrame:
         # Keep inSSR mapping for origin/destination validation.
@@ -537,6 +644,15 @@ class EventStudyPanelSSR:
             not_panel, movement_list = self._build_to_b_panel(mode="not")
             if not not_panel.empty:
                 not_panel.to_csv(output_path / f"ssr_firm_panel_to_B_not_in_A.csv", index=False)
+            return movement_list
+            
+        if self.event_type == "interlock_dissolution":
+            dissolution_panel, movement_list = self._build_dissolution_panel()
+            if not dissolution_panel.empty:
+                dissolution_panel.to_csv(output_path / f"ssr_firm_panel_interlock_dissolution_leave_B.csv", index=False)
+                # Ensure movement_list is saved directly or let the caller loop handle it based on specific paths if generalized
+                # But requirement says "Create and save a CSV: data/movement_list/leave_B_movement.csv"
+                movement_list.to_csv(OUTPUT_BASE_PATH / "movement_list" / "leave_B_movement.csv", index=False)
             return movement_list
 
         if self.event_type in ["direct interlock", "indirect interlock"]:
