@@ -1,35 +1,30 @@
 """
 Purpose:
-Generate ATC-sharing labels for cohort and staggered files, then plot sharing vs
+Generate ATC-sharing labels for cohort files, then plot treated sharing vs
 non-sharing distributions across cohort years.
 
 Process:
-- Load event-partner links and ATC mapping tables.
-- For each configured design, label treated firm-product units as atc3_sharing
-    when their ATC peers overlap with event partners.
-- Save enriched cohort and staggered files under *_with_atc3sharing folders.
+- Load req-valid movement partners and ATC mapping tables.
+- For each configured cohort design, label treated firm-product units as
+    atc3_sharing when their ATC peers overlap with movement partners.
+- Save enriched cohort files under *_with_atc3sharing folders.
 - Build diagnostic plots for configured periods.
 
 Input:
 - data/atc3mapping/atc3mapping_year_level[_level2].csv
-- data/cohort_data/{panel_level}-level_{A|B}_{with|without}_{B|A}/...
-- data/staggered_data/...
-- data/event_B.xlsx
-- data/event_A.xlsx
+- data/cohort_data/{panel_level}-level_{A|B}_{with|without}_{B|A}/{event|first_event}/req{n}/...
+- data/movement_tables/movement_event_candidates.csv
 
 Output:
-- data/cohort_data_with_atc3sharing/{panel_level}-level_{A|B}_{with|without}_{B|A}/...
-- data/staggered_data_with_atc3sharing/...
-- figures/cohort_sharing_atc3/{panel_level}-level_{A|B}_{with|without}_{B|A}/...
-- figures/staggered_sharing_atc3/...
+- data/cohort_data_with_atc3sharing/{panel_level}-level_{A|B}_{with|without}_{B|A}/{event|first_event}/req{n}/...
+- figures/cohort_sharing_atc3/{panel_level}-level_{A|B}_{with|without}_{B|A}/{event|first_event}/req{n}/...
 """
 
 import ast
+from functools import lru_cache
 from pathlib import Path
-
 import matplotlib.pyplot as plt
 import pandas as pd
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ATC3_MAP_DIR = PROJECT_ROOT / "data" / "atc3mapping"
@@ -39,6 +34,7 @@ STAGGERED_ROOT = PROJECT_ROOT / "data" / "staggered_data"
 STAGGERED_OUT_ROOT = PROJECT_ROOT / "data" / "staggered_data_with_atc3sharing"
 EVENT_XLSX_B = PROJECT_ROOT / "data" / "event_B.xlsx"
 EVENT_XLSX_A = PROJECT_ROOT / "data" / "event_A.xlsx"
+MOVEMENT_CANDIDATES_PATH = PROJECT_ROOT / "data" / "movement_tables" / "movement_event_candidates.csv"
 FIG_ROOT = PROJECT_ROOT / "figures" / "cohort_sharing_atc3"
 STAGGERED_FIG_ROOT = PROJECT_ROOT / "figures" / "staggered_sharing_atc3"
 
@@ -58,13 +54,21 @@ STAGGERED_FIG_ROOT = PROJECT_ROOT / "figures" / "staggered_sharing_atc3"
 # - "Not", "Not Yet", "Pure Control".
 # - Controls which cohort-design variants are traversed for enrichment and diagnostics.
 #
+# EVENT_REQUIREMENTS:
+# - 0 / 1 / 2 correspond to req0 / req1 / req2 cohort folders.
+# - These are used only by the cohort movement workflow below.
+# - Pair filtering always requires the movement stay_{x}_years flag.
+# - req1 and req2 additionally require requirement1 == 1.
+# - req2 treated filtering itself is already encoded upstream in the req2 cohort files,
+#   so this script does not apply a second requirement2 filter at the pair level.
+#
 # ATC3_SHARING_PERIODS:
 # - Relative periods used to define saved atc3_sharing labels.
 # - [0] means labels are defined from event-year observations only.
 #
 # PERIODS:
 # - Relative periods used only for plotted diagnostics.
-# - Does not change exported cohort/staggered files.
+# - Does not change exported cohort files.
 #
 # atc_level:
 # - 1 keeps original ATC3.
@@ -76,27 +80,31 @@ STAGGERED_FIG_ROOT = PROJECT_ROOT / "figures" / "staggered_sharing_atc3"
 # - Staggered traversal remains unchanged.
 RUN_CONFIG = {
     "EVENTS": [
-        "direct_interlock",
-        "indirect_interlock",
         "to_B_not_in_A",
         "to_B_still_in_A",
         "interlock_dissolution",
     ],
-    "EVENT_TYPES": ["event", "first_event"],
+    "EVENT_TYPES": ["event"], #"first_event"
     "PANEL_LEVELS": ["quarter"],
     "CONTROL_FOLDERS": ["Not", "Not Yet", "Pure Control"],
+    "EVENT_REQUIREMENTS": [0, 1, 2],
     "ATC3_SHARING_PERIODS": [0],
     "PERIODS": [0],
     "atc_level": 2,
-    "COHORT_YEARS": list(range(2007, 2019)),
+    "COHORT_YEARS": list(range(2009, 2019)),
     "treatment_groups": ["B","A"],
-    "include_eventpair": [1,0],
+    "include_eventpair": [0], # 1
 }
+"""
+        "direct_interlock",
+        "indirect_interlock",
+"""
 # ===============================================================
 EVENTS = RUN_CONFIG["EVENTS"]
 EVENT_TYPES = RUN_CONFIG["EVENT_TYPES"]
 PANEL_LEVELS = RUN_CONFIG["PANEL_LEVELS"]
 CONTROL_FOLDERS = RUN_CONFIG["CONTROL_FOLDERS"]
+EVENT_REQUIREMENTS = [int(x) for x in RUN_CONFIG["EVENT_REQUIREMENTS"]]
 ATC3_SHARING_PERIODS = RUN_CONFIG["ATC3_SHARING_PERIODS"]
 PERIODS = RUN_CONFIG["PERIODS"]
 COHORT_YEARS = RUN_CONFIG["COHORT_YEARS"]
@@ -130,6 +138,14 @@ def cohort_group_label(treatment_group: str, include_eventpair: int) -> str:
 def cohort_level_folder(panel_level: str, treatment_group: str, include_eventpair: int) -> str:
     """Return cohort level folder name with group suffix."""
     return f"{panel_level}-level_{cohort_group_label(treatment_group, include_eventpair)}"
+
+
+def requirement_folder(event_requirement: int) -> str:
+    """Return req{n} folder label."""
+    req = int(event_requirement)
+    if req not in {0, 1, 2}:
+        raise ValueError("event_requirement must be one of: 0, 1, 2")
+    return f"req{req}"
 
 
 def parse_staggered_file_name(file_name: str) -> dict[str, str] | None:
@@ -217,6 +233,39 @@ def parse_list_cell(value) -> list[str]:
     return [str(value)]
 
 
+@lru_cache(maxsize=1)
+def load_movement_candidates() -> pd.DataFrame:
+    """Load movement candidates once and detect the unique stay column."""
+    movement = pd.read_csv(MOVEMENT_CANDIDATES_PATH)
+    stay_cols = [
+        column
+        for column in movement.columns
+        if str(column).startswith("stay_") and str(column).endswith("_years")
+    ]
+    if len(stay_cols) != 1:
+        raise ValueError(
+            "Expected exactly one stay_{x}_years column in movement candidates, "
+            f"found: {stay_cols}"
+        )
+    stay_col = stay_cols[0]
+    movement["event_year"] = pd.to_numeric(movement["event_year"], errors="raise").astype(int)
+    movement["requirement1"] = pd.to_numeric(movement["requirement1"], errors="raise").astype(int)
+    movement[stay_col] = pd.to_numeric(movement[stay_col], errors="raise").astype(int)
+    movement.attrs["stay_col"] = stay_col
+    return movement
+
+
+def filter_movement_pairs(event_requirement: int) -> pd.DataFrame:
+    """Return req-valid movement rows for ATC-sharing matching."""
+    base_movement = load_movement_candidates()
+    stay_col = base_movement.attrs["stay_col"]
+    movement = base_movement.copy()
+    movement = movement.loc[movement[stay_col].eq(1)].copy()
+    if int(event_requirement) in {1, 2}:
+        movement = movement.loc[movement["requirement1"].eq(1)].copy()
+    return movement
+
+
 def cohort_file_path(
     panel_level: str,
     event_type: str,
@@ -224,12 +273,21 @@ def cohort_file_path(
     cohort_year: int,
     treatment_group: str,
     include_eventpair: int,
+    control_folder: str,
+    event_requirement: int,
 ) -> Path:
     """Build cohort file path following CohortPanelMaker naming."""
     treat_suffix = "_first_event" if event_type == "first_event" else ""
     file_name = f"{event}_{panel_level}_cohort_{cohort_year}{treat_suffix}_balanced.csv"
     level_folder = cohort_level_folder(panel_level, treatment_group, include_eventpair)
-    return COHORT_ROOT / level_folder / event_type / "Pure Control" / file_name
+    return (
+        COHORT_ROOT
+        / level_folder
+        / event_type
+        / requirement_folder(event_requirement)
+        / control_folder
+        / file_name
+    )
 
 
 def load_atc3_mapping(panel_level: str, atc_level: int = 1) -> pd.DataFrame:
@@ -246,6 +304,36 @@ def load_atc3_mapping(panel_level: str, atc_level: int = 1) -> pd.DataFrame:
     path = ATC3_MAP_DIR / f"atc3mapping_year_level{level_suffix}.csv"
     df = pd.read_csv(path)
     return df
+
+
+def load_movement_event_pairs(
+    treatment_group: str = "B",
+    event_requirement: int = 0,
+) -> pd.DataFrame:
+    """Build cohort event-pair rows directly from req-valid movement candidates."""
+    movement = filter_movement_pairs(event_requirement=event_requirement)
+    tg = str(treatment_group).upper()
+    if tg not in {"A", "B"}:
+        raise ValueError("treatment_group must be one of: A, B")
+
+    treated_col = "FirmB" if tg == "B" else "FirmA"
+    counterpart_col = "FirmA" if tg == "B" else "FirmB"
+
+    event_long = (
+        movement.rename(
+            columns={
+                "event_type": "event",
+                "event_year": "year",
+                treated_col: "BoardName",
+                counterpart_col: "BoardNamePair",
+            }
+        )[["BoardName", "year", "event", "BoardNamePair"]]
+        .dropna(subset=["BoardName", "year", "event", "BoardNamePair"])
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    event_long["year"] = event_long["year"].astype(int)
+    return event_long
 
 
 def event_table_path(treatment_group: str) -> Path:
@@ -267,7 +355,6 @@ def load_event_pairs(treatment_group: str = "B") -> pd.DataFrame:
     event_df = pd.read_excel(event_path)
     needed = ["BoardName", "year", "event", "BoardNamePair"]
     event_df = event_df[needed].copy()
-
     event_df["BoardNamePair"] = event_df["BoardNamePair"].apply(parse_list_cell)
 
     event_long = event_df.explode("BoardNamePair", ignore_index=True)
@@ -355,6 +442,8 @@ def build_distribution_for_config(
     panel_level: str,
     event_type: str,
     event: str,
+    event_requirement: int,
+    control_folder: str,
     treatment_group: str,
     include_eventpair: int,
     event_pairs_long: pd.DataFrame,
@@ -380,6 +469,8 @@ def build_distribution_for_config(
             cohort,
             treatment_group,
             include_eventpair,
+            control_folder,
+            event_requirement,
         )
 
         if not file_path.exists():
@@ -450,7 +541,8 @@ def plot_distribution(summary_df: pd.DataFrame, panel_level: str, event_type: st
     plt.xlabel("Cohort Year")
     plt.ylabel("Number of Event Observations")
     plt.title(
-        f"ATC3 Sharing Distribution | event={event} | event_type={event_type} | level={panel_level} | period={period}"
+        f"ATC3 Sharing Distribution | event={event} | event_type={event_type} | "
+        f"level={panel_level} | period={period}"
     )
     plt.legend()
     plt.xticks(x, rotation=45)
@@ -568,11 +660,15 @@ def add_atc3_sharing_column_for_years(
 def generate_all_cohort_data_with_atc3sharing(
     treatment_group: str,
     include_eventpair: int,
+    event_requirement: int,
     atc_level: int = 1,
     periods: list[int] | None = None,
 ) -> None:
     """Add atc3_sharing to all balanced cohort files and mirror folder structure."""
-    event_pairs_long = load_event_pairs(treatment_group=treatment_group)
+    event_pairs_long = load_movement_event_pairs(
+        treatment_group=treatment_group,
+        event_requirement=event_requirement,
+    )
 
     for panel_level in PANEL_LEVELS:
         atc3_mapping = load_atc3_mapping(panel_level, atc_level=atc_level)
@@ -580,11 +676,23 @@ def generate_all_cohort_data_with_atc3sharing(
         for event_type in EVENT_TYPES:
             for control_folder in CONTROL_FOLDERS:
                 level_folder = cohort_level_folder(panel_level, treatment_group, include_eventpair)
-                src_dir = COHORT_ROOT / level_folder / event_type / control_folder
+                src_dir = (
+                    COHORT_ROOT
+                    / level_folder
+                    / event_type
+                    / requirement_folder(event_requirement)
+                    / control_folder
+                )
                 if not src_dir.exists():
                     continue
 
-                dst_dir = COHORT_OUT_ROOT / level_folder / event_type / control_folder
+                dst_dir = (
+                    COHORT_OUT_ROOT
+                    / level_folder
+                    / event_type
+                    / requirement_folder(event_requirement)
+                    / control_folder
+                )
                 dst_dir.mkdir(parents=True, exist_ok=True)
 
                 for event in EVENTS:
@@ -621,10 +729,16 @@ def generate_all_cohort_data_with_atc3sharing(
                         out_path = dst_dir / f.name
                         df_out.to_csv(out_path, index=False)
 
-                    print(f"  [{panel_level}/{event_type}/{control_folder}] {event} done")
+                    print(
+                        f"  [{panel_level}/{event_type}/req{event_requirement}/{control_folder}] "
+                        f"{event} done"
+                    )
 
     label = cohort_group_label(treatment_group, include_eventpair)
-    print(f"\nAll cohort data with atc3_sharing saved for {label} to: {COHORT_OUT_ROOT}")
+    print(
+        f"\nAll cohort data with atc3_sharing saved for {label} "
+        f"(req{event_requirement}) to: {COHORT_OUT_ROOT}"
+    )
 
 
 def generate_all_staggered_data_with_atc3sharing(
@@ -743,32 +857,37 @@ def period_suffix(period: int) -> str:
 def main() -> None:
     sharing_periods = list(ATC3_SHARING_PERIODS)
 
-    # Generate enriched cohort and staggered files.
+    # Generate enriched cohort files.
     print("=" * 60)
     print(
-        "Generating cohort/staggered data with atc3_sharing "
+        "Generating cohort data with atc3_sharing "
         f"(atc_level={ATC_LEVEL}, periods={sharing_periods}) ..."
     )
     print("=" * 60)
     for treatment_group in TREATMENT_GROUPS:
         for include_eventpair in INCLUDE_EVENTPAIR_VALUES:
-            label = cohort_group_label(treatment_group, include_eventpair)
-            print(f"Cohort pass: {label}")
-            generate_all_cohort_data_with_atc3sharing(
-                treatment_group=treatment_group,
-                include_eventpair=include_eventpair,
-                atc_level=ATC_LEVEL,
-                periods=sharing_periods,
-            )
-
+            for event_requirement in EVENT_REQUIREMENTS:
+                label = cohort_group_label(treatment_group, include_eventpair)
+                print(f"Cohort pass: {label} | req{event_requirement}")
+                generate_all_cohort_data_with_atc3sharing(
+                    treatment_group=treatment_group,
+                    include_eventpair=include_eventpair,
+                    event_requirement=event_requirement,
+                    atc_level=ATC_LEVEL,
+                    periods=sharing_periods,
+                )
+    """
     # Staggered processing intentionally unchanged by cohort group parameters.
     generate_all_staggered_data_with_atc3sharing(atc_level=ATC_LEVEL, periods=sharing_periods)
+    """
 
     # Plot diagnostics for configured periods.
     print("\n" + "=" * 60)
-    print("Plotting cohort/staggered sharing distributions ...")
+    print("Plotting cohort sharing distributions ...")
     print("=" * 60)
+    """
     staggered_event_pairs_long = load_event_pairs(treatment_group="B")
+    """
 
     for period in PERIODS:
         p_suffix = period_suffix(period)
@@ -781,35 +900,53 @@ def main() -> None:
                 atc3_mapping = load_atc3_mapping(panel_level, atc_level=atc_level)
 
                 for treatment_group in TREATMENT_GROUPS:
-                    event_pairs_long = load_event_pairs(treatment_group=treatment_group)
                     for include_eventpair in INCLUDE_EVENTPAIR_VALUES:
                         label = cohort_group_label(treatment_group, include_eventpair)
+                        for event_requirement in EVENT_REQUIREMENTS:
+                            event_pairs_long = load_movement_event_pairs(
+                                treatment_group=treatment_group,
+                                event_requirement=event_requirement,
+                            )
+                            for event_type in EVENT_TYPES:
+                                for control_folder in ["Pure Control"]:
+                                    for event in EVENTS:
+                                        summary = build_distribution_for_config(
+                                            panel_level=panel_level,
+                                            event_type=event_type,
+                                            event=event,
+                                            event_requirement=event_requirement,
+                                            control_folder=control_folder,
+                                            treatment_group=treatment_group,
+                                            include_eventpair=include_eventpair,
+                                            event_pairs_long=event_pairs_long,
+                                            atc3_mapping=atc3_mapping,
+                                            atc_level=atc_level,
+                                            period=period,
+                                        )
 
-                        for event_type in EVENT_TYPES:
-                            for event in EVENTS:
-                                summary = build_distribution_for_config(
-                                    panel_level=panel_level,
-                                    event_type=event_type,
-                                    event=event,
-                                    treatment_group=treatment_group,
-                                    include_eventpair=include_eventpair,
-                                    event_pairs_long=event_pairs_long,
-                                    atc3_mapping=atc3_mapping,
-                                    atc_level=atc_level,
-                                    period=period,
-                                )
+                                        out_dir = (
+                                            FIG_ROOT
+                                            / f"{panel_level}-level_{label}"
+                                            / event_type
+                                            / requirement_folder(event_requirement)
+                                        )
+                                        stem = (
+                                            f"sharing_atc3_{event}_{event_type}_{panel_level}-level_{label}"
+                                            f"{level_suffix}{p_suffix}"
+                                        )
+                                        out_png = out_dir / f"{stem}.png"
 
-                                out_dir = FIG_ROOT / f"{panel_level}-level_{label}" / event_type
-                                stem = (
-                                    f"sharing_atc3_{event}_{event_type}_{panel_level}-level_{label}"
-                                    f"{level_suffix}{p_suffix}"
-                                )
-                                out_png = out_dir / f"{stem}.png"
+                                        plot_distribution(
+                                            summary_df=summary,
+                                            panel_level=panel_level,
+                                            event_type=event_type,
+                                            event=event,
+                                            out_png=out_png,
+                                            period=period,
+                                        )
 
-                                plot_distribution(summary, panel_level, event_type, event, out_png, period=period)
-
-                                print(f"Saved: {out_png}")
-
+                                        print(f"Saved: {out_png}")
+                """
                 # staggered_data is always first_event by construction
                 src_dir = STAGGERED_ROOT / staggered_level_folder(panel_level)
                 if not src_dir.exists():
@@ -853,6 +990,7 @@ def main() -> None:
                     )
 
                     print(f"Saved: {out_png}")
+                """
 
 
 if __name__ == "__main__":

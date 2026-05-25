@@ -36,9 +36,9 @@ set trace off
 
 * ================= user config =================
 local shortened_atc3 0
-local outlier_treatment "trim"
+local outlier_treatment "winsorize"
 * trim winsorize none
-local outlier_treatment_percentile "p90"
+local outlier_treatment_percentile "p95"
 * 90 95 99
 
 * ================= path =================
@@ -55,15 +55,18 @@ cap mkdir "`project_path'/logs"
 cap mkdir "`project_path'/tex"
 cap mkdir "`project_path'/csv"
 
-local events interlock_dissolution
+local events interlock_dissolution to_B_not_in_A to_B_still_in_A
 * direct_interlock indirect_interlock to_B_not_in_A to_B_still_in_A
-local controls not 
+local controls not notyet purecontrol
 * not notyet purecontrol
-local targets price price0 revenue quantity
-local standardize_types normalize log_transform standardize
+local targets price price0
+* price price0 revenue quantity
+local standardize_types log_transform
 * log_transform standardize normalize
 local event_types event
 * first_event
+local reqs 2
+* 1 2
 local treatment_groups A B
 local include_eventpair_values 0
 * 1
@@ -130,65 +133,109 @@ foreach panel_level of local panel_levels {
                     foreach control of local controls {
                         foreach std of local standardize_types {
                             foreach event_type of local event_types {
+                                foreach req of local reqs {
                                 local cohort_list ""
 
                                 if "`panel_level'" == "quarter" {
-                                    if "`event'" == "direct_interlock" & "`event_type'" == "first_event" {
-                                        local cohort_list 2008 2009 2010 2011 2012 2013 2014 2017 2018
-                                    }
-                                    else if "`event'" == "direct_interlock" & "`event_type'" == "event" {
-                                        local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                    }
-                                    else if "`event'" == "indirect_interlock" & "`event_type'" == "first_event" {
-                                        local cohort_list 2008 2010 2011 2012 2013 2014
-                                    }
-                                    else if "`event'" == "indirect_interlock" & "`event_type'" == "event" {
-                                        local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                    }
-                                    else if "`event'" == "to_B_not_in_A" & "`event_type'" == "first_event" {
+                                    if "`req'" == "0" & "`event_type'" == "event" {
                                         if "`treatment_group'" == "A" {
-                                            local cohort_list 2008 2009 2010 2012 2013 2016 2017 2018
-                                        }
-                                        else {
-                                            local cohort_list 2009 2010 2012 2013 2014 2016 2017 2018
-                                        }
-                                    }
-                                    else if "`event'" == "to_B_not_in_A" & "`event_type'" == "event" {
-                                        if "`treatment_group'" == "A" {
-                                            local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                        }
-                                        else {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2016 2017 2018
-                                        }
-                                    }
-                                    else if "`event'" == "to_B_still_in_A" & "`event_type'" == "first_event" {
-                                        if "`treatment_group'" == "A" {
-                                            local cohort_list 2009 2010 2011 2012 2013 2015 2017
-                                        }
-                                        else {
-                                            local cohort_list 2008 2009 2010 2011 2013 2014 2017 2018
-                                        }
-                                    }
-                                    else if "`event'" == "to_B_still_in_A" & "`event_type'" == "event" {
-                                        if "`treatment_group'" == "A" {
-                                            local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                        }
-                                        else {
-                                            local cohort_list 2008 2009 2010 2011 2013 2014 2015 2017 2018
-                                        }
-                                    }
-                                    else if "`event'" == "interlock_dissolution" {
-                                        if "`treatment_group'" == "A" {
-                                            local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                        }
-                                        else {
-                                            if "`event_type'" == "first_event" {
-                                                local cohort_list 2008 2009 2010 2011 2012 2014 2015 2016 2017 2018
+                                            if inlist("`event'", "interlock_dissolution", "to_B_not_in_A", "to_B_still_in_A") {
+                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
                                             }
                                             else {
-                                                local cohort_list 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                di as error "Unsupported event: `event'"
+                                                exit 198
                                             }
                                         }
+                                        else if "`treatment_group'" == "B" {
+                                            if "`event'" == "interlock_dissolution" {
+                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017
+                                            }
+                                            else if "`event'" == "to_B_not_in_A" {
+                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`event'" == "to_B_still_in_A" {
+                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2017 2018
+                                            }
+                                            else {
+                                                di as error "Unsupported event: `event'"
+                                                exit 198
+                                            }
+                                        }
+                                        else {
+                                            di as error "Unsupported treatment_group: `treatment_group'"
+                                            exit 198
+                                        }
+                                    }
+                                    else if "`req'" == "1" & "`event_type'" == "event" {
+                                        if "`treatment_group'" == "A" {
+                                            if inlist("`event'", "interlock_dissolution", "to_B_not_in_A", "to_B_still_in_A") {
+                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                            }
+                                            else {
+                                                di as error "Unsupported event: `event'"
+                                                exit 198
+                                            }
+                                        }
+                                        else if "`treatment_group'" == "B" {
+                                            if "`event'" == "interlock_dissolution" {
+                                                local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`event'" == "to_B_not_in_A" {
+                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`event'" == "to_B_still_in_A" {
+                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2017 2018
+                                            }
+                                            else {
+                                                di as error "Unsupported event: `event'"
+                                                exit 198
+                                            }
+                                        }
+                                        else {
+                                            di as error "Unsupported treatment_group: `treatment_group'"
+                                            exit 198
+                                        }
+                                    }
+                                    else if "`req'" == "2" & "`event_type'" == "event" {
+                                        if "`treatment_group'" == "A" {
+                                            if "`event'" == "interlock_dissolution" {
+                                                local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017
+                                            }
+                                            else if "`event'" == "to_B_not_in_A" {
+                                                local cohort_list 2010 2012 2014 2016 2017
+                                            }
+                                            else if "`event'" == "to_B_still_in_A" {
+                                                local cohort_list ""
+                                            }
+                                            else {
+                                                di as error "Unsupported event: `event'"
+                                                exit 198
+                                            }
+                                        }
+                                        else if "`treatment_group'" == "B" {
+                                            if "`event'" == "interlock_dissolution" {
+                                                local cohort_list ""
+                                            }
+                                            else if "`event'" == "to_B_not_in_A" {
+                                                local cohort_list 2012 2015 2017 2018
+                                            }
+                                            else if "`event'" == "to_B_still_in_A" {
+                                                local cohort_list 2010 2012 2013 2015 2017 2018
+                                            }
+                                            else {
+                                                di as error "Unsupported event: `event'"
+                                                exit 198
+                                            }
+                                        }
+                                        else {
+                                            di as error "Unsupported treatment_group: `treatment_group'"
+                                            exit 198
+                                        }
+                                    }
+                                    else {
+                                        di as error "Unsupported req or event_type: req=`req', event_type=`event_type'"
+                                        exit 198
                                     }
                                 }
 
@@ -218,14 +265,21 @@ foreach panel_level of local panel_levels {
                                     local suffix "_first_event"
                                 }
 
-                                local file_stub "`event'_`event_type'_`control_fname'_`std'_ddd_atc3sharing_fe`fe_level'_`group_label'"
+                                local file_stub "`event_type'_`control_fname'_`std'"
+
+                                cap mkdir "`fe_log_root'/`panel_group_folder'/`event'/req`req'"
+                                cap mkdir "`fe_tex_root'/`panel_group_folder'/`event'/req`req'"
+                                cap mkdir "`fe_csv_root'/`panel_group_folder'/`event'/req`req'"
+                                cap mkdir "`fe_log_root'/`panel_group_folder'/`event'/req`req'/`target'"
+                                cap mkdir "`fe_tex_root'/`panel_group_folder'/`event'/req`req'/`target'"
+                                cap mkdir "`fe_csv_root'/`panel_group_folder'/`event'/req`req'/`target'"
 
                                 cap log close
-                                log using "`fe_log_root'/`panel_group_folder'/`event'/`file_stub'.log", text replace
+                                log using "`fe_log_root'/`panel_group_folder'/`event'/req`req'/`file_stub'.log", text replace
 
                                 estimates clear
 
-                                local csv_file "`fe_csv_root'/`panel_group_folder'/`event'/`file_stub'.csv"
+                                local csv_file "`fe_csv_root'/`panel_group_folder'/`event'/req`req'/`file_stub'.csv"
                                 tempfile run_results
                                 tempname posth
 
@@ -252,10 +306,15 @@ foreach panel_level of local panel_levels {
                                     local first 1
 
                                     foreach cohort of local cohort_list {
-                                        local data_file "`data_path'/`event_type'/`control_folder'/`event'_`panel_level'_cohort_`cohort'`suffix'_balanced.csv"
+                                        local data_file "`data_path'/`event_type'/req`req'/`control_folder'/`event'_`panel_level'_cohort_`cohort'`suffix'_balanced.csv"
 
                                         import delimited "`data_file'", clear
                                         gen target_raw = `target'
+                                        
+                                        local event_anchor_q = yq(`cohort', 1)
+                                        gen rel_quarter_all = yq(year, quarter) - `event_anchor_q'
+                                        keep if rel_quarter_all >= -6 & rel_quarter_all <= 7
+                                        drop rel_quarter_all
 
                                         gen event_cohort = .
                                         gen treated_in_stack = 0
@@ -569,17 +628,17 @@ foreach panel_level of local panel_levels {
                                 export delimited using "`csv_file'", replace
                                 restore
 
-                                local tex_file "`fe_tex_root'/`panel_group_folder'/`event'/`file_stub'.tex"
+                                local tex_file "`fe_tex_root'/`panel_group_folder'/`event'/req`req'/`file_stub'.tex"
                                 tempfile tex_fragment
 
-                                esttab m_revenue m_price m_price0 m_quantity using "`tex_fragment'", ///
+                                esttab m_price using "`tex_fragment'", ///
                                     replace booktabs se star(* 0.10 ** 0.05 *** 0.01) ///
                                     keep(did did_g) ///
                                     coeflabels( ///
                                         did "beta0: Treat x Post" ///
                                         did_g "beta1: Treat x Post x G" ///
                                     ) ///
-                                    mtitles("Revenue" "Price" "Price0" "Quantity") ///
+                                    mtitles("Price") ///
                                     stats( ///
                                         premean_notshare ///
                                         premean_share ///
@@ -647,6 +706,8 @@ foreach panel_level of local panel_levels {
         }
     }
 }
+}
+clear all
 
 
 
