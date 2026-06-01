@@ -15,6 +15,9 @@ Process:
   using the pre-built movement candidate table.
 - For movement req2 cohorts, split controls into stable/changing variation
   groups using the firm interlock panel.
+- Add other-event control columns (e.g., event_still_pulse, event_not_history) 
+  relevant to the current event_type and requirement, filtered strictly within 
+  the cohort window.
 - Save cohort CSV files and plot treated/control counts by cohort year for
   both product-level and firm-level distributions.
 
@@ -461,6 +464,113 @@ def add_req2_control_variation_columns(
     return cohort_df
 
 
+def get_relevant_other_events(current_event_type: str, req: int) -> list[str]:
+    events = []
+    if current_event_type == "to_B_not_in_A":
+        events = ["to_B_still_in_A", "interlock_dissolution"]
+    elif current_event_type == "to_B_still_in_A":
+        if req in {0, 1}:
+            events = ["to_B_not_in_A", "interlock_dissolution"]
+        elif req == 2:
+            events = ["to_B_not_in_A"]
+    elif current_event_type == "interlock_dissolution":
+        if req in {0, 1}:
+            events = ["to_B_not_in_A", "to_B_still_in_A"]
+        elif req == 2:
+            events = ["to_B_not_in_A"]
+    return events
+
+
+def get_other_event_prefix(other_event: str) -> str:
+    mapping = {
+        "to_B_not_in_A": "event_not",
+        "to_B_still_in_A": "event_still",
+        "interlock_dissolution": "event_dissolution"
+    }
+    return mapping[other_event]
+
+
+@lru_cache(maxsize=16)
+def get_other_event_timing(
+    other_event_type: str,
+    panel_level: str,
+    treatment_group: str,
+    req: int
+) -> pd.DataFrame:
+    """Return a DataFrame of unique (BoardName, year) where event == 1 for the other event."""
+    data_path = get_data_path(
+        event_type=other_event_type,
+        panel_level=panel_level,
+        treatment_group=treatment_group,
+        event_requirement=req,
+    )
+    if not data_path.exists():
+        raise FileNotFoundError(f"Missing required other-event panel: {data_path}")
+    
+    try:
+        df = pd.read_csv(data_path, usecols=["BoardName", "year", "event"])
+    except ValueError:
+        df = pd.read_csv(data_path)
+    
+    df_event = df[df["event"] == 1][["BoardName", "year"]].drop_duplicates()
+    return df_event
+
+
+def add_other_event_columns(
+    cohort_df: pd.DataFrame,
+    start_year: int,
+    end_year: int,
+    current_event_type: str,
+    req: int,
+    panel_level: str,
+    treatment_group: str
+) -> pd.DataFrame:
+    """Attach configured event_pulse and event_history columns for other event types."""
+    other_events = get_relevant_other_events(current_event_type, req)
+    
+    for other_evt in other_events:
+        prefix = get_other_event_prefix(other_evt)
+        pulse_col = f"{prefix}_pulse"
+        history_col = f"{prefix}_history"
+        
+        cohort_df[pulse_col] = 0
+        cohort_df[history_col] = 0
+        
+        timing_df = get_other_event_timing(other_evt, panel_level, treatment_group, req)
+        timing_window = timing_df[
+            timing_df["year"].between(start_year, end_year)
+        ].copy()
+        
+        if not timing_window.empty:
+            timing_window = timing_window.rename(columns={"year": "other_event_year"})
+            
+            # Pulse
+            merged = cohort_df[["BoardName", "year"]].merge(
+                timing_window,
+                left_on=["BoardName", "year"],
+                right_on=["BoardName", "other_event_year"],
+                how="left"
+            )
+            # The pulse condition is 1 if there was a match, keeping original order using .values
+            cohort_df[pulse_col] = merged["other_event_year"].notna().values.astype("int8")
+            
+            # History
+            first_event_in_window = (
+                timing_window.groupby("BoardName")["other_event_year"]
+                .min()
+            )
+            min_years = cohort_df["BoardName"].map(first_event_in_window)
+            cohort_df[history_col] = (
+                min_years.notna() & 
+                (cohort_df["year"] >= min_years)
+            ).values.astype("int8")
+        else:
+            cohort_df[pulse_col] = cohort_df[pulse_col].astype("int8")
+            cohort_df[history_col] = cohort_df[history_col].astype("int8")
+            
+    return cohort_df
+
+
 def build_control_groups(
     event_type: str,
     panel_level: str = "year",
@@ -625,10 +735,28 @@ def build_control_groups(
                 board_variations=board_variations,
                 control_variations=control_variations,
             )
+            cohort_df = add_other_event_columns(
+                cohort_df=cohort_df,
+                start_year=start,
+                end_year=end,
+                current_event_type=event_type,
+                req=event_requirement,
+                panel_level=panel_level,
+                treatment_group=treatment_group,
+            )
             cohort_df.to_csv(output_dir / filename, index=False)
         else:
             cohort_df = pd.concat([treated, controls], axis=0)
             cohort_df = cohort_df.sort_values(sort_cols).reset_index(drop=True)
+            cohort_df = add_other_event_columns(
+                cohort_df=cohort_df,
+                start_year=start,
+                end_year=end,
+                current_event_type=event_type,
+                req=event_requirement,
+                panel_level=panel_level,
+                treatment_group=treatment_group,
+            )
             cohort_df.to_csv(output_dir / filename, index=False)
 
     print(f"Finished. Files saved to: {output_root}")

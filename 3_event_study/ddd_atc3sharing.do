@@ -73,13 +73,19 @@ local event_types event
 * first_event
 local reqs 1
 * 1 2
+local control_for_other_events none pulse history
+* none pulse history
+local control_kappas none
+* none kappa_asy kappa_norm
+local control_atc3s separate
+* none separate interaction
 local req2_control_variations all
 * all stable changing stable_interlock stable_no_interlock
 local treatment_groups A B
 local include_eventpair_values 0
 * 1
 local fe_levels 1 2
-* 1 2 3
+* 1 2
 
 foreach panel_level of local panel_levels {
     foreach treatment_group of local treatment_groups {
@@ -110,8 +116,8 @@ foreach panel_level of local panel_levels {
             local data_path "`data_root'/`panel_group_folder'"
 
             foreach fe_level of local fe_levels {
-                if !inlist(`fe_level', 1, 2, 3) {
-                    di as error "fe_level must be one of: 1, 2, 3"
+                if !inlist(`fe_level', 1, 2) {
+                    di as error "fe_level must be one of: 1, 2"
                     exit 198
                 }
 
@@ -142,6 +148,9 @@ foreach panel_level of local panel_levels {
                         foreach std of local standardize_types {
                             foreach event_type of local event_types {
                                 foreach req of local reqs {
+                                    foreach c_var of local control_for_other_events {
+                                        foreach control_kappa of local control_kappas {
+                                            foreach control_atc3 of local control_atc3s {
                                     
                                 * -------- determine quarter cohort list --------
                                 local cohort_list ""
@@ -237,8 +246,17 @@ foreach panel_level of local panel_levels {
                                     local control_variation_title "`control_variation'"
                                     local control_title "`control', `control_variation'"
                                 }
-
-                                local file_stub "`event_type'_`control_fname'_`std'"
+                                
+                                local control_var_tag ""
+                                if "`c_var'" != "none" {
+                                    local control_var_tag "_cv_`c_var'"
+                                }
+                                local kappa_tag ""
+                                if "`control_kappa'" != "none" {
+                                    local kappa_tag "_kappa_`control_kappa'"
+                                }
+                                local atc3_tag "_atc3_`control_atc3'"
+                                local file_stub "`event_type'_`control_fname'_`std'`control_var_tag'`kappa_tag'`atc3_tag'"
 
                                 cap mkdir "`fe_log_root'/`panel_group_folder'/`event'/req`req'"
                                 cap mkdir "`fe_tex_root'/`panel_group_folder'/`event'/req`req'"
@@ -265,6 +283,9 @@ foreach panel_level of local panel_levels {
                                     str15 event_type ///
                                     str20 target ///
                                     str20 model ///
+                                    str15 control_var ///
+                                    str15 control_kappa ///
+                                    str15 control_atc3 ///
                                     double beta0 beta0_se beta0_p ///
                                     double beta1 beta1_se beta1_p ///
                                     double te_share te_share_se te_share_p ///
@@ -327,6 +348,17 @@ foreach panel_level of local panel_levels {
                                     }
 
                                     use `master', clear
+
+                                    preserve
+                                    import delimited "`project_path'/data/kappa/ssr_kappa_firm_level_v4.csv", clear
+                                    rename firm boardname
+                                    keep year quarter boardname kappa_norm_mean kappa_mean
+                                    isid year quarter boardname
+                                    tempfile kappa_controls
+                                    save `kappa_controls', replace
+                                    restore
+
+                                    merge m:1 year quarter boardname using `kappa_controls', keep(master match) nogen
 
                                     if "`outlier_treatment'" == "trim" {
                                         bysort boardname product data_cohort: egen group_max_raw = max(`target')
@@ -453,19 +485,96 @@ foreach panel_level of local panel_levels {
                                     replace atc3_sharing_het = 0 if treat == 0
                                     
                                     egen cohort_q_time_fe = group(data_cohort q_time)
-                                    cap egen atc3_q_time_fe = group(atc3 q_time)
+                                    cap egen atc3_id = group(atc3)
+
+                                    local cv_list ""
+                                    if "`c_var'" == "pulse" | "`c_var'" == "history" {
+                                        if "`event'" == "to_B_not_in_A" {
+                                            if inlist("`req'", "0", "1", "2") {
+                                                local cv_list "event_still_`c_var' event_dissolution_`c_var'"
+                                            }
+                                        }
+                                        else if "`event'" == "to_B_still_in_A" {
+                                            if inlist("`req'", "0", "1") {
+                                                local cv_list "event_not_`c_var' event_dissolution_`c_var'"
+                                            }
+                                            else if "`req'" == "2" {
+                                                local cv_list "event_not_`c_var'"
+                                            }
+                                        }
+                                        else if "`event'" == "interlock_dissolution" {
+                                            if inlist("`req'", "0", "1") {
+                                                local cv_list "event_not_`c_var' event_still_`c_var'"
+                                            }
+                                            else if "`req'" == "2" {
+                                                local cv_list "event_not_`c_var'"
+                                            }
+                                        }
+                                    }
+                                    
+                                    local final_cv_list ""
+                                    foreach cv of local cv_list {
+                                        cap confirm variable `cv'
+                                        if _rc {
+                                            di as error "Missing other-event control variable: `cv'"
+                                            exit 111
+                                        }
+                                        quietly summarize `cv', meanonly
+                                        if r(max) > 0 {
+                                            local final_cv_list "`final_cv_list' `cv'"
+                                        }
+                                    }
 
                                     * FE level 1 uses stack-unit and common calendar-quarter FE.
                                     * FE level 2 replaces common time FE with cohort-by-quarter FE, allowing each stacked cohort to have its own aggregate path.
-                                    local fe_spec "id q_time"
+                                    local fe_spec "id q_time `final_cv_list'"
                                     if `fe_level' == 2 {
-                                        local fe_spec "id cohort_q_time_fe"
-                                    }
-                                    else if `fe_level' == 3 {
-                                        local fe_spec "id atc3_q_time_fe"
+                                        local fe_spec "id cohort_q_time_fe `final_cv_list'"
                                     }
 
-                                    reghdfe `target' did did_g, absorb(`fe_spec')
+                                    local kappa_control_var ""
+                                    if "`control_kappa'" == "kappa_asy" {
+                                        local kappa_control_var "kappa_mean"
+                                    }
+                                    else if "`control_kappa'" == "kappa_norm" {
+                                        local kappa_control_var "kappa_norm_mean"
+                                    }
+                                    else if "`control_kappa'" != "none" {
+                                        di as error "control_kappa must be one of: none, kappa_asy, kappa_norm"
+                                        exit 198
+                                    }
+
+                                    if !inlist("`control_atc3'", "none", "separate", "interaction") {
+                                        di as error "control_atc3 must be one of: none, separate, interaction"
+                                        exit 198
+                                    }
+
+                                    local reghdfe_controls ""
+                                    local did_controls ""
+                                    if "`kappa_control_var'" != "" {
+                                        local reghdfe_controls "c.`kappa_control_var'"
+                                        local did_controls "controls(`kappa_control_var')"
+                                    }
+
+                                    if "`control_atc3'" == "separate" {
+                                        local fe_spec "`fe_spec' atc3_id"
+                                    }
+                                    else if "`control_atc3'" == "interaction" {
+                                        if "`control_kappa'" == "none" {
+                                            di as error "control_atc3=interaction requires control_kappa != none"
+                                            exit 198
+                                        }
+                                        local reghdfe_controls "i.atc3_id#c.`kappa_control_var'"
+                                        local atc3_kappa_controls ""
+                                        levelsof atc3_id if !missing(atc3_id), local(atc3_levels)
+                                        foreach atc3_level of local atc3_levels {
+                                            gen atc3_`atc3_level'_`kappa_control_var' = (atc3_id == `atc3_level') * `kappa_control_var'
+                                            local atc3_kappa_controls "`atc3_kappa_controls' atc3_`atc3_level'_`kappa_control_var'"
+                                        }
+                                        local did_controls "controls(`atc3_kappa_controls')"
+                                    }
+
+                                    reghdfe `target' did did_g `reghdfe_controls', absorb(`fe_spec')
                                     local N_obs_reghdfe = e(N)
 
                                     lincom did
@@ -510,7 +619,7 @@ foreach panel_level of local panel_levels {
                                     did_imputation `target' id q_time event_cohort_did_imputation, ///
                                         fe(`fe_spec') ///
                                         hetby(atc3_sharing_het) ///
-                                        autosample tol(0.1)
+                                        autosample tol(0.1) `did_controls'
 
                                     local N_obs_didimp = e(N)
 
@@ -528,6 +637,9 @@ foreach panel_level of local panel_levels {
                                         ("`event_type'") ///
                                         ("`target'") ///
                                         ("reghdfe") ///
+                                        ("`c_var'") ///
+                                        ("`control_kappa'") ///
+                                        ("`control_atc3'") ///
                                         (`beta0') (`beta0_se') (`beta0_p') ///
                                         (`beta1') (`beta1_se') (`beta1_p') ///
                                         (`te_share') (`te_share_se') (`te_share_p') ///
@@ -547,6 +659,9 @@ foreach panel_level of local panel_levels {
                                         ("`event_type'") ///
                                         ("`target'") ///
                                         ("did_imputation") ///
+                                        ("`c_var'") ///
+                                        ("`control_kappa'") ///
+                                        ("`control_atc3'") ///
                                         (.) (.) (.) ///
                                         (.) (.) (.) ///
                                         (.) (.) (.) ///
@@ -649,7 +764,7 @@ foreach panel_level of local panel_levels {
                                             "did-imputation p-value" ///
                                         ) ///
                                     ) ///
-                                    title("DDD: `event', `event_type', `control_title', `std' | `group_label' | FE `fe_level'")
+                                    title("DDD: `event', `event_type', `control_title', `std' | `group_label' | FE `fe_level' | kappa=`control_kappa' | atc3=`control_atc3'")
 
                                 tempname fhin fhout
                                 file open `fhin' using "`tex_fragment'", read text
@@ -669,6 +784,9 @@ foreach panel_level of local panel_levels {
                                 file close `fhout'
 
                                 log close
+                                }
+                                }
+                                }
                                 }
                             }
                         }

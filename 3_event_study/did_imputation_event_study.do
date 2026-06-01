@@ -51,7 +51,7 @@ cap mkdir "`project_path'/figures"
 cap mkdir "`project_path'/csv"
 cap mkdir "`project_path'/logs"
 
-local events interlock_dissolution
+local events interlock_dissolution to_B_still_in_A to_B_not_in_A
 *direct_interlock indirect_interlock to_B_still_in_A to_B_not_in_A
 local controls not 
 * notyet purecontrol not
@@ -63,12 +63,18 @@ local event_types event
 * first_event
 local reqs 1 2
 * 0 1 2
+local control_for_other_events none
+* none pulse history
+local control_kappas kappa_asy kappa_norm
+* none kappa_asy kappa_norm
+local control_atc3s separate interaction
+* none separate interaction
 local treatment_groups A B
 * B
 local include_eventpair_values 0
 * 1 0
-local fe_levels 1 2
-* 1 2 3
+local fe_levels 1
+* 1 2
 
 local coef_names pre_3 pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
 local n_total 11
@@ -143,6 +149,9 @@ foreach treatment_group of local treatment_groups {
                             foreach std of local standardize_types {
                                 foreach event_type of local event_types {
                                     foreach req of local reqs {
+                                        foreach c_var of local control_for_other_events {
+                                            foreach control_kappa of local control_kappas {
+                                                foreach control_atc3 of local control_atc3s {
 
                                 * -------- determine quarter cohort list --------
                                 local cohort_list ""
@@ -248,7 +257,16 @@ foreach treatment_group of local treatment_groups {
                                 cap mkdir "`event_csv_path'"
                                 cap mkdir "`event_log_path'"
 
-                                local file_stub "`event_type'_`control_fname'_`std'_`mode_tag'"
+                                local control_var_tag ""
+                                if "`c_var'" != "none" {
+                                    local control_var_tag "_cv_`c_var'"
+                                }
+                                local kappa_tag ""
+                                if "`control_kappa'" != "none" {
+                                    local kappa_tag "_kappa_`control_kappa'"
+                                }
+                                local atc3_tag "_atc3_`control_atc3'"
+                                local file_stub "`event_type'_`control_fname'_`std'_`mode_tag'`control_var_tag'`kappa_tag'`atc3_tag'"
 
                                 cap log close
                                 log using "`event_log_path'/`file_stub'.log", text replace
@@ -302,6 +320,17 @@ foreach treatment_group of local treatment_groups {
                                 }
 
                                 use `master', clear
+
+                                preserve
+                                import delimited "`project_path'/data/kappa/ssr_kappa_firm_level_v4.csv", clear
+                                rename firm boardname
+                                keep year quarter boardname kappa_norm_mean kappa_mean
+                                isid year quarter boardname
+                                tempfile kappa_controls
+                                save `kappa_controls', replace
+                                restore
+
+                                merge m:1 year quarter boardname using `kappa_controls', keep(master match) nogen
                                 
                                 if "`outlier_treatment'" == "trim" {
                                     bysort boardname product data_cohort: egen group_max_norm = max(`target')
@@ -339,6 +368,47 @@ foreach treatment_group of local treatment_groups {
                                 else if "`std'" == "log_transform" {
                                     replace `target' = log(`target')
                                 }
+                                
+                                * -------- determine control variables based on current event, req, and c_var --------
+                                local cv_list ""
+                                if "`c_var'" == "pulse" | "`c_var'" == "history" {
+                                    if "`event'" == "to_B_not_in_A" {
+                                        if inlist("`req'", "0", "1", "2") {
+                                            local cv_list "event_still_`c_var' event_dissolution_`c_var'"
+                                        }
+                                    }
+                                    else if "`event'" == "to_B_still_in_A" {
+                                        if inlist("`req'", "0", "1") {
+                                            local cv_list "event_not_`c_var' event_dissolution_`c_var'"
+                                        }
+                                        else if "`req'" == "2" {
+                                            local cv_list "event_not_`c_var'"
+                                        }
+                                    }
+                                    else if "`event'" == "interlock_dissolution" {
+                                        if inlist("`req'", "0", "1") {
+                                            local cv_list "event_not_`c_var' event_still_`c_var'"
+                                        }
+                                        else if "`req'" == "2" {
+                                            local cv_list "event_not_`c_var'"
+                                        }
+                                    }
+                                }
+
+                                * Drop control variables that are all zeros and update cv_list accordingly
+                                local final_cv_list ""
+                                foreach cv of local cv_list {
+                                    cap confirm variable `cv'
+                                    if _rc {
+                                        di as error "Missing other-event control variable: `cv'"
+                                        exit 111
+                                    }
+                                    quietly summarize `cv', meanonly
+                                    if r(max) > 0 {
+                                        local final_cv_list "`final_cv_list' `cv'"
+                                    }
+                                }
+                                local cv_list "`final_cv_list'"
 
                                 egen id = group(boardname product data_cohort)
                                 gen q_time = yq(year, quarter)
@@ -346,14 +416,54 @@ foreach treatment_group of local treatment_groups {
                                 gen event_cohort_q = yq(event_cohort, 1) if !missing(event_cohort)
 
                                 egen cohort_q_time_fe = group(data_cohort q_time)
-                                cap egen atc3_q_time_fe = group(atc3 q_time)
+                                cap egen atc3_id = group(atc3)
 
                                 local fe_spec "id `timevar'"
                                 if `fe_level' == 2 {
                                     local fe_spec "id cohort_q_time_fe"
                                 }
-                                else if `fe_level' == 3 {
-                                    local fe_spec "id atc3_q_time_fe"
+
+                                if "`cv_list'" != "" {
+                                    local fe_spec "`fe_spec' `cv_list'"
+                                }
+
+                                local kappa_control_var ""
+                                if "`control_kappa'" == "kappa_asy" {
+                                    local kappa_control_var "kappa_mean"
+                                }
+                                else if "`control_kappa'" == "kappa_norm" {
+                                    local kappa_control_var "kappa_norm_mean"
+                                }
+                                else if "`control_kappa'" != "none" {
+                                    di as error "control_kappa must be one of: none, kappa_asy, kappa_norm"
+                                    exit 198
+                                }
+
+                                if !inlist("`control_atc3'", "none", "separate", "interaction") {
+                                    di as error "control_atc3 must be one of: none, separate, interaction"
+                                    exit 198
+                                }
+
+                                local did_controls ""
+                                if "`kappa_control_var'" != "" {
+                                    local did_controls "controls(`kappa_control_var')"
+                                }
+
+                                if "`control_atc3'" == "separate" {
+                                    local fe_spec "`fe_spec' atc3_id"
+                                }
+                                else if "`control_atc3'" == "interaction" {
+                                    if "`kappa_control_var'" == "" {
+                                        di as error "control_atc3=interaction requires control_kappa != none"
+                                        exit 198
+                                    }
+                                    local atc3_kappa_controls ""
+                                    levelsof atc3_id if !missing(atc3_id), local(atc3_levels)
+                                    foreach atc3_level of local atc3_levels {
+                                        gen atc3_`atc3_level'_`kappa_control_var' = (atc3_id == `atc3_level') * `kappa_control_var'
+                                        local atc3_kappa_controls "`atc3_kappa_controls' atc3_`atc3_level'_`kappa_control_var'"
+                                    }
+                                    local did_controls "controls(`atc3_kappa_controls')"
                                 }
 
                                 gen treated = !missing(event_cohort) & event_cohort != 0
@@ -408,9 +518,8 @@ foreach treatment_group of local treatment_groups {
                                 if `separate' == 0 {
                                     gen atc3_sharing_het = atc3_sharing if treated == 1
                                     replace atc3_sharing_het = 0 if treated == 0
-									
 
-                                    did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') hetby(atc3_sharing_het) autosample tol(0.1) minn(0)
+                                    did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') hetby(atc3_sharing_het) autosample tol(0.1) minn(0) `did_controls'
 
                                     matrix did2_b_full = e(b)
                                     matrix did2_V_full = e(V)
@@ -491,7 +600,7 @@ foreach treatment_group of local treatment_groups {
                                         preserve
                                         drop if treated == 1 & atc3_sharing != `sval'
 
-                                        did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') autosample tol(0.1) minn(0)
+                                        did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') autosample tol(0.1) minn(0) `did_controls'
 
 										matrix did2_b_full = e(b)
                                         matrix did2_V_full = e(V)
@@ -580,6 +689,9 @@ foreach treatment_group of local treatment_groups {
                                 gen prd_control = .
                                 gen prd_treated0 = .
                                 gen prd_treated1 = .
+                                gen str16 control_var = "`c_var'"
+                                gen str16 control_kappa = "`control_kappa'"
+                                gen str16 control_atc3 = "`control_atc3'"
                                 foreach cov_name of local coef_names {
                                     gen cov_`cov_name' = .
                                 }
@@ -617,6 +729,9 @@ foreach treatment_group of local treatment_groups {
                                         replace standardize = "`std'" in `row'
                                         replace event_type = "`event_type'" in `row'
                                         replace mode = "`mode_tag'" in `row'
+                                        replace control_var = "`c_var'" in `row'
+                                        replace control_kappa = "`control_kappa'" in `row'
+                                        replace control_atc3 = "`control_atc3'" in `row'
                                         replace sharingatc3 = `sval' in `row'
                                         replace coef_name = "`this_coef'" in `row'
                                         replace rel_quarter = `rel_q' in `row'
@@ -648,6 +763,12 @@ foreach treatment_group of local treatment_groups {
 
                                 * -------- plot two sharing groups together --------
                                 local graph_title_size small
+                                
+                                local cv_title ""
+                                if "`c_var'" != "0" {
+                                    local cv_title " | cv=`c_var'"
+                                }
+                                local kappa_title " | kappa=`control_kappa' | atc3=`control_atc3'"
 
                                 event_plot did2_b_s0#did2_V_s0 did2_b_s1#did2_V_s1, ///
                                     stub_lag(post_# post_#) ///
@@ -656,7 +777,7 @@ foreach treatment_group of local treatment_groups {
                                     plottype(scatter) ciplottype(rcap) ///
                                     together perturb(-`perturb_step'(`perturb_span')`perturb_step') noautolegend ///
                                     graph_opt( ///
-                                        title("did_imputation (`mode_title'): `event_name' `event_type' `control_title' `std' | `group_label'", size(`graph_title_size')) ///
+                                        title("`mode_title': `event_name' `event_type' `control_title' `std' | `group_label'`cv_title'`kappa_title'", size(`graph_title_size')) ///
                                         xtitle("Periods since the event", size(small)) ///
                                         ytitle("`target'", size(`graph_title_size')) ///
                                         xlabel(`xlabel_spec', nogrid) ///
@@ -673,6 +794,11 @@ foreach treatment_group of local treatment_groups {
                                 graph export "`event_fig_path'/`file_stub'.png", replace width(`graph_width')
 
                                 log close
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -680,7 +806,5 @@ foreach treatment_group of local treatment_groups {
             }
         }
     }
-}
-}
 }
 clear all

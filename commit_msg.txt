@@ -1,0 +1,9 @@
+﻿Add kappa controls and other-event controls to ATC-sharing analyses
+
+1_data_prep/KappaFirmLevelMaker.py: Add a preprocessing script that builds data/kappa/ssr_kappa_firm_level_v4.csv by merging normalized firm-level kappa measures with raw pairwise kappa moments. The script enforces 1:1 rdate-firm matches, validates cusip and pair-count consistency, adds year/quarter merge keys, and exports kappa_mean, kappa_median, and kappa_std alongside the normalized measures.
+
+1_data_prep/CohortPanelMaker.py: Add other-event pulse and history columns to cohort files. For each focal event and requirement, the script identifies only the relevant alternative events, restricts their timing to the cohort window, and writes event_not_*, event_still_*, or event_dissolution_* controls into the saved cohort panels.
+
+3_event_study/ddd_atc3sharing.do: Extend stacked DDD regressions to merge firm-quarter kappa controls, optionally absorb other-event pulse/history controls, and compare ATC3 control specifications using separate ATC3 fixed effects or ATC3-by-kappa interactions. Output filenames and CSV rows now record the other-event, kappa, and ATC3-control specification used in each run.
+
+3_event_study/did_imputation_event_study.do: Extend did-imputation event-study runs to the same kappa and ATC3-control specifications, merge firm-quarter kappa controls before estimation, pass kappa or ATC3-by-kappa controls into did_imputation, and record the control specification in output CSVs and graph titles.
