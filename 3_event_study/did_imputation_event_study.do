@@ -24,13 +24,13 @@ set trace off
 // ================================================================
 
 * ================= user config =================
-local shortened_atc3 1
-* 1 0
+local atc_level 3
+* 1 2 3
 local separate_modes 0
 * 1
 local outlier_treatment "winsorize"
 * trim winsorize none
-local outlier_treatment_percentile "p90"
+local outlier_treatment_percentile "p95"
 *p90 p95 p99
 
 * ================= path =================
@@ -39,14 +39,19 @@ local parent_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
 local project_path = regexr("`parent_path'", "[/\\][^/\\]+$", "")
 local project_path = subinstr("`project_path'", "\", "/", .)
 
-local data_root "`project_path'/data/cohort_data_with_atc3sharing"
-local output_tag_base "did_imputation_event_study_sharingatc3"
+local level_suffix ""
+if `atc_level' != 1 {
+    local level_suffix "_level`atc_level'"
+}
+
+local data_root "`project_path'/data/cohort_data_with_atc3sharing`level_suffix'"
+local output_tag_base "did_imputation_event_study_sharingatc3`level_suffix'"
 
 cap mkdir "`project_path'/figures"
 cap mkdir "`project_path'/csv"
 cap mkdir "`project_path'/logs"
 
-local events interlock_dissolution to_B_still_in_A to_B_not_in_A
+local events interlock_dissolution
 *direct_interlock indirect_interlock to_B_still_in_A to_B_not_in_A
 local controls not 
 * notyet purecontrol not
@@ -56,26 +61,25 @@ local standardize_types log_transform
 * log_transform standardize normalize
 local event_types event
 * first_event
-local reqs 0
+local reqs 1 2
 * 0 1 2
 local treatment_groups A B
+* B
 local include_eventpair_values 0
 * 1 0
-local fe_levels 1
+local fe_levels 1 2
 * 1 2 3
 
-local coef_names pre_4 pre_3 pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
-local n_pre_nonref 4
-local n_post 8
-local n_total 12
-local trimlead 4
+local coef_names pre_3 pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
+local n_total 11
+local trimlead 3
 local trimlag 7
-local xlabel_spec -4(1)7
+local xlabel_spec -3(1)7
 local graph_width 3000
 local perturb_step 0.15
 local perturb_span 0.30
 local did_horizons 0/7
-local did_pretrend 4
+local did_pretrend 3
 local timevar q_time
 local gvar event_cohort_q
 
@@ -143,105 +147,55 @@ foreach treatment_group of local treatment_groups {
                                 * -------- determine quarter cohort list --------
                                 local cohort_list ""
 
-                                if "`req'" == "0" & "`event_type'" == "event" {
-                                    if "`treatment_group'" == "A" {
-                                        if inlist("`event'", "interlock_dissolution", "to_B_not_in_A", "to_B_still_in_A") {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                        }
-                                        else {
-                                            di as error "Unsupported event: `event'"
-                                            exit 198
-                                        }
-                                    }
-                                    else if "`treatment_group'" == "B" {
-                                        if "`event'" == "interlock_dissolution" {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017
-                                        }
-                                        else if "`event'" == "to_B_not_in_A" {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                        }
-                                        else if "`event'" == "to_B_still_in_A" {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2017 2018
-                                        }
-                                        else {
-                                            di as error "Unsupported event: `event'"
-                                            exit 198
-                                        }
-                                    }
-                                    else {
-                                        di as error "Unsupported treatment_group: `treatment_group'"
-                                        exit 198
-                                    }
+                                if "`event_type'" != "event" | !inlist("`req'", "0", "1", "2") {
+                                    di as error "Unsupported req or event_type: req=`req', event_type=`event_type'"
+                                    exit 198
                                 }
-                                else if "`req'" == "1" & "`event_type'" == "event" {
-                                    if "`treatment_group'" == "A" {
-                                        if inlist("`event'", "interlock_dissolution", "to_B_not_in_A", "to_B_still_in_A") {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                        }
-                                        else {
-                                            di as error "Unsupported event: `event'"
-                                            exit 198
-                                        }
+
+                                if !inlist("`treatment_group'", "A", "B") {
+                                    di as error "Unsupported treatment_group: `treatment_group'"
+                                    exit 198
+                                }
+
+                                if !inlist("`event'", "interlock_dissolution", "to_B_not_in_A", "to_B_still_in_A") {
+                                    di as error "Unsupported event: `event'"
+                                    exit 198
+                                }
+
+                                if !inlist(`atc_level', 2, 3) {
+                                    di as error "Unsupported atc_level for this cohort logic: atc_level=`atc_level'"
+                                    exit 198
+                                }
+
+                                if inlist("`req'", "0", "1") {
+                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                }
+                                else if "`req'" == "2" {
+                                    if `atc_level' == 2 & "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
+                                        local cohort_list ""
                                     }
-                                    else if "`treatment_group'" == "B" {
+                                    else if "`treatment_group'" == "A" {
                                         if "`event'" == "interlock_dissolution" {
                                             local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
                                         }
                                         else if "`event'" == "to_B_not_in_A" {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                            local cohort_list 2009 2010 2012 2014 2015 2016 2017 2018
                                         }
                                         else if "`event'" == "to_B_still_in_A" {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2017 2018
-                                        }
-                                        else {
-                                            di as error "Unsupported event: `event'"
-                                            exit 198
-                                        }
-                                    }
-                                    else {
-                                        di as error "Unsupported treatment_group: `treatment_group'"
-                                        exit 198
-                                    }
-                                }
-                                else if "`req'" == "2" & "`event_type'" == "event" {
-                                    if "`treatment_group'" == "A" {
-                                        if "`event'" == "interlock_dissolution" {
-                                            local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017
-                                        }
-                                        else if "`event'" == "to_B_not_in_A" {
-                                            local cohort_list 2010 2012 2014 2016 2017
-                                        }
-                                        else if "`event'" == "to_B_still_in_A" {
-                                            local cohort_list ""
-                                        }
-                                        else {
-                                            di as error "Unsupported event: `event'"
-                                            exit 198
+                                            local cohort_list 2009 2010 2011 2012 2013 2015 2017
                                         }
                                     }
                                     else if "`treatment_group'" == "B" {
                                         if "`event'" == "interlock_dissolution" {
-                                            local cohort_list ""
+                                            local cohort_list 2010 2011 2012 2014 2015 2016 2017 2018
                                         }
                                         else if "`event'" == "to_B_not_in_A" {
                                             local cohort_list 2012 2015 2017 2018
                                         }
                                         else if "`event'" == "to_B_still_in_A" {
-                                            local cohort_list 2010 2012 2013 2015 2017 2018
-                                        }
-                                        else {
-                                            di as error "Unsupported event: `event'"
-                                            exit 198
+                                            local cohort_list 2009 2010 2012 2013 2015 2016 2017 2018
                                         }
                                     }
-                                    else {
-                                        di as error "Unsupported treatment_group: `treatment_group'"
-                                        exit 198
-                                    }
-                                }
-                                else {
-                                    di as error "Unsupported req or event_type: req=`req', event_type=`event_type'"
-                                    exit 198
                                 }
 
                                 if "`cohort_list'" == "" {
@@ -308,7 +262,7 @@ foreach treatment_group of local treatment_groups {
                                     
                                     local event_anchor_q = yq(`cohort', 1)
                                     gen rel_quarter_all = yq(year, quarter) - `event_anchor_q'
-                                    keep if rel_quarter_all >= -6 & rel_quarter_all <= 7
+                                    keep if rel_quarter_all >= -4 & rel_quarter_all <= 7
                                     drop rel_quarter_all
 
                                     gen event_cohort = .
@@ -326,7 +280,7 @@ foreach treatment_group of local treatment_groups {
 
                                     gen rel_quarter = yq(year, quarter) - `event_anchor_q' if treated_in_stack == 1
 
-                                    forvalues i = 1/6 {
+                                    forvalues i = 1/4 {
                                         gen pre_`i' = treated_in_stack == 1 & rel_quarter == -`i'
                                     }
                                     forvalues i = 0/7 {
@@ -349,20 +303,6 @@ foreach treatment_group of local treatment_groups {
 
                                 use `master', clear
                                 
-                                if `shortened_atc3' == 1 {
-                                    capture confirm string variable atc3
-                                    if !_rc {
-                                        replace atc3 = substr(atc3, 1, length(atc3) - 3)
-                                    }
-                                    else {
-                                        tostring atc3, replace
-                                        replace atc3 = substr(atc3, 1, length(atc3) - 3)
-                                    }
-                                }
-                                if `shortened_atc3' == 1 {
-                                    drop if atc3 == "Devi"
-                                }
-
                                 if "`outlier_treatment'" == "trim" {
                                     bysort boardname product data_cohort: egen group_max_norm = max(`target')
                                     bysort boardname product data_cohort: egen group_min_norm = min(`target')
@@ -470,9 +410,7 @@ foreach treatment_group of local treatment_groups {
                                     replace atc3_sharing_het = 0 if treated == 0
 									
 
-                                    did_imputation `target' id `timevar' event_cohort_did_imputation, ///
-                                        fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') ///
-                                        hetby(atc3_sharing_het) autosample tol(0.1) minn(0)
+                                    did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') hetby(atc3_sharing_het) autosample tol(0.1) minn(0)
 
                                     matrix did2_b_full = e(b)
                                     matrix did2_V_full = e(V)
@@ -553,11 +491,9 @@ foreach treatment_group of local treatment_groups {
                                         preserve
                                         drop if treated == 1 & atc3_sharing != `sval'
 
-                                        did_imputation `target' id `timevar' event_cohort_did_imputation, ///
-                                            fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') ///
-                                            autosample tol(0.1) minn(0)
+                                        did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') autosample tol(0.1) minn(0)
 
-                                        matrix did2_b_full = e(b)
+										matrix did2_b_full = e(b)
                                         matrix did2_V_full = e(V)
                                         local did2_ncol = colsof(did2_b_full)
                                         local did2_names : colnames did2_b_full
@@ -571,7 +507,7 @@ foreach treatment_group of local treatment_groups {
 
                                             local candidate_list ""
 
-                                            if substr("`coef_name'", 1, 4) == "pre_" {
+                                            if substr("`coef_name'", 1, 3) == "pre_" {
                                                 local k = substr("`coef_name'", 5, .)
                                                 local candidate_list pre`k'
                                             }

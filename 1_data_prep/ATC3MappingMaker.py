@@ -33,10 +33,11 @@ from pathlib import Path
 # atc_levels:
 # - 1 keeps original ATC3.
 # - 2 truncates the last character and coarsens therapeutic categories.
-# - Moving from 1 to 2 usually increases peer matches and mapping row counts.
+# - 3 keeps "Device" if it starts with "Device", otherwise keeps only the first character.
+
 RUN_CONFIG = {
     "levels": ["year"],
-    "atc_levels": [2],
+    "atc_levels": [3],
 }
 # ===============================================================
 
@@ -52,8 +53,10 @@ def process_data(level='year', atc_level=1):
     # atc_level controls therapeutic aggregation before matching.
     if atc_level == 2:
         df['atc3'] = df['atc3'].astype(str).str[:-1]
+    elif atc_level == 3:
+        df['atc3'] = df['atc3'].astype(str).apply(lambda x: 'Device' if x.startswith('Device') else x[0])
     elif atc_level != 1:
-        raise ValueError("atc_level must be 1 or 2")
+        raise ValueError("atc_level must be 1, 2, or 3")
     
     # level defines time cell used for matching and uniqueness checks.
     if level == 'year':
@@ -73,7 +76,7 @@ def process_data(level='year', atc_level=1):
     if level == 'year':
         df_level = df_level.drop_duplicates().reset_index(drop=True)
     
-    # Enforce one row per unit-time-product key before matching.
+    # Enforce one product has only one atc3 before matching.
     duplicates = df_level[df_level.duplicated(subset=uniqueness_cols, keep=False)]
     if len(duplicates) > 0:
         print(f"\nERROR: {', '.join(uniqueness_cols)} are NOT unique!")
@@ -125,7 +128,7 @@ def main():
     print(f"\nOutput directory: {output_dir}")
     
     for atc_level in atc_levels:
-        level_suffix = "" if atc_level == 1 else "_level2"
+        level_suffix = "" if atc_level == 1 else f"_level{atc_level}"
 
         for level in levels:
             result_df = process_data(level=level, atc_level=atc_level)

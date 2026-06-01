@@ -166,7 +166,7 @@ RUN_CONFIG = {
     "treat_types": ["first_event", "event"],
     "control_types": ["pure_control", "not_yet", "not"],
     "control_variations": ["stable", "changing", "stable_interlock", "stable_no_interlock"],
-    "window_pre": 2,
+    "window_pre": 1,
     "window_post": 1,
     "balanced_states": [1],
     "treatment_groups": ["B", "A"],
@@ -866,9 +866,40 @@ def plot_treated_control_counts(
                 plt.savefig(out_path)
                 plt.close()
 
+                # Save CSV output
+                csv_dir = (
+                    PROJECT_ROOT
+                    / "csv"
+                    / config["figure_root"]
+                    / f"{panel_level}-level_{output_group_label}"
+                    / treat_type
+                    / get_requirement_folder(event_requirement)
+                    / folder_name
+                )
+                csv_dir.mkdir(parents=True, exist_ok=True)
+                
+                csv_filename = (
+                    f"{event_type}_{panel_level}-level_{output_group_label}_"
+                    f"{treat_type}_{control_type}_{balanced_label}.csv"
+                )
+                
+                if is_req2_movement:
+                    csv_data = {"Year": years, "Treated": treated_counts}
+                    for segment in plot_segments:
+                        csv_data[f"Control: {segment}"] = control_segment_counts[segment]
+                    pd.DataFrame(csv_data).to_csv(csv_dir / csv_filename, index=False)
+                else:
+                    pd.DataFrame({
+                        "Year": years, 
+                        "Treated": treated_counts, 
+                        "Control": control_counts
+                    }).to_csv(csv_dir / csv_filename, index=False)
+
+
     print(
-        "Figures generated and saved to: "
-        f"./figures/{config['figure_root']}/"
+        "Figures and CSV tables generated and saved to:\n"
+        f"  {PROJECT_ROOT}/figures/{config['figure_root']}/\n"
+        f"  {PROJECT_ROOT}/csv/{config['figure_root']}/"
     )
 
 

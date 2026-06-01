@@ -13,7 +13,7 @@ Process:
 - In quarter mode, event and stay flags are placed in Q1 of the event year.
 - Mark first-event and event-year indicators, then compute balance tags using
     balance_window = (start_offset, end_offset), i.e., t+start through t+end.
-- Export panel files to data/{panel_level}-level_{A|B}_{with|without}_{B|A}.
+- Export panel files to data/{panel_level}-level_{A|B}/ssr_firm_panel_*.csv.
 
 Input:
 - InterimData/boardex_ssr_price_sample.csv
@@ -34,8 +34,8 @@ Provenance of the `revenue` variable in boardex_ssr_price_sample.csv:
 So the `revenue` carried through every downstream panel here is SSR `avgnet`.
 
 Output:
-- data/year-level_{A|B}_{with|without}_{B|A}/ssr_firm_panel_*.csv
-- data/quarter-level_{A|B}_{with|without}_{B|A}/ssr_firm_panel_*.csv
+- data/year-level_{A|B}/ssr_firm_panel_*.csv
+- data/quarter-level_{A|B}/ssr_firm_panel_*.csv
 """
 
 import pathlib
@@ -103,7 +103,7 @@ RUN_CONFIG = {
     ],
     "panel_levels": ["quarter"],
     "stay_x_years": 2,
-    "balance_window": (-2, 1),
+    "balance_window": (-1, 1),
     "treatment_groups": ["B","A"],
 }
 #        "direct interlock",

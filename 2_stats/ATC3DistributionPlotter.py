@@ -29,14 +29,10 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ATC3_MAP_DIR = PROJECT_ROOT / "data" / "atc3mapping"
 COHORT_ROOT = PROJECT_ROOT / "data" / "cohort_data"
-COHORT_OUT_ROOT = PROJECT_ROOT / "data" / "cohort_data_with_atc3sharing"
 STAGGERED_ROOT = PROJECT_ROOT / "data" / "staggered_data"
-STAGGERED_OUT_ROOT = PROJECT_ROOT / "data" / "staggered_data_with_atc3sharing"
 EVENT_XLSX_B = PROJECT_ROOT / "data" / "event_B.xlsx"
 EVENT_XLSX_A = PROJECT_ROOT / "data" / "event_A.xlsx"
 MOVEMENT_CANDIDATES_PATH = PROJECT_ROOT / "data" / "movement_tables" / "movement_event_candidates.csv"
-FIG_ROOT = PROJECT_ROOT / "figures" / "cohort_sharing_atc3"
-STAGGERED_FIG_ROOT = PROJECT_ROOT / "figures" / "staggered_sharing_atc3"
 
 # ========================== USER CONFIG ==========================
 # EVENTS:
@@ -73,6 +69,7 @@ STAGGERED_FIG_ROOT = PROJECT_ROOT / "figures" / "staggered_sharing_atc3"
 # atc_level:
 # - 1 keeps original ATC3.
 # - 2 truncates the last character and coarsens categories.
+# - 3 keeps "Device" if it starts with "Device", otherwise keeps only the first character.
 # - Coarser ATC usually increases the chance of being tagged as sharing.
 #
 # treatment_groups / include_eventpair:
@@ -90,7 +87,7 @@ RUN_CONFIG = {
     "EVENT_REQUIREMENTS": [0, 1, 2],
     "ATC3_SHARING_PERIODS": [0],
     "PERIODS": [0],
-    "atc_level": 2,
+    "atc_level": 3,
     "COHORT_YEARS": list(range(2009, 2019)),
     "treatment_groups": ["B","A"],
     "include_eventpair": [0], # 1
@@ -111,6 +108,12 @@ COHORT_YEARS = RUN_CONFIG["COHORT_YEARS"]
 ATC_LEVEL = int(RUN_CONFIG["atc_level"])
 TREATMENT_GROUPS = [str(x).upper() for x in RUN_CONFIG.get("treatment_groups", ["B"])]
 INCLUDE_EVENTPAIR_VALUES = [int(x) for x in RUN_CONFIG.get("include_eventpair", [1])]
+
+LEVEL_SUFFIX = "" if ATC_LEVEL == 1 else f"_level{ATC_LEVEL}"
+COHORT_OUT_ROOT = PROJECT_ROOT / "data" / f"cohort_data_with_atc3sharing{LEVEL_SUFFIX}"
+STAGGERED_OUT_ROOT = PROJECT_ROOT / "data" / f"staggered_data_with_atc3sharing{LEVEL_SUFFIX}"
+FIG_ROOT = PROJECT_ROOT / "figures" / f"cohort_sharing_atc3{LEVEL_SUFFIX}"
+STAGGERED_FIG_ROOT = PROJECT_ROOT / "figures" / f"staggered_sharing_atc3{LEVEL_SUFFIX}"
 
 STAGGERED_CONTROL_FOLDER_MAP = {
     "not_yet": "Not Yet",
@@ -200,6 +203,8 @@ def apply_atc_level(df: pd.DataFrame, atc_level: int) -> pd.DataFrame:
     out = df.copy()
     if atc_level == 2:
         out["atc3"] = out["atc3"].astype(str).str[:-1]
+    elif atc_level == 3:
+        out["atc3"] = out["atc3"].astype(str).apply(lambda x: 'Device' if x.startswith('Device') else x[0])
     return out
 
 
@@ -298,9 +303,9 @@ def load_atc3_mapping(panel_level: str, atc_level: int = 1) -> pd.DataFrame:
     panel_level : str
         Kept for compatibility; mapping is always year-level.
     atc_level : int
-        1 for standard level, 2 for level2 version
+        1 for standard level, 2 for level2 version, 3 for level3 version
     """
-    level_suffix = "" if atc_level == 1 else "_level2"
+    level_suffix = "" if atc_level == 1 else f"_level{atc_level}"
     path = ATC3_MAP_DIR / f"atc3mapping_year_level{level_suffix}.csv"
     df = pd.read_csv(path)
     return df
@@ -490,6 +495,8 @@ def build_distribution_for_config(
         # Process atc3 based on atc_level
         if atc_level == 2:
             df['atc3'] = df['atc3'].astype(str).str[:-1]
+        elif atc_level == 3:
+            df['atc3'] = df['atc3'].astype(str).apply(lambda x: 'Device' if x.startswith('Device') else x[0])
         
         event_rows = filter_event_rows(df, event_type=event_type, cohort_year=cohort, panel_level=panel_level, period=period)
 
@@ -722,10 +729,6 @@ def generate_all_cohort_data_with_atc3sharing(
                             periods=periods,
                         )
 
-                        # If atc_level==2, restore original atc3 values for output
-                        if atc_level == 2:
-                            df_out["atc3"] = df["atc3"]
-
                         out_path = dst_dir / f.name
                         df_out.to_csv(out_path, index=False)
 
@@ -785,9 +788,6 @@ def generate_all_staggered_data_with_atc3sharing(
                 cohort_years=cohort_years,
                 periods=periods,
             )
-
-            if atc_level == 2:
-                df_out["atc3"] = df["atc3"]
 
             out_dir = STAGGERED_OUT_ROOT / panel_level / event_type / control_folder
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -893,7 +893,7 @@ def main() -> None:
         p_suffix = period_suffix(period)
 
         for atc_level in [ATC_LEVEL]:
-            level_suffix = "" if atc_level == 1 else "_level2"
+            level_suffix = "" if atc_level == 1 else f"_level{atc_level}"
             print(f"\n  ATC Level {atc_level}")
 
             for panel_level in PANEL_LEVELS:
@@ -945,7 +945,24 @@ def main() -> None:
                                             period=period,
                                         )
 
+                                        csv_dir = (
+                                            PROJECT_ROOT
+                                            / "csv"
+                                            / f"cohort_sharing_atc3{level_suffix}"
+                                            / f"{panel_level}-level_{label}"
+                                            / event_type
+                                            / requirement_folder(event_requirement)
+                                        )
+                                        csv_dir.mkdir(parents=True, exist_ok=True)
+                                        out_csv = csv_dir / f"{stem}.csv"
+                                        
+                                        # Only save relevant plotting columns to make it clean
+                                        csv_df = summary[["cohort", "sharing_atc3", "not_sharing_atc3", "total"]].copy()
+                                        csv_df.rename(columns={"cohort": "Year"}, inplace=True)
+                                        csv_df.to_csv(out_csv, index=False)
+
                                         print(f"Saved: {out_png}")
+                                        print(f"Saved CSV: {out_csv}")
                 """
                 # staggered_data is always first_event by construction
                 src_dir = STAGGERED_ROOT / staggered_level_folder(panel_level)
@@ -989,7 +1006,23 @@ def main() -> None:
                         period=period,
                     )
 
+                    csv_dir = (
+                        PROJECT_ROOT
+                        / "csv"
+                        / f"staggered_sharing_atc3{level_suffix}"
+                        / panel_level 
+                        / "first_event" 
+                        / control_folder
+                    )
+                    csv_dir.mkdir(parents=True, exist_ok=True)
+                    out_csv = csv_dir / f"{stem}.csv"
+                    
+                    csv_df = summary[["cohort", "sharing_atc3", "not_sharing_atc3", "total"]].copy()
+                    csv_df.rename(columns={"cohort": "Year"}, inplace=True)
+                    csv_df.to_csv(out_csv, index=False)
+
                     print(f"Saved: {out_png}")
+                    print(f"Saved CSV: {out_csv}")
                 """
 
 

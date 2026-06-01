@@ -35,7 +35,7 @@ FIRM_INTERLOCK_EDGES_PATH = OUTPUT_DIR / "firm_interlock_panel.csv"
 # ========================== USER CONFIG ==========================
 RUN_CONFIG = {
     "stay_x_years": 2,
-    "requirement2_window": (-2, 1),
+    "requirement2_window": (-1, 1),
 }
 # ===============================================================
 
@@ -313,10 +313,15 @@ def build_movement_candidates(
     complete_table: pd.DataFrame,
     pair_year_set: set[tuple[str, str, int]],
     stay_x_years: int,
+    requirement2_window: tuple[int, int],
 ) -> pd.DataFrame:
     """Build movement candidate rows and all requested flags."""
     stay_col = f"stay_{stay_x_years}_years"
     candidate_rows: list[dict[str, object]] = []
+
+    start_offset, end_offset = requirement2_window
+    forward_stay_years = min(stay_x_years, max(0, end_offset) + 1)
+    backward_stay_years = min(stay_x_years, max(0, -start_offset))
 
     # Traverse adjacent years within each director's completed yearly history.
     for director_id, director_panel in complete_table.groupby("DirectorID", sort=False):
@@ -358,7 +363,7 @@ def build_movement_candidates(
                             "event_year": curr_year,
                             "FirmA": firm_a,
                             "FirmB": firm_b,
-                            stay_col: _stay_forward(board_history, firm_b, curr_year, stay_x_years),
+                            stay_col: _stay_forward(board_history, firm_b, curr_year, forward_stay_years),
                             "requirement1": int(pair_tm1 == 0),
                             "pair_interlock_t-1": pair_tm1,
                             "pair_interlock_t": pair_t,
@@ -377,7 +382,7 @@ def build_movement_candidates(
                             "event_year": curr_year,
                             "FirmA": firm_a,
                             "FirmB": firm_b,
-                            stay_col: _stay_forward(board_history, firm_b, curr_year, stay_x_years),
+                            stay_col: _stay_forward(board_history, firm_b, curr_year, forward_stay_years),
                             "requirement1": int(pair_t == 0),
                             "pair_interlock_t-1": pair_tm1,
                             "pair_interlock_t": pair_t,
@@ -402,7 +407,7 @@ def build_movement_candidates(
                                 firm_a,
                                 firm_b,
                                 curr_year,
-                                stay_x_years,
+                                backward_stay_years,
                             ),
                             "requirement1": int(pair_t == 0),
                             "pair_interlock_t-1": pair_tm1,
@@ -476,6 +481,7 @@ def main() -> None:
         complete_table=complete_table,
         pair_year_set=pair_year_set,
         stay_x_years=stay_x_years,
+        requirement2_window=requirement2_window,
     )
 
     movement_candidates = add_requirement2_flags(
