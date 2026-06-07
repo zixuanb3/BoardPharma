@@ -73,18 +73,18 @@ local event_types event
 * first_event
 local reqs 1
 * 1 2
-local control_for_other_events none pulse history
+local control_for_other_events none
 * none pulse history
-local control_kappas none
+local control_kappas kappa_asy kappa_norm
 * none kappa_asy kappa_norm
-local control_atc3s separate
+local control_atc3s separate interaction
 * none separate interaction
 local req2_control_variations all
 * all stable changing stable_interlock stable_no_interlock
 local treatment_groups A B
 local include_eventpair_values 0
 * 1
-local fe_levels 1 2
+local fe_levels 1
 * 1 2
 
 foreach panel_level of local panel_levels {
@@ -350,7 +350,7 @@ foreach panel_level of local panel_levels {
                                     use `master', clear
 
                                     preserve
-                                    import delimited "`project_path'/data/kappa/ssr_kappa_firm_level_v4.csv", clear
+                                    import delimited "`project_path'/data/kappa/ssr_kappa_firm_level_v5.csv", clear
                                     rename firm boardname
                                     keep year quarter boardname kappa_norm_mean kappa_mean
                                     isid year quarter boardname

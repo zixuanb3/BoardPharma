@@ -33,6 +33,9 @@ STAGGERED_ROOT = PROJECT_ROOT / "data" / "staggered_data"
 EVENT_XLSX_B = PROJECT_ROOT / "data" / "event_B.xlsx"
 EVENT_XLSX_A = PROJECT_ROOT / "data" / "event_A.xlsx"
 MOVEMENT_CANDIDATES_PATH = PROJECT_ROOT / "data" / "movement_tables" / "movement_event_candidates.csv"
+INDIRECT_INTERLOCK_CANDIDATES_PATH = (
+    PROJECT_ROOT / "data" / "movement_tables" / "indirect_interlock_event_candidates.csv"
+)
 
 # ========================== USER CONFIG ==========================
 # EVENTS:
@@ -77,9 +80,7 @@ MOVEMENT_CANDIDATES_PATH = PROJECT_ROOT / "data" / "movement_tables" / "movement
 # - Staggered traversal remains unchanged.
 RUN_CONFIG = {
     "EVENTS": [
-        "to_B_not_in_A",
-        "to_B_still_in_A",
-        "interlock_dissolution",
+        "indirect_interlock"
     ],
     "EVENT_TYPES": ["event"], #"first_event"
     "PANEL_LEVELS": ["quarter"],
@@ -87,12 +88,15 @@ RUN_CONFIG = {
     "EVENT_REQUIREMENTS": [0, 1, 2],
     "ATC3_SHARING_PERIODS": [0],
     "PERIODS": [0],
-    "atc_level": 3,
+    "atc_level": 2,
     "COHORT_YEARS": list(range(2009, 2019)),
     "treatment_groups": ["B","A"],
     "include_eventpair": [0], # 1
 }
 """
+        "to_B_not_in_A",
+        "to_B_still_in_A",
+        "interlock_dissolution",
         "direct_interlock",
         "indirect_interlock",
 """
@@ -271,6 +275,42 @@ def filter_movement_pairs(event_requirement: int) -> pd.DataFrame:
     return movement
 
 
+@lru_cache(maxsize=1)
+def load_indirect_interlock_candidates() -> pd.DataFrame:
+    """Load indirect interlock candidates once and detect the unique stay column."""
+    indirect = pd.read_csv(INDIRECT_INTERLOCK_CANDIDATES_PATH)
+    stay_cols = [
+        column
+        for column in indirect.columns
+        if str(column).startswith("stay_") and str(column).endswith("_years")
+    ]
+    if len(stay_cols) != 1:
+        raise ValueError(
+            "Expected exactly one stay_{x}_years column in indirect interlock candidates, "
+            f"found: {stay_cols}"
+        )
+    stay_col = stay_cols[0]
+    indirect["event_year"] = pd.to_numeric(indirect["event_year"], errors="raise").astype(int)
+    indirect["requirement1"] = pd.to_numeric(indirect["requirement1"], errors="raise").astype(int)
+    indirect["requirement2"] = pd.to_numeric(indirect["requirement2"], errors="raise").astype(int)
+    indirect[stay_col] = pd.to_numeric(indirect[stay_col], errors="raise").astype(int)
+    indirect.attrs["stay_col"] = stay_col
+    return indirect
+
+
+def filter_indirect_interlock_pairs(event_requirement: int) -> pd.DataFrame:
+    """Return req-valid indirect interlock rows for ATC-sharing matching."""
+    base_indirect = load_indirect_interlock_candidates()
+    stay_col = base_indirect.attrs["stay_col"]
+    indirect = base_indirect.copy()
+    indirect = indirect.loc[indirect[stay_col].eq(1)].copy()
+    if int(event_requirement) in {1, 2}:
+        indirect = indirect.loc[indirect["requirement1"].eq(1)].copy()
+    if int(event_requirement) == 2:
+        indirect = indirect.loc[indirect["requirement2"].eq(1)].copy()
+    return indirect
+
+
 def cohort_file_path(
     panel_level: str,
     event_type: str,
@@ -284,7 +324,10 @@ def cohort_file_path(
     """Build cohort file path following CohortPanelMaker naming."""
     treat_suffix = "_first_event" if event_type == "first_event" else ""
     file_name = f"{event}_{panel_level}_cohort_{cohort_year}{treat_suffix}_balanced.csv"
-    level_folder = cohort_level_folder(panel_level, treatment_group, include_eventpair)
+    if event == "indirect_interlock":
+        level_folder = f"{panel_level}-level"
+    else:
+        level_folder = cohort_level_folder(panel_level, treatment_group, include_eventpair)
     return (
         COHORT_ROOT
         / level_folder
@@ -331,6 +374,24 @@ def load_movement_event_pairs(
                 "event_year": "year",
                 treated_col: "BoardName",
                 counterpart_col: "BoardNamePair",
+            }
+        )[["BoardName", "year", "event", "BoardNamePair"]]
+        .dropna(subset=["BoardName", "year", "event", "BoardNamePair"])
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    event_long["year"] = event_long["year"].astype(int)
+    return event_long
+
+
+def load_indirect_interlock_event_pairs(event_requirement: int = 0) -> pd.DataFrame:
+    """Build indirect interlock event-pair rows from req-valid directed candidates."""
+    indirect = filter_indirect_interlock_pairs(event_requirement=event_requirement)
+    event_long = (
+        indirect.rename(
+            columns={
+                "event_type": "event",
+                "event_year": "year",
             }
         )[["BoardName", "year", "event", "BoardNamePair"]]
         .dropna(subset=["BoardName", "year", "event", "BoardNamePair"])
@@ -672,37 +733,58 @@ def generate_all_cohort_data_with_atc3sharing(
     periods: list[int] | None = None,
 ) -> None:
     """Add atc3_sharing to all balanced cohort files and mirror folder structure."""
-    event_pairs_long = load_movement_event_pairs(
-        treatment_group=treatment_group,
-        event_requirement=event_requirement,
-    )
+    movement_event_pairs = None
+    if any(event != "indirect_interlock" for event in EVENTS):
+        movement_event_pairs = load_movement_event_pairs(
+            treatment_group=treatment_group,
+            event_requirement=event_requirement,
+        )
+    indirect_event_pairs = None
+    if "indirect_interlock" in EVENTS:
+        indirect_event_pairs = load_indirect_interlock_event_pairs(
+            event_requirement=event_requirement
+        )
 
     for panel_level in PANEL_LEVELS:
         atc3_mapping = load_atc3_mapping(panel_level, atc_level=atc_level)
 
         for event_type in EVENT_TYPES:
             for control_folder in CONTROL_FOLDERS:
-                level_folder = cohort_level_folder(panel_level, treatment_group, include_eventpair)
-                src_dir = (
-                    COHORT_ROOT
-                    / level_folder
-                    / event_type
-                    / requirement_folder(event_requirement)
-                    / control_folder
-                )
-                if not src_dir.exists():
-                    continue
-
-                dst_dir = (
-                    COHORT_OUT_ROOT
-                    / level_folder
-                    / event_type
-                    / requirement_folder(event_requirement)
-                    / control_folder
-                )
-                dst_dir.mkdir(parents=True, exist_ok=True)
-
                 for event in EVENTS:
+                    if event == "indirect_interlock":
+                        if (
+                            treatment_group != TREATMENT_GROUPS[0]
+                            or include_eventpair != INCLUDE_EVENTPAIR_VALUES[0]
+                        ):
+                            continue
+                        level_folder = f"{panel_level}-level"
+                        event_pairs_long = indirect_event_pairs
+                    else:
+                        level_folder = cohort_level_folder(
+                            panel_level,
+                            treatment_group,
+                            include_eventpair,
+                        )
+                        event_pairs_long = movement_event_pairs
+                    src_dir = (
+                        COHORT_ROOT
+                        / level_folder
+                        / event_type
+                        / requirement_folder(event_requirement)
+                        / control_folder
+                    )
+                    if not src_dir.exists():
+                        continue
+
+                    dst_dir = (
+                        COHORT_OUT_ROOT
+                        / level_folder
+                        / event_type
+                        / requirement_folder(event_requirement)
+                        / control_folder
+                    )
+                    dst_dir.mkdir(parents=True, exist_ok=True)
+
                     for f in sorted(src_dir.glob(f"{event}_{panel_level}_cohort_*_balanced.csv")):
                         # Extract cohort year from standard cohort filename patterns.
                         stem = f.stem
@@ -901,15 +983,39 @@ def main() -> None:
 
                 for treatment_group in TREATMENT_GROUPS:
                     for include_eventpair in INCLUDE_EVENTPAIR_VALUES:
-                        label = cohort_group_label(treatment_group, include_eventpair)
                         for event_requirement in EVENT_REQUIREMENTS:
-                            event_pairs_long = load_movement_event_pairs(
-                                treatment_group=treatment_group,
-                                event_requirement=event_requirement,
-                            )
+                            movement_event_pairs = None
+                            if any(event != "indirect_interlock" for event in EVENTS):
+                                movement_event_pairs = load_movement_event_pairs(
+                                    treatment_group=treatment_group,
+                                    event_requirement=event_requirement,
+                                )
+                            indirect_event_pairs = None
+                            if "indirect_interlock" in EVENTS:
+                                indirect_event_pairs = load_indirect_interlock_event_pairs(
+                                    event_requirement=event_requirement
+                                )
                             for event_type in EVENT_TYPES:
                                 for control_folder in ["Pure Control"]:
                                     for event in EVENTS:
+                                        if event == "indirect_interlock":
+                                            if (
+                                                treatment_group != TREATMENT_GROUPS[0]
+                                                or include_eventpair != INCLUDE_EVENTPAIR_VALUES[0]
+                                            ):
+                                                continue
+                                            level_folder = f"{panel_level}-level"
+                                            label_suffix = ""
+                                            event_pairs_long = indirect_event_pairs
+                                        else:
+                                            label = cohort_group_label(treatment_group, include_eventpair)
+                                            level_folder = cohort_level_folder(
+                                                panel_level,
+                                                treatment_group,
+                                                include_eventpair,
+                                            )
+                                            label_suffix = f"_{label}"
+                                            event_pairs_long = movement_event_pairs
                                         summary = build_distribution_for_config(
                                             panel_level=panel_level,
                                             event_type=event_type,
@@ -926,12 +1032,12 @@ def main() -> None:
 
                                         out_dir = (
                                             FIG_ROOT
-                                            / f"{panel_level}-level_{label}"
+                                            / level_folder
                                             / event_type
                                             / requirement_folder(event_requirement)
                                         )
                                         stem = (
-                                            f"sharing_atc3_{event}_{event_type}_{panel_level}-level_{label}"
+                                            f"sharing_atc3_{event}_{event_type}_{panel_level}-level{label_suffix}"
                                             f"{level_suffix}{p_suffix}"
                                         )
                                         out_png = out_dir / f"{stem}.png"
@@ -949,7 +1055,7 @@ def main() -> None:
                                             PROJECT_ROOT
                                             / "csv"
                                             / f"cohort_sharing_atc3{level_suffix}"
-                                            / f"{panel_level}-level_{label}"
+                                            / level_folder
                                             / event_type
                                             / requirement_folder(event_requirement)
                                         )

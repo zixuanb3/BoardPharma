@@ -24,7 +24,7 @@ set trace off
 // ================================================================
 
 * ================= user config =================
-local atc_level 3
+local atc_level 2
 * 1 2 3
 local separate_modes 0
 * 1
@@ -322,7 +322,7 @@ foreach treatment_group of local treatment_groups {
                                 use `master', clear
 
                                 preserve
-                                import delimited "`project_path'/data/kappa/ssr_kappa_firm_level_v4.csv", clear
+                                import delimited "`project_path'/data/kappa/ssr_kappa_firm_level_v5.csv", clear
                                 rename firm boardname
                                 keep year quarter boardname kappa_norm_mean kappa_mean
                                 isid year quarter boardname

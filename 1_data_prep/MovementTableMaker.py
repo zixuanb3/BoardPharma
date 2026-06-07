@@ -12,10 +12,12 @@ Process:
 
 Input:
 - InterimData/boardex_pharma.dta
+- InterimData/boardex_interlock_indirect_firmpair.dta
 
 Output:
 - data/movement_tables/movement_event_candidates.csv
 - data/movement_tables/firm_interlock_panel.csv
+- data/movement_tables/indirect_interlock_event_candidates.csv
 """
 
 from __future__ import annotations
@@ -27,9 +29,11 @@ import pandas as pd
 CURRENT_PATH = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_PATH.parent.parent
 INPUT_PATH = PROJECT_ROOT / "InterimData" / "boardex_pharma.dta"
+INDIRECT_INPUT_PATH = PROJECT_ROOT / "InterimData" / "boardex_interlock_indirect_firmpair.dta"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "movement_tables"
 MOVEMENT_CANDIDATES_PATH = OUTPUT_DIR / "movement_event_candidates.csv"
 FIRM_INTERLOCK_EDGES_PATH = OUTPUT_DIR / "firm_interlock_panel.csv"
+INDIRECT_INTERLOCK_CANDIDATES_PATH = OUTPUT_DIR / "indirect_interlock_event_candidates.csv"
 
 
 # ========================== USER CONFIG ==========================
@@ -240,6 +244,175 @@ def _requirement2_holds(
         return int(all(current_set == baseline_set for current_set in interlock_history[1:]))
 
     raise ValueError(f"Unsupported movement event type for requirement2: {event_type}")
+
+
+def load_indirect_interlock_pairs() -> pd.DataFrame:
+    """Load directed indirect interlock firm-pair-year rows."""
+    indirect_pairs = pd.read_stata(
+        INDIRECT_INPUT_PATH,
+        columns=["BoardName1", "BoardName2", "year"],
+    )
+    indirect_pairs = indirect_pairs.dropna(subset=["BoardName1", "BoardName2", "year"]).copy()
+    indirect_pairs["event_year"] = indirect_pairs["year"].astype(int)
+    indirect_pairs["BoardName"] = indirect_pairs["BoardName1"].astype(str)
+    indirect_pairs["BoardNamePair"] = indirect_pairs["BoardName2"].astype(str)
+    indirect_pairs["pair_min"] = indirect_pairs[["BoardName", "BoardNamePair"]].min(axis=1)
+    indirect_pairs["pair_max"] = indirect_pairs[["BoardName", "BoardNamePair"]].max(axis=1)
+    indirect_pairs = indirect_pairs.drop_duplicates(
+        subset=["BoardName", "BoardNamePair", "event_year"]
+    )
+    return indirect_pairs.reset_index(drop=True)
+
+
+def build_indirect_board_year_lookup(
+    indirect_pairs: pd.DataFrame,
+) -> dict[tuple[str, int], set[str]]:
+    """Map each directed BoardName-year to its indirect counterpart set."""
+    if indirect_pairs.empty:
+        return {}
+
+    grouped = (
+        indirect_pairs.groupby(["BoardName", "event_year"])["BoardNamePair"]
+        .agg(lambda values: set(values.tolist()))
+        .reset_index()
+    )
+    return {
+        (str(board_name), int(event_year)): set(counterparts)
+        for board_name, event_year, counterparts in grouped.itertuples(index=False, name=None)
+    }
+
+
+def build_indirect_pair_year_set(
+    indirect_pairs: pd.DataFrame,
+) -> set[tuple[str, str, int]]:
+    """Build unordered indirect pair-year lookup from directed rows."""
+    return {
+        (str(pair_min), str(pair_max), int(event_year))
+        for pair_min, pair_max, event_year in indirect_pairs[
+            ["pair_min", "pair_max", "event_year"]
+        ].itertuples(index=False, name=None)
+    }
+
+
+def _pair_indirect(
+    indirect_pair_year_set: set[tuple[str, str, int]],
+    pair_min: str,
+    pair_max: str,
+    year: int,
+) -> int:
+    """Look up whether an unordered indirect pair exists in a given year."""
+    return int((pair_min, pair_max, int(year)) in indirect_pair_year_set)
+
+
+def _indirect_stay_forward(
+    indirect_pair_year_set: set[tuple[str, str, int]],
+    pair_min: str,
+    pair_max: str,
+    event_year: int,
+    stay_x_years: int,
+) -> int:
+    """Check whether an unordered indirect pair persists from t through t+x-1."""
+    for year in range(event_year, event_year + stay_x_years):
+        if not _pair_indirect(indirect_pair_year_set, pair_min, pair_max, year):
+            return 0
+    return 1
+
+
+def _indirect_requirement2_holds(
+    board_name: str,
+    event_year: int,
+    indirect_board_year_lookup: dict[tuple[str, int], set[str]],
+    requirement2_window: tuple[int, int],
+) -> int:
+    """Check whether a firm's indirect counterpart set weakly expands over the window."""
+    window_years = _requirement2_window_years(event_year, requirement2_window)
+    indirect_history = [
+        indirect_board_year_lookup.get((board_name, year), set())
+        for year in window_years
+    ]
+    return int(
+        all(
+            current_set.issuperset(previous_set)
+            for previous_set, current_set in zip(indirect_history, indirect_history[1:])
+        )
+    )
+
+
+def build_indirect_interlock_candidates(
+    indirect_pairs: pd.DataFrame,
+    stay_x_years: int,
+    requirement2_window: tuple[int, int],
+) -> pd.DataFrame:
+    """Build directed indirect interlock event candidate rows."""
+    stay_col = f"stay_{stay_x_years}_years"
+    final_columns = [
+        "event_type",
+        "event_year",
+        "BoardName",
+        "BoardNamePair",
+        "pair_min",
+        "pair_max",
+        stay_col,
+        "requirement1",
+        "requirement2",
+        "pair_indirect_t-1",
+        "pair_indirect_t",
+    ]
+    if indirect_pairs.empty:
+        return pd.DataFrame(columns=final_columns)
+
+    candidates = indirect_pairs[
+        ["event_year", "BoardName", "BoardNamePair", "pair_min", "pair_max"]
+    ].copy()
+    indirect_pair_year_set = build_indirect_pair_year_set(indirect_pairs)
+    indirect_board_year_lookup = build_indirect_board_year_lookup(indirect_pairs)
+
+    candidates["event_type"] = "indirect_interlock"
+    candidates["pair_indirect_t-1"] = candidates.apply(
+        lambda row: _pair_indirect(
+            indirect_pair_year_set,
+            str(row["pair_min"]),
+            str(row["pair_max"]),
+            int(row["event_year"]) - 1,
+        ),
+        axis=1,
+    ).astype("int8")
+    candidates["pair_indirect_t"] = candidates.apply(
+        lambda row: _pair_indirect(
+            indirect_pair_year_set,
+            str(row["pair_min"]),
+            str(row["pair_max"]),
+            int(row["event_year"]),
+        ),
+        axis=1,
+    ).astype("int8")
+    candidates[stay_col] = candidates.apply(
+        lambda row: _indirect_stay_forward(
+            indirect_pair_year_set,
+            str(row["pair_min"]),
+            str(row["pair_max"]),
+            int(row["event_year"]),
+            stay_x_years,
+        ),
+        axis=1,
+    ).astype("int8")
+    candidates["requirement1"] = (
+        candidates["pair_indirect_t-1"].eq(0) & candidates["pair_indirect_t"].eq(1)
+    ).astype("int8")
+    candidates["requirement2"] = candidates.apply(
+        lambda row: _indirect_requirement2_holds(
+            board_name=str(row["BoardName"]),
+            event_year=int(row["event_year"]),
+            indirect_board_year_lookup=indirect_board_year_lookup,
+            requirement2_window=requirement2_window,
+        ),
+        axis=1,
+    ).astype("int8")
+
+    candidates = candidates[final_columns].sort_values(
+        ["event_year", "BoardName", "BoardNamePair"]
+    )
+    return candidates.reset_index(drop=True)
 
 
 def add_requirement2_flags(
@@ -492,8 +665,17 @@ def main() -> None:
     )
     movement_candidates.to_csv(MOVEMENT_CANDIDATES_PATH, index=False)
 
+    indirect_pairs = load_indirect_interlock_pairs()
+    indirect_candidates = build_indirect_interlock_candidates(
+        indirect_pairs=indirect_pairs,
+        stay_x_years=stay_x_years,
+        requirement2_window=requirement2_window,
+    )
+    indirect_candidates.to_csv(INDIRECT_INTERLOCK_CANDIDATES_PATH, index=False)
+
     print(f"Saved {len(firm_interlock_edges):,} rows to {FIRM_INTERLOCK_EDGES_PATH}")
     print(f"Saved {len(movement_candidates):,} rows to {MOVEMENT_CANDIDATES_PATH}")
+    print(f"Saved {len(indirect_candidates):,} rows to {INDIRECT_INTERLOCK_CANDIDATES_PATH}")
 
 
 if __name__ == "__main__":

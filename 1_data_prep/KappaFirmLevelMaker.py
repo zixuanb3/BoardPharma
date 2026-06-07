@@ -14,11 +14,11 @@ Process:
   kappa_median, and kappa_std.
 
 Input:
-- InterimData/ssr_kappa_pairwise_v4.csv
-- InterimData/ssr_kappa_firm_level_v4.csv
+- InterimData/ssr_kappa_pairwise_v5.csv
+- InterimData/ssr_kappa_firm_level_v5.csv
 
 Output:
-- data/kappa/ssr_kappa_firm_level_v4.csv
+- data/kappa/ssr_kappa_firm_level_v5.csv
 """
 
 from __future__ import annotations
@@ -33,9 +33,9 @@ PROJECT_ROOT = CURRENT_PATH.parent.parent
 INTERIM_DATA_PATH = PROJECT_ROOT / "InterimData"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "kappa"
 
-PAIRWISE_INPUT_PATH = INTERIM_DATA_PATH / "ssr_kappa_pairwise_v4.csv"
-FIRM_LEVEL_INPUT_PATH = INTERIM_DATA_PATH / "ssr_kappa_firm_level_v4.csv"
-OUTPUT_PATH = OUTPUT_DIR / "ssr_kappa_firm_level_v4.csv"
+PAIRWISE_INPUT_PATH = INTERIM_DATA_PATH / "ssr_kappa_pairwise_v5.csv"
+FIRM_LEVEL_INPUT_PATH = INTERIM_DATA_PATH / "ssr_kappa_firm_level_v5.csv"
+OUTPUT_PATH = OUTPUT_DIR / "ssr_kappa_firm_level_v5.csv"
 
 KEY_COLS = ["rdate", "firm"]
 FIRM_LEVEL_REQUIRED_COLS = [

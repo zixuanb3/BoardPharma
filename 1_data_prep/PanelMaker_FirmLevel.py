@@ -6,7 +6,8 @@ The script supports both year and quarter panels, and balanced-sample tagging vi
 Process:
 - Build SSR base panel at the selected panel_level (year or quarter).
 - Construct treatment events by event_type:
-    direct/indirect interlock use symmetric firm-pair links;
+    direct interlock uses symmetric firm-pair links;
+    indirect interlock reads prebuilt directed candidate rows from movement tables;
     movement events read prebuilt director-level candidates from movement tables,
     then select valid treated firm-years under req0 / req1 / req2.
 - Apply stay_x_years so movement panel inputs must match the configured stay column.
@@ -18,8 +19,8 @@ Process:
 Input:
 - InterimData/boardex_ssr_price_sample.csv
 - InterimData/boardex_interlock_direct_firmpair.dta
-- InterimData/boardex_interlock_indirect_firmpair.dta
 - data/movement_tables/movement_event_candidates.csv
+- data/movement_tables/indirect_interlock_event_candidates.csv
 
 Provenance of the `revenue` variable in boardex_ssr_price_sample.csv:
 1. /Dropbox/SSR/Stata/codes/1_clean/2_clean_ssr.do:88-91 — picks `avgnet` from
@@ -55,6 +56,7 @@ OUTPUT_BASE_PATH = PROJECT_ROOT / "data"
 OUTPUT_BASE_PATH.mkdir(parents=True, exist_ok=True)
 MOVEMENT_TABLES_PATH = OUTPUT_BASE_PATH / "movement_tables"
 MOVEMENT_CANDIDATES_PATH = MOVEMENT_TABLES_PATH / "movement_event_candidates.csv"
+INDIRECT_INTERLOCK_CANDIDATES_PATH = MOVEMENT_TABLES_PATH / "indirect_interlock_event_candidates.csv"
 
 MOVEMENT_EVENT_SPECS = {
     "to B still in A": {
@@ -97,15 +99,16 @@ MOVEMENT_REQUIREMENTS = ("req0", "req1", "req2")
 # - "A": origin firm as treated group
 RUN_CONFIG = {
     "event_types": [
-        "to B not in A",
-        "to B still in A",
-        "interlock_dissolution",
+        "indirect interlock"
     ],
     "panel_levels": ["quarter"],
     "stay_x_years": 2,
     "balance_window": (-1, 1),
     "treatment_groups": ["B","A"],
 }
+#        "to B not in A",
+#        "to B still in A",
+#        "interlock_dissolution",
 #        "direct interlock",
 #        "indirect interlock",
 # ===============================================================
@@ -155,6 +158,20 @@ def load_movement_candidates_table() -> pd.DataFrame:
             f"{MOVEMENT_CANDIDATES_PATH}. Run MovementTableMaker.py first."
         )
     return pd.read_csv(MOVEMENT_CANDIDATES_PATH)
+
+
+@lru_cache(maxsize=1)
+def load_indirect_interlock_candidates_table() -> pd.DataFrame:
+    """
+    Load the prebuilt directed indirect interlock candidate table.
+    """
+    if not INDIRECT_INTERLOCK_CANDIDATES_PATH.exists():
+        raise FileNotFoundError(
+            "Indirect interlock candidate table not found at "
+            f"{INDIRECT_INTERLOCK_CANDIDATES_PATH}. Run MovementTableMaker.py first."
+        )
+    return pd.read_csv(INDIRECT_INTERLOCK_CANDIDATES_PATH)
+
 
 class EventStudyPanelSSR:
     def __init__(
@@ -229,7 +246,6 @@ class EventStudyPanelSSR:
         # event_type controls both data source and treatment meaning.
         event_files = {
             "direct interlock": "boardex_interlock_direct_firmpair.dta",
-            "indirect interlock": "boardex_interlock_indirect_firmpair.dta",
         }
         if self.event_type not in event_files:
             if self.event_type == "no event":
@@ -431,6 +447,60 @@ class EventStudyPanelSSR:
         event_board_year = self._build_movement_board_year_events(requirement_level)
         return self._build_panel_from_board_year_events(event_board_year)
 
+    def _build_indirect_interlock_board_year_events(self, requirement_level: str) -> pd.DataFrame:
+        """
+        Collapse directed indirect interlock candidates to unique treated BoardName-year rows.
+        """
+        if requirement_level not in MOVEMENT_REQUIREMENTS:
+            raise ValueError(f"Unsupported indirect interlock requirement level: {requirement_level}")
+
+        indirect = load_indirect_interlock_candidates_table().copy()
+        required_cols = {
+            "event_year",
+            "BoardName",
+            self.stay_col,
+            "requirement1",
+            "requirement2",
+        }
+        missing_cols = sorted(required_cols - set(indirect.columns))
+        if missing_cols:
+            raise ValueError(
+                "Indirect interlock candidate table is missing required columns: "
+                f"{missing_cols}. Expected stay column '{self.stay_col}'. "
+                "Regenerate indirect_interlock_event_candidates.csv with the same stay_x_years setting."
+            )
+
+        indirect["event_year"] = pd.to_numeric(indirect["event_year"], errors="raise").astype(int)
+        indirect[self.stay_col] = pd.to_numeric(indirect[self.stay_col], errors="raise").astype(np.int8)
+        indirect["requirement1"] = pd.to_numeric(indirect["requirement1"], errors="raise").astype(np.int8)
+        indirect["requirement2"] = pd.to_numeric(indirect["requirement2"], errors="raise").astype(np.int8)
+
+        indirect = indirect.loc[indirect[self.stay_col].eq(1)].copy()
+        if requirement_level in {"req1", "req2"}:
+            indirect = indirect.loc[indirect["requirement1"].eq(1)].copy()
+        if requirement_level == "req2":
+            indirect = indirect.loc[indirect["requirement2"].eq(1)].copy()
+
+        indirect = (
+            indirect.rename(columns={"event_year": "year"})[["BoardName", "year"]]
+            .dropna(subset=["BoardName", "year"])
+            .drop_duplicates()
+            .sort_values(["BoardName", "year"])
+            .reset_index(drop=True)
+        )
+        indirect["event"] = 1
+        indirect[self.stay_col] = 1
+        indirect["event"] = indirect["event"].astype(np.int8)
+        indirect[self.stay_col] = indirect[self.stay_col].astype(np.int8)
+        return indirect
+
+    def _build_indirect_interlock_panel(self, requirement_level: str) -> pd.DataFrame:
+        """
+        Build one indirect interlock panel under the requested requirement level.
+        """
+        event_board_year = self._build_indirect_interlock_board_year_events(requirement_level)
+        return self._build_panel_from_board_year_events(event_board_year)
+
     def _movement_output_group_label(self) -> str:
         return f"{self.treatment_group}"
 
@@ -557,6 +627,17 @@ class EventStudyPanelSSR:
         return merged
 
     def merge_event_data(self) -> pd.DataFrame:
+        if self.event_type == "indirect interlock":
+            output_path = OUTPUT_BASE_PATH / f"{self.panel_level}-level"
+            output_path.mkdir(parents=True, exist_ok=True)
+            for requirement_level in MOVEMENT_REQUIREMENTS:
+                indirect_panel = self._build_indirect_interlock_panel(requirement_level)
+                indirect_panel.to_csv(
+                    output_path / f"ssr_firm_panel_indirect_interlock_{requirement_level}.csv",
+                    index=False,
+                )
+            return pd.DataFrame()
+
         output_group = self._movement_output_group_label()
         output_path = OUTPUT_BASE_PATH / f"{self.panel_level}-level_{output_group}"
         output_path.mkdir(parents=True, exist_ok=True)
@@ -571,7 +652,7 @@ class EventStudyPanelSSR:
                 )
             return pd.DataFrame()
 
-        if self.event_type in ["direct interlock", "indirect interlock"]:
+        if self.event_type == "direct interlock":
             panel = self._build_interlock_panel()
             panel.to_csv(output_path / f"ssr_firm_panel_{self.event_type.replace(' ', '_')}.csv", index=False)
             return pd.DataFrame()
@@ -598,6 +679,8 @@ def main() -> None:
     for panel_level in panel_levels:
         for treatment_group in treatment_groups:
             for event_type in event_types:
+                if event_type == "indirect interlock" and treatment_group != treatment_groups[0]:
+                    continue
                 print(
                     f"Generating panel: '{event_type}' | level={panel_level} | "
                     f"treatment_group={treatment_group} | "

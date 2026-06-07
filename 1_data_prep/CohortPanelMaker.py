@@ -64,6 +64,10 @@ EVENT_CONFIGS = {
         "panel_stem": "ssr_firm_panel_interlock_dissolution_leave_B",
         "candidate_event_type": "interlock_dissolution",
     },
+    "indirect_interlock": {
+        "kind": "indirect_interlock",
+        "panel_stem": "ssr_firm_panel_indirect_interlock",
+    },
 }
 """
     "direct_interlock": {
@@ -128,7 +132,7 @@ DISTRIBUTION_CONFIGS = {
 #
 # event_requirements:
 # - 0, 1, or 2 for movement events.
-# - direct/indirect interlock always use req0-equivalent firm panels.
+# - indirect interlock uses req0/req1/req2 firm panels without treatment_group suffix.
 #
 # treat_types:
 # - "first_event": unit enters treated sample at most once, when first_event_year == t.
@@ -161,9 +165,7 @@ DISTRIBUTION_CONFIGS = {
 RUN_CONFIG = {
     "panel_levels": ["quarter"],
     "event_types": [
-        "to_B_not_in_A",
-        "to_B_still_in_A",
-        "interlock_dissolution",
+        "indirect_interlock",
     ],
     "event_requirements": [0, 1, 2],
     "treat_types": ["first_event", "event"],
@@ -178,6 +180,9 @@ RUN_CONFIG = {
     "plot_end_year": 2018,
 }
 """
+        "to_B_not_in_A",
+        "to_B_still_in_A",
+        "interlock_dissolution",
         "direct_interlock",
         "indirect_interlock",
 """
@@ -189,6 +194,13 @@ def is_movement_event(event_type: str) -> bool:
     if event_type not in EVENT_CONFIGS:
         raise ValueError(f"Unsupported event_type: {event_type}")
     return EVENT_CONFIGS[event_type]["kind"] == "movement"
+
+
+def is_indirect_interlock_event(event_type: str) -> bool:
+    """Return whether the current event type uses indirect interlock requirement panels."""
+    if event_type not in EVENT_CONFIGS:
+        raise ValueError(f"Unsupported event_type: {event_type}")
+    return EVENT_CONFIGS[event_type]["kind"] == "indirect_interlock"
 
 
 def get_panel_group_label(treatment_group: str) -> str:
@@ -204,6 +216,20 @@ def get_output_group_label(treatment_group: str, include_eventpair: int) -> str:
     counterpart = "B" if str(treatment_group).upper() == "A" else "A"
     relation = "with" if int(include_eventpair) == 1 else "without"
     return f"{str(treatment_group).upper()}_{relation}_{counterpart}"
+
+
+def get_event_output_group_label(event_type: str, treatment_group: str, include_eventpair: int) -> str:
+    """Build the cohort and figure folder suffix for the current event."""
+    if is_indirect_interlock_event(event_type):
+        return ""
+    return get_output_group_label(treatment_group, include_eventpair)
+
+
+def get_level_folder_name(panel_level: str, output_group_label: str) -> str:
+    """Build the level folder, allowing no suffix for indirect interlock."""
+    if output_group_label == "":
+        return f"{panel_level}-level"
+    return f"{panel_level}-level_{output_group_label}"
 
 
 def get_requirement_folder(event_requirement: int) -> str:
@@ -237,13 +263,18 @@ def get_data_path(
     if panel_level not in {"year", "quarter"}:
         raise ValueError("panel_level must be one of: year, quarter")
 
-    group_label = get_panel_group_label(treatment_group)
-    level_folder = f"{panel_level}-level_{group_label}"
     config = EVENT_CONFIGS[event_type]
 
     if config["kind"] == "movement":
+        group_label = get_panel_group_label(treatment_group)
+        level_folder = f"{panel_level}-level_{group_label}"
+        filename = f"{config['panel_stem']}_{get_requirement_folder(event_requirement)}.csv"
+    elif config["kind"] == "indirect_interlock":
+        level_folder = f"{panel_level}-level"
         filename = f"{config['panel_stem']}_{get_requirement_folder(event_requirement)}.csv"
     else:
+        group_label = get_panel_group_label(treatment_group)
+        level_folder = f"{panel_level}-level_{group_label}"
         filename = config["filename"]
 
     return DATA_ROOT / level_folder / filename
@@ -276,8 +307,8 @@ def get_valid_event_requirements(
     requested_requirements: list[int],
 ) -> list[int]:
     """Return the applicable requirement levels for the current event type."""
-    # Movement events run req0/req1/req2; interlock events only have one panel flavor.
-    if is_movement_event(event_type):
+    # Movement and indirect interlock events run req0/req1/req2.
+    if is_movement_event(event_type) or is_indirect_interlock_event(event_type):
         return [int(requirement) for requirement in requested_requirements]
     return [0]
 
@@ -328,7 +359,7 @@ def get_cohort_root(
     """Build the shared cohort output root for one configuration."""
     return (
         COHORT_DATA_ROOT
-        / f"{panel_level}-level_{output_group_label}"
+        / get_level_folder_name(panel_level, output_group_label)
         / treat_type
         / get_requirement_folder(event_requirement)
     )
@@ -599,6 +630,7 @@ def build_control_groups(
             f"{invalid_variations}"
         )
     is_req2_movement = int(event_requirement) == 2 and is_movement_event(event_type)
+    has_stay_column = is_movement_event(event_type) or is_indirect_interlock_event(event_type)
 
     # Load the firm-level panel that already matches the requested requirement.
     data_path = get_data_path(
@@ -609,7 +641,7 @@ def build_control_groups(
     )
     df = pd.read_csv(data_path)
 
-    stay_col = detect_stay_column(df.columns) if is_movement_event(event_type) else None
+    stay_col = detect_stay_column(df.columns) if has_stay_column else None
     movement_pairs = None
     if int(include_eventpair) == 0 and is_movement_event(event_type):
         movement_pairs = load_effective_movement_pairs(
@@ -622,7 +654,7 @@ def build_control_groups(
     interlock_lookup = build_firm_interlock_lookup() if is_req2_movement else None
 
     id_cols = ["BoardName", "product"]
-    output_group_label = get_output_group_label(treatment_group, include_eventpair)
+    output_group_label = get_event_output_group_label(event_type, treatment_group, include_eventpair)
     output_root = get_cohort_root(
         panel_level=panel_level,
         output_group_label=output_group_label,
@@ -792,7 +824,9 @@ def plot_treated_control_counts(
 
     config = DISTRIBUTION_CONFIGS[unit_level]
     id_cols = config["id_cols"]
-    output_group_label = get_output_group_label(treatment_group, include_eventpair)
+    output_group_label = get_event_output_group_label(event_type, treatment_group, include_eventpair)
+    level_folder_name = get_level_folder_name(panel_level, output_group_label)
+    output_group_suffix = f"_{output_group_label}" if output_group_label else ""
     years = list(range(int(start_year), int(end_year) + 1))
     is_req2_movement = int(event_requirement) == 2 and is_movement_event(event_type)
 
@@ -966,7 +1000,7 @@ def plot_treated_control_counts(
                 plt.xticks(x, years, rotation=45)
                 plt.ylabel(config["ylabel"])
                 plt.title(
-                    f"{panel_level}-level_{output_group_label} | "
+                    f"{level_folder_name} | "
                     f"{config['title_label']} | {event_type} | {treat_type} | "
                     f"req{int(event_requirement)} | {control_type} | {balanced_label}"
                 )
@@ -977,7 +1011,7 @@ def plot_treated_control_counts(
                     PROJECT_ROOT
                     / "figures"
                     / config["figure_root"]
-                    / f"{panel_level}-level_{output_group_label}"
+                    / level_folder_name
                     / treat_type
                     / get_requirement_folder(event_requirement)
                     / folder_name
@@ -987,7 +1021,7 @@ def plot_treated_control_counts(
                 out_path = (
                     figure_dir
                     / (
-                        f"{event_type}_{panel_level}-level_{output_group_label}_"
+                        f"{event_type}_{panel_level}-level{output_group_suffix}_"
                         f"{treat_type}_{control_type}_{balanced_label}.png"
                     )
                 )
@@ -999,7 +1033,7 @@ def plot_treated_control_counts(
                     PROJECT_ROOT
                     / "csv"
                     / config["figure_root"]
-                    / f"{panel_level}-level_{output_group_label}"
+                    / level_folder_name
                     / treat_type
                     / get_requirement_folder(event_requirement)
                     / folder_name
@@ -1007,7 +1041,7 @@ def plot_treated_control_counts(
                 csv_dir.mkdir(parents=True, exist_ok=True)
                 
                 csv_filename = (
-                    f"{event_type}_{panel_level}-level_{output_group_label}_"
+                    f"{event_type}_{panel_level}-level{output_group_suffix}_"
                     f"{treat_type}_{control_type}_{balanced_label}.csv"
                 )
                 
@@ -1061,6 +1095,14 @@ if __name__ == "__main__":
         for treatment_group in treatment_groups:
             for include_eventpair in include_eventpair_values:
                 for event_type in event_types:
+                    if (
+                        is_indirect_interlock_event(event_type)
+                        and (
+                            treatment_group != treatment_groups[0]
+                            or include_eventpair != include_eventpair_values[0]
+                        )
+                    ):
+                        continue
                     valid_requirements = get_valid_event_requirements(
                         event_type=event_type,
                         requested_requirements=event_requirements,
