@@ -1,26 +1,26 @@
 r"""
 Purpose:
-Build firm-level event-study panels for SSR pharma firms under multiple treatment concepts.
-The script supports both year and quarter panels, and balanced-sample tagging via stay_x_years and a configurable balance window requirement.
+Build firm-level event-study panels for SSR pharma firms from standardized movement
+and interlock event tables.
 
 Process:
 - Build SSR base panel at the selected panel_level (year or quarter).
-- Construct treatment events by event_type:
-    direct interlock uses symmetric firm-pair links;
-    indirect interlock reads prebuilt directed candidate rows from movement tables;
-    movement events read prebuilt director-level candidates from movement tables,
-    then select valid treated firm-years under req0 / req1 / req2.
-- Apply stay_x_years so movement panel inputs must match the configured stay column.
-- In quarter mode, event and stay flags are placed in Q1 of the event year.
+- Read precomputed firm-side event eligibility from movement_table.csv and
+  interlock_table.csv.
+- Keep pure_event from the unfiltered event table so first_event is not changed
+  by req0/req1/req2 filters.
+- Build event and event_YYYY from the selected requirement level, with req0
+  exposed as stay_x_years in the output panel.
+- In quarter mode, event, pure_event, and stay flags are placed in Q1 of the event year.
 - Mark first-event and event-year indicators, then compute balance tags using
     balance_window = (start_offset, end_offset), i.e., t+start through t+end.
-- Export panel files to data/{panel_level}-level_{A|B}/ssr_firm_panel_*.csv.
+- Export movement files to data/{panel_level}-level_{A|B}/ and interlock files
+  to data/{panel_level}-level/.
 
 Input:
 - InterimData/boardex_ssr_price_sample.csv
-- InterimData/boardex_interlock_direct_firmpair.dta
-- data/movement_tables/movement_event_candidates.csv
-- data/movement_tables/indirect_interlock_event_candidates.csv
+- data/event_tables/movement_table.csv
+- data/event_tables/interlock_table.csv
 
 Provenance of the `revenue` variable in boardex_ssr_price_sample.csv:
 1. /Dropbox/SSR/Stata/codes/1_clean/2_clean_ssr.do:88-91 — picks `avgnet` from
@@ -37,6 +37,8 @@ So the `revenue` carried through every downstream panel here is SSR `avgnet`.
 Output:
 - data/year-level_{A|B}/ssr_firm_panel_*.csv
 - data/quarter-level_{A|B}/ssr_firm_panel_*.csv
+- data/year-level/ssr_firm_panel_*.csv
+- data/quarter-level/ssr_firm_panel_*.csv
 """
 
 import pathlib
@@ -54,34 +56,23 @@ PROJECT_ROOT = CURRENT_PATH.parent.parent
 INTERIM_DATA_PATH = PROJECT_ROOT / "InterimData"
 OUTPUT_BASE_PATH = PROJECT_ROOT / "data"
 OUTPUT_BASE_PATH.mkdir(parents=True, exist_ok=True)
-MOVEMENT_TABLES_PATH = OUTPUT_BASE_PATH / "movement_tables"
-MOVEMENT_CANDIDATES_PATH = MOVEMENT_TABLES_PATH / "movement_event_candidates.csv"
-INDIRECT_INTERLOCK_CANDIDATES_PATH = MOVEMENT_TABLES_PATH / "indirect_interlock_event_candidates.csv"
+EVENT_TABLE_DIR = OUTPUT_BASE_PATH / "event_tables"
+MOVEMENT_EVENT_TABLE_PATH = EVENT_TABLE_DIR / "movement_table.csv"
+INTERLOCK_EVENT_TABLE_PATH = EVENT_TABLE_DIR / "interlock_table.csv"
 
-MOVEMENT_EVENT_SPECS = {
-    "to B still in A": {
-        "candidate_event_type": "to_B_still_in_A",
-        "output_stem": "to_B_still_in_A",
-    },
-    "to B not in A": {
-        "candidate_event_type": "to_B_not_in_A",
-        "output_stem": "to_B_not_in_A",
-    },
-    "interlock_dissolution": {
-        "candidate_event_type": "interlock_dissolution",
-        "output_stem": "interlock_dissolution_leave_B",
-    },
-}
-
-MOVEMENT_REQUIREMENTS = ("req0", "req1", "req2")
+MOVEMENT_EVENTS = {"to_B_still_in_A", "to_B_not_in_A", "interlock_dissolution"}
+INTERLOCK_EVENTS = {"direct_interlock", "indirect_interlock"}
+OUTPUT_STEM_OVERRIDES = {"interlock_dissolution": "interlock_dissolution_leave_B"}
+EVENT_REQUIREMENTS = ("req0", "req1", "req2")
 
 
 # ========================== USER CONFIG ==========================
 # event_types:
-# - "direct interlock": symmetric firm-pair interlock treatment
-# - "indirect interlock": symmetric firm-pair indirect interlock treatment
-# - "to B still in A": directional director-move treatment (destination B) while still on A
-# - "to B not in A": directional director-move treatment (destination B) after leaving A
+# - "direct_interlock": direct firm interlock treatment
+# - "indirect_interlock": indirect firm interlock treatment
+# - "to_B_still_in_A": destination firm treatment while the director remains on A
+# - "to_B_not_in_A": destination firm treatment after the director leaves A
+# - "interlock_dissolution": directional dissolution treatment; output keeps leave_B naming
 #
 # panel_levels:
 # - "year": yearly panel
@@ -99,78 +90,78 @@ MOVEMENT_REQUIREMENTS = ("req0", "req1", "req2")
 # - "A": origin firm as treated group
 RUN_CONFIG = {
     "event_types": [
-        "indirect interlock"
+        "to_B_not_in_A",
+        "to_B_still_in_A",
+        "interlock_dissolution",
+        "direct_interlock",
+        "indirect_interlock",
     ],
     "panel_levels": ["quarter"],
     "stay_x_years": 2,
     "balance_window": (-1, 1),
     "treatment_groups": ["B","A"],
 }
-#        "to B not in A",
-#        "to B still in A",
-#        "interlock_dissolution",
-#        "direct interlock",
-#        "indirect interlock",
 # ===============================================================
 
 
-@lru_cache(maxsize=1)
-def load_ssr_yearly() -> pd.DataFrame:
-    """
-    Load and aggregate SSR data to firm-product-year.
-    """
+# ========================== DATA LOADERS ==========================
+
+
+@lru_cache(maxsize=None)
+def load_ssr_panel(panel_level: str) -> pd.DataFrame:
+    """Load and aggregate SSR data to the requested panel level."""
     ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv")
-    ssr = ssr[["BoardName", "year", "product", "atc3", "revenue", "quantity", "price0"]]
-    yearly = (
-        ssr.groupby(["BoardName", "year", "product", "atc3"], as_index=False)
+    group_cols = ["BoardName", "year", "product", "atc3"]
+    sort_cols = ["BoardName", "product", "year"]
+    if panel_level == "quarter":
+        group_cols = ["BoardName", "year", "quarter", "product", "atc3"]
+        sort_cols = ["BoardName", "product", "year", "quarter"]
+
+    panel = (
+        ssr[group_cols + ["revenue", "quantity", "price0"]]
+        .groupby(group_cols, as_index=False)
         .agg(revenue=("revenue", "sum"), quantity=("quantity", "sum"), price0=("price0", "mean"))
-        .sort_values(["BoardName", "product", "year"])
+        .sort_values(sort_cols)
     )
-    yearly["price"] = yearly["revenue"] * 1_000_000 / yearly["quantity"]
-    return yearly
+    panel["price"] = panel["revenue"] * 1_000_000 / panel["quantity"]
+    if panel_level == "quarter":
+        panel["quarter"] = panel["quarter"].astype(np.int8)
+    return panel
 
 
-@lru_cache(maxsize=1)
-def load_ssr_quarterly() -> pd.DataFrame:
+@lru_cache(maxsize=None)
+def load_event_table(table_type: str) -> pd.DataFrame:
     """
-    Load and aggregate SSR data to firm-product-year-quarter.
+    Load a standardized firm-side event eligibility table.
     """
-    ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv")
-    ssr = ssr[["BoardName", "year", "quarter", "product", "atc3", "revenue", "quantity", "price0"]]
-    quarterly = (
-        ssr.groupby(["BoardName", "year", "quarter", "product", "atc3"], as_index=False)
-        .agg(revenue=("revenue", "sum"), quantity=("quantity", "sum"), price0=("price0", "mean"))
-        .sort_values(["BoardName", "product", "year", "quarter"])
-    )
-    quarterly["price"] = quarterly["revenue"] * 1_000_000 / quarterly["quantity"]
-    quarterly["quarter"] = quarterly["quarter"].astype(np.int8)
-    return quarterly
+    if table_type == "movement":
+        path = MOVEMENT_EVENT_TABLE_PATH
+        required_columns = {"BoardName", "year", "event_type", "firm_type", *EVENT_REQUIREMENTS}
+    elif table_type == "interlock":
+        path = INTERLOCK_EVENT_TABLE_PATH
+        required_columns = {"BoardName", "year", "event_type", *EVENT_REQUIREMENTS}
+    else:
+        raise ValueError("table_type must be either 'movement' or 'interlock'")
+
+    event_table = pd.read_csv(path)
+    missing_columns = sorted(required_columns - set(event_table.columns))
+    if missing_columns:
+        raise ValueError(f"{path.name} is missing required columns: {missing_columns}")
+
+    event_table["BoardName"] = event_table["BoardName"].astype(str)
+    event_table["event_type"] = event_table["event_type"].astype(str)
+    event_table["year"] = pd.to_numeric(event_table["year"], errors="raise").astype(int)
+    for requirement_level in EVENT_REQUIREMENTS:
+        event_table[requirement_level] = pd.to_numeric(
+            event_table[requirement_level],
+            errors="raise",
+        ).astype(np.int8)
+    if table_type == "movement":
+        event_table["firm_type"] = event_table["firm_type"].astype(str).str.upper()
+    return event_table
 
 
-@lru_cache(maxsize=1)
-def load_movement_candidates_table() -> pd.DataFrame:
-    """
-    Load the prebuilt director-level movement candidate table.
-    """
-    if not MOVEMENT_CANDIDATES_PATH.exists():
-        raise FileNotFoundError(
-            "Movement candidate table not found at "
-            f"{MOVEMENT_CANDIDATES_PATH}. Run MovementTableMaker.py first."
-        )
-    return pd.read_csv(MOVEMENT_CANDIDATES_PATH)
-
-
-@lru_cache(maxsize=1)
-def load_indirect_interlock_candidates_table() -> pd.DataFrame:
-    """
-    Load the prebuilt directed indirect interlock candidate table.
-    """
-    if not INDIRECT_INTERLOCK_CANDIDATES_PATH.exists():
-        raise FileNotFoundError(
-            "Indirect interlock candidate table not found at "
-            f"{INDIRECT_INTERLOCK_CANDIDATES_PATH}. Run MovementTableMaker.py first."
-        )
-    return pd.read_csv(INDIRECT_INTERLOCK_CANDIDATES_PATH)
+# ========================== PANEL BUILDER ==========================
 
 
 class EventStudyPanelSSR:
@@ -198,469 +189,200 @@ class EventStudyPanelSSR:
         if self.treatment_group not in {"A", "B"}:
             raise ValueError("treatment_group must be either 'A' or 'B'")
             
-        self.ssr_yearly = load_ssr_yearly().copy()
-        self.ssr_base = self._build_ssr_base()
+        self.ssr_base = load_ssr_panel(self.panel_level).copy()
 
-    def _build_ssr_base(self) -> pd.DataFrame:
-        # Year mode keeps firm-product-year observations as-is.
-        if self.panel_level == "year":
-            return self.ssr_yearly.copy()
+    # -------------------------- Shared req/pure/stay panel construction --------------------------
 
-        # Quarter mode rebuilds the base at firm-product-year-quarter granularity.
-        return load_ssr_quarterly().copy()
-
-    def _required_periods(self, event_year: int) -> set:
-        # Balanced-window requirement: include all periods from t+start to t+end.
-        start_offset, end_offset = self.balance_window
-        if self.panel_level == "quarter":
-            return {
-                (y, q)
-                for y in range(event_year + start_offset, event_year + end_offset + 1)
-                for q in (1, 2, 3, 4)
-            }
-        return set(range(event_year + start_offset, event_year + end_offset + 1))
-
-    def _cohort_event_years(self) -> list[int]:
+    def _build_event_panel(self, requirement_level: str) -> pd.DataFrame:
         """
-        Return the full cohort-year range that must exist in event_YYYY and
-        balance_panel_YYYY columns, even when a given year has no valid events.
+        Build one panel under the requested requirement level.
         """
-        start_offset, end_offset = self.balance_window
-        pre_length = max(0, -int(start_offset))
-        post_length = max(0, int(end_offset))
-        start_year = 2007 + pre_length
-        end_year = 2019 - post_length
-        if start_year > end_year:
-            return []
-        return list(range(start_year, end_year + 1))
+        if requirement_level not in EVENT_REQUIREMENTS:
+            raise ValueError(f"Unsupported requirement level: {requirement_level}")
 
-    @staticmethod
-    def _event_mask(df: pd.DataFrame, year: int, boards: set, panel_level: str) -> pd.Series:
-        # Quarterly panels register event-year flags in Q1 only.
-        mask = (df["year"] == year) & df["BoardName"].isin(boards)
-        if panel_level == "quarter" and "quarter" in df.columns:
-            mask = mask & (df["quarter"] == 1)
-        return mask
-
-    def load_event_data(self) -> pd.DataFrame:
-        # event_type controls both data source and treatment meaning.
-        event_files = {
-            "direct interlock": "boardex_interlock_direct_firmpair.dta",
-        }
-        if self.event_type not in event_files:
-            if self.event_type == "no event":
-                return pd.DataFrame()
-            if self.event_type in MOVEMENT_EVENT_SPECS:
-                raise ValueError(
-                    f"Movement event '{self.event_type}' should load from "
-                    f"{MOVEMENT_CANDIDATES_PATH.name}, not directly from boardex_pharma.dta."
-                )
-            raise ValueError("Unsupported event type")
-        return pd.read_stata(INTERIM_DATA_PATH / event_files[self.event_type])
-
-    def _load_movement_candidates(self) -> pd.DataFrame:
-        """
-        Load and validate the prebuilt director-level movement candidate table.
-        """
-        # Movement panels must read the prebuilt director-level candidate table.
-        movement = load_movement_candidates_table().copy()
-        requirement2_col = f"requirement2_{self.treatment_group}"
-        required_cols = {
-            "event_type",
-            "DirectorID",
-            "event_year",
-            "FirmA",
-            "FirmB",
-            "requirement1",
-            self.stay_col,
-            requirement2_col,
-        }
-        missing_cols = sorted(required_cols - set(movement.columns))
-        if missing_cols:
-            raise ValueError(
-                "Movement candidate table is missing required columns: "
-                f"{missing_cols}. Expected stay column '{self.stay_col}'. "
-                "Regenerate movement_event_candidates.csv with the same stay_x_years setting."
-            )
-
-        movement["event_year"] = pd.to_numeric(movement["event_year"], errors="raise").astype(int)
-        movement["requirement1"] = pd.to_numeric(movement["requirement1"], errors="raise").astype(np.int8)
-        movement[self.stay_col] = pd.to_numeric(movement[self.stay_col], errors="raise").astype(np.int8)
-        movement[requirement2_col] = pd.to_numeric(
-            movement[requirement2_col],
-            errors="raise",
-        ).astype(np.int8)
-        return movement
-
-    def _mark_balance_panel(self, group: pd.DataFrame, event_col: str) -> pd.DataFrame:
-        # One balance tag per event definition (first event or event_year).
-        balance_col = "balance_panel_first" if event_col == "first_event" else f"balance_panel_{event_col.split('_')[-1]}"
-        group = group.copy()
-        group[balance_col] = 0
-
-        treated = group[group[event_col] == 1]
-        if len(treated) > 1:
-            raise ValueError(f"More than one event row found for BoardName={group['BoardName'].iloc[0]}")
-            
-        if treated.empty or treated.iloc[0][self.stay_col] != 1:
-            return group
-
-        # Balanced flag requires full coverage of the configured balance window.
-        event_year = int(treated.iloc[0]["year"])
-        if self.panel_level == "quarter" and "quarter" in group.columns:
-            observed_periods = set(zip(group["year"].astype(int), group["quarter"].astype(int)))
+        if self.event_type in MOVEMENT_EVENTS:
+            event_table = load_event_table("movement").copy()
+            event_table = event_table.loc[
+                event_table["event_type"].eq(self.event_type)
+                & event_table["firm_type"].eq(self.treatment_group)
+            ].copy()
+        elif self.event_type in INTERLOCK_EVENTS:
+            event_table = load_event_table("interlock").copy()
+            event_table = event_table.loc[event_table["event_type"].eq(self.event_type)].copy()
         else:
-            observed_periods = set(group["year"].astype(int))
+            raise ValueError(f"Unsupported event type: {self.event_type}")
 
-        if self._required_periods(event_year).issubset(observed_periods):
-            group[balance_col] = 1
-        return group
+        pure_event_board_year = (
+            event_table[["BoardName", "year"]]
+            .dropna(subset=["BoardName", "year"])
+            .drop_duplicates()
+            .sort_values(["BoardName", "year"])
+            .reset_index(drop=True)
+        )
+        pure_event_board_year["pure_event"] = np.int8(1)
 
-    @staticmethod
-    def _add_event_year_columns(
-        df: pd.DataFrame,
-        event_df: pd.DataFrame,
-        event_years: list[int],
-    ) -> pd.DataFrame:
-        # event_YYYY columns store whether a board is treated in that calendar year.
-        allowed_years = {int(y) for y in event_years}
-        for y in event_years:
-            df[f"event_{int(y)}"] = 0
+        stay_event_board_year = (
+            event_table.loc[event_table["req0"].eq(1), ["BoardName", "year"]]
+            .dropna(subset=["BoardName", "year"])
+            .drop_duplicates()
+            .sort_values(["BoardName", "year"])
+            .reset_index(drop=True)
+        )
+        stay_event_board_year[self.stay_col] = np.int8(1)
 
-        years_by_board = event_df.groupby("BoardName")["year"].agg(lambda x: set(x.tolist())).to_dict()
+        req_event_board_year = (
+            event_table.loc[event_table[requirement_level].eq(1), ["BoardName", "year"]]
+            .dropna(subset=["BoardName", "year"])
+            .drop_duplicates()
+            .sort_values(["BoardName", "year"])
+            .reset_index(drop=True)
+        )
+        req_event_board_year["event"] = np.int8(1)
 
-        def assign(group: pd.DataFrame) -> pd.DataFrame:
-            # Restrict event_YYYY columns to the fixed cohort-year range only.
-            years = {
-                int(y)
-                for y in years_by_board.get(group["BoardName"].iloc[0], set())
-                if int(y) in allowed_years
-            }
-            for y in years:
-                group[f"event_{int(y)}"] = 1
-            return group
+        events = req_event_board_year.copy()
+        pure_events = pure_event_board_year.copy()
+        stay_events = stay_event_board_year.copy()
 
-        return df.groupby("BoardName", group_keys=False).apply(assign)
-
-    def _build_panel_from_board_year_events(self, event_board_year: pd.DataFrame) -> pd.DataFrame:
-        """
-        Convert a unique BoardName-year event table into a firm-level SSR panel.
-        """
-        # Movement panels start from unique treated BoardName-year rows.
-        events = event_board_year.copy()
         events["year"] = pd.to_numeric(events["year"], errors="raise").astype(int)
         events["event"] = pd.to_numeric(events["event"], errors="raise").astype(np.int8)
-        events[self.stay_col] = pd.to_numeric(events[self.stay_col], errors="raise").astype(np.int8)
+        pure_events["year"] = pd.to_numeric(pure_events["year"], errors="raise").astype(int)
+        pure_events["pure_event"] = pd.to_numeric(pure_events["pure_event"], errors="raise").astype(np.int8)
+        stay_events["year"] = pd.to_numeric(stay_events["year"], errors="raise").astype(int)
+        stay_events[self.stay_col] = pd.to_numeric(stay_events[self.stay_col], errors="raise").astype(np.int8)
 
         # Quarter mode expands each treated board-year into Q1-Q4, with the event anchored at Q1.
         if self.panel_level == "quarter":
             events = events.loc[events.index.repeat(4)].reset_index(drop=True)
             events["quarter"] = events.groupby(["BoardName", "year"]).cumcount() + 1
             events["quarter"] = events["quarter"].astype(np.int8)
-            events.loc[events["quarter"] != 1, ["event", self.stay_col]] = 0
+            events.loc[events["quarter"] != 1, "event"] = 0
+
+            pure_events = pure_events.loc[pure_events.index.repeat(4)].reset_index(drop=True)
+            pure_events["quarter"] = pure_events.groupby(["BoardName", "year"]).cumcount() + 1
+            pure_events["quarter"] = pure_events["quarter"].astype(np.int8)
+            pure_events.loc[pure_events["quarter"] != 1, "pure_event"] = 0
+
+            stay_events = stay_events.loc[stay_events.index.repeat(4)].reset_index(drop=True)
+            stay_events["quarter"] = stay_events.groupby(["BoardName", "year"]).cumcount() + 1
+            stay_events["quarter"] = stay_events["quarter"].astype(np.int8)
+            stay_events.loc[stay_events["quarter"] != 1, self.stay_col] = 0
 
         merge_keys = ["BoardName", "year"] + (["quarter"] if self.panel_level == "quarter" else [])
         panel = self.ssr_base.merge(events, on=merge_keys, how="left")
+        panel = panel.merge(pure_events, on=merge_keys, how="left")
+        panel = panel.merge(stay_events, on=merge_keys, how="left")
         panel["event"] = panel["event"].fillna(0).astype(np.int8)
+        panel["pure_event"] = panel["pure_event"].fillna(0).astype(np.int8)
         panel[self.stay_col] = panel[self.stay_col].fillna(0).astype(np.int8)
 
-        # first_event_year is the earliest valid treated year under the current requirement.
         first_event = (
-            event_board_year.groupby("BoardName", as_index=False)["year"]
+            pure_event_board_year.groupby("BoardName", as_index=False)["year"]
             .min()
             .rename(columns={"year": "first_event_year"})
         )
         panel = panel.merge(first_event, on="BoardName", how="left")
 
-        first_mask = (panel["event"] == 1) & (panel["year"] == panel["first_event_year"])
+        first_mask = (panel["pure_event"] == 1) & (panel["year"] == panel["first_event_year"])
         if self.panel_level == "quarter":
             first_mask = first_mask & panel["quarter"].eq(1)
         panel["first_event"] = first_mask.astype(np.int8)
 
-        # Use the full cohort-year grid so downstream cohort files exist even
-        # when a particular requirement has no treated events in some years.
-        event_years = self._cohort_event_years()
-        event_row_cols = []
-        for y in event_years:
-            event_row_col = f"event_row_{int(y)}"
-            boards = set(event_board_year.loc[event_board_year["year"] == y, "BoardName"])
-            panel[event_row_col] = self._event_mask(panel, y, boards, self.panel_level).astype(np.int8)
-            event_row_cols.append(event_row_col)
+        start_offset, end_offset = self.balance_window
+        event_years = list(range(2007, 2020))
 
-        panel = panel.groupby(["BoardName", "product"], group_keys=False).apply(
-            lambda g: self._mark_balance_panel(g, "first_event")
-        )
-        for event_row_col in event_row_cols:
-            panel = panel.groupby(["BoardName", "product"], group_keys=False).apply(
-                lambda g, e=event_row_col: self._mark_balance_panel(g, e)
+        if self.panel_level == "quarter":
+            periods_lookup = {
+                board_product: set(zip(group["year"].astype(int), group["quarter"].astype(int)))
+                for board_product, group in panel.groupby(["BoardName", "product"])
+            }
+        else:
+            periods_lookup = (
+                panel.groupby(["BoardName", "product"])["year"]
+                .agg(lambda s: set(s.dropna().astype(int).tolist()))
+                .to_dict()
             )
 
-        # Final event_YYYY columns are board-level constants, so drop temporary row-level event columns.
-        panel = panel.drop(columns=event_row_cols)
-        panel = self._add_event_year_columns(panel, event_board_year, event_years)
+        first_event_stay = (
+            first_event.merge(
+                stay_event_board_year.rename(columns={"year": "first_event_year"}),
+                on=["BoardName", "first_event_year"],
+                how="left",
+            )
+            .set_index("BoardName")[self.stay_col]
+            .fillna(0)
+            .astype(np.int8)
+        )
+        first_year_by_board = first_event.set_index("BoardName")["first_event_year"].to_dict()
+        qualified_first = set()
+        for board_product, periods in periods_lookup.items():
+            board_name, _product = board_product
+            first_year = first_year_by_board.get(board_name)
+            if pd.isna(first_year) or int(first_event_stay.get(board_name, 0)) != 1:
+                continue
+            if self.panel_level == "quarter":
+                required_periods = {
+                    (year, quarter)
+                    for year in range(int(first_year) + start_offset, int(first_year) + end_offset + 1)
+                    for quarter in (1, 2, 3, 4)
+                }
+            else:
+                required_periods = set(range(int(first_year) + start_offset, int(first_year) + end_offset + 1))
+            if required_periods.issubset(periods):
+                qualified_first.add((board_name, _product))
+        panel["balance_panel_first"] = (
+            pd.MultiIndex.from_frame(panel[["BoardName", "product"]]).isin(qualified_first).astype(np.int8)
+        )
+
+        for y in event_years:
+            boards = set(req_event_board_year.loc[req_event_board_year["year"] == y, "BoardName"])
+            if self.panel_level == "quarter":
+                required_periods = {
+                    (year, quarter)
+                    for year in range(int(y) + start_offset, int(y) + end_offset + 1)
+                    for quarter in (1, 2, 3, 4)
+                }
+            else:
+                required_periods = set(range(int(y) + start_offset, int(y) + end_offset + 1))
+
+            stay_boards = set(stay_event_board_year.loc[stay_event_board_year["year"] == y, "BoardName"])
+            qualified = {
+                board_product
+                for board_product, periods in periods_lookup.items()
+                if board_product[0] in boards
+                and board_product[0] in stay_boards
+                and required_periods.issubset(periods)
+            }
+            panel[f"balance_panel_{int(y)}"] = (
+                pd.MultiIndex.from_frame(panel[["BoardName", "product"]]).isin(qualified).astype(np.int8)
+            )
+
+        for y in event_years:
+            boards = set(req_event_board_year.loc[req_event_board_year["year"] == y, "BoardName"])
+            panel[f"event_{int(y)}"] = panel["BoardName"].isin(boards).astype(np.int8)
 
         ordered = panel.columns.tolist()
         ordered.insert(4, ordered.pop(ordered.index("event")))
         return panel[ordered]
 
-    def _build_movement_board_year_events(self, requirement_level: str) -> pd.DataFrame:
-        """
-        Collapse director-level movement candidates to unique treated BoardName-year rows.
-        """
-        # Filter director-level movement candidates to the current event type and requirement.
-        if requirement_level not in MOVEMENT_REQUIREMENTS:
-            raise ValueError(f"Unsupported movement requirement level: {requirement_level}")
-
-        spec = MOVEMENT_EVENT_SPECS[self.event_type]
-        movement = self._load_movement_candidates()
-        requirement2_col = f"requirement2_{self.treatment_group}"
-        movement = movement.loc[
-            movement["event_type"].eq(spec["candidate_event_type"])
-        ].copy()
-
-        movement = movement.loc[movement[self.stay_col].eq(1)].copy()
-        if requirement_level in {"req1", "req2"}:
-            movement = movement.loc[movement["requirement1"].eq(1)].copy()
-        if requirement_level == "req2":
-            movement = movement.loc[movement[requirement2_col].eq(1)].copy()
-
-        # treatment_group picks which side of the movement becomes the treated firm.
-        treated_firm_col = "FirmB" if self.treatment_group == "B" else "FirmA"
-        movement = (
-            movement.rename(columns={treated_firm_col: "BoardName", "event_year": "year"})
-            [["BoardName", "year"]]
-            .dropna(subset=["BoardName", "year"])
-            .drop_duplicates()
-            .sort_values(["BoardName", "year"])
-            .reset_index(drop=True)
-        )
-        movement["event"] = 1
-        movement[self.stay_col] = 1
-        movement["event"] = movement["event"].astype(np.int8)
-        movement[self.stay_col] = movement[self.stay_col].astype(np.int8)
-        return movement
-
-    def _build_movement_panel(self, requirement_level: str) -> pd.DataFrame:
-        """
-        Build one movement panel under the requested requirement level.
-        """
-        event_board_year = self._build_movement_board_year_events(requirement_level)
-        return self._build_panel_from_board_year_events(event_board_year)
-
-    def _build_indirect_interlock_board_year_events(self, requirement_level: str) -> pd.DataFrame:
-        """
-        Collapse directed indirect interlock candidates to unique treated BoardName-year rows.
-        """
-        if requirement_level not in MOVEMENT_REQUIREMENTS:
-            raise ValueError(f"Unsupported indirect interlock requirement level: {requirement_level}")
-
-        indirect = load_indirect_interlock_candidates_table().copy()
-        required_cols = {
-            "event_year",
-            "BoardName",
-            self.stay_col,
-            "requirement1",
-            "requirement2",
-        }
-        missing_cols = sorted(required_cols - set(indirect.columns))
-        if missing_cols:
-            raise ValueError(
-                "Indirect interlock candidate table is missing required columns: "
-                f"{missing_cols}. Expected stay column '{self.stay_col}'. "
-                "Regenerate indirect_interlock_event_candidates.csv with the same stay_x_years setting."
-            )
-
-        indirect["event_year"] = pd.to_numeric(indirect["event_year"], errors="raise").astype(int)
-        indirect[self.stay_col] = pd.to_numeric(indirect[self.stay_col], errors="raise").astype(np.int8)
-        indirect["requirement1"] = pd.to_numeric(indirect["requirement1"], errors="raise").astype(np.int8)
-        indirect["requirement2"] = pd.to_numeric(indirect["requirement2"], errors="raise").astype(np.int8)
-
-        indirect = indirect.loc[indirect[self.stay_col].eq(1)].copy()
-        if requirement_level in {"req1", "req2"}:
-            indirect = indirect.loc[indirect["requirement1"].eq(1)].copy()
-        if requirement_level == "req2":
-            indirect = indirect.loc[indirect["requirement2"].eq(1)].copy()
-
-        indirect = (
-            indirect.rename(columns={"event_year": "year"})[["BoardName", "year"]]
-            .dropna(subset=["BoardName", "year"])
-            .drop_duplicates()
-            .sort_values(["BoardName", "year"])
-            .reset_index(drop=True)
-        )
-        indirect["event"] = 1
-        indirect[self.stay_col] = 1
-        indirect["event"] = indirect["event"].astype(np.int8)
-        indirect[self.stay_col] = indirect[self.stay_col].astype(np.int8)
-        return indirect
-
-    def _build_indirect_interlock_panel(self, requirement_level: str) -> pd.DataFrame:
-        """
-        Build one indirect interlock panel under the requested requirement level.
-        """
-        event_board_year = self._build_indirect_interlock_board_year_events(requirement_level)
-        return self._build_panel_from_board_year_events(event_board_year)
-
-    def _movement_output_group_label(self) -> str:
-        return f"{self.treatment_group}"
-
-    def _build_interlock_panel(self) -> pd.DataFrame:
-        event_data = self.load_event_data()
-        # Restrict interlock events to SSR boards so treatment is defined on panel universe.
-        valid_boards = set(self.ssr_yearly["BoardName"].dropna().unique())
-        event_data = event_data.loc[
-            event_data["BoardName1"].isin(valid_boards) & event_data["BoardName2"].isin(valid_boards)
-        ].copy()
-
-        event_data["pair_min"] = np.where(
-            event_data["BoardName1"] <= event_data["BoardName2"], event_data["BoardName1"], event_data["BoardName2"]
-        )
-        event_data["pair_max"] = np.where(
-            event_data["BoardName1"] <= event_data["BoardName2"], event_data["BoardName2"], event_data["BoardName1"]
-        )
-
-        pair_year = event_data[["pair_min", "pair_max", "year"]].dropna().drop_duplicates().copy()
-        pair_year["year"] = pair_year["year"].astype(int)
-        pair_year_set = set(pair_year[["pair_min", "pair_max", "year"]].itertuples(index=False, name=None))
-
-        def _check_stay(r):
-            # stay_x_years for interlocks: the same pair must remain linked in future years.
-            if self.stay_x_years <= 1:
-                return 1
-            for offset in range(1, self.stay_x_years):
-                if (r["pair_min"], r["pair_max"], int(r["year"]) + offset) not in pair_year_set:
-                    return 0
-            return 1
-
-        pair_year[self.stay_col] = pair_year.apply(_check_stay, axis=1).astype(np.int8)
-
-        event_board_year = (
-            pair_year
-            .melt(id_vars=["year", self.stay_col], value_vars=["pair_min", "pair_max"], value_name="BoardName")
-            [["BoardName", "year", self.stay_col]]
-            .dropna()
-            .drop_duplicates()
-            .groupby(["BoardName", "year"], as_index=False)
-            .agg(**{self.stay_col: (self.stay_col, "max")})
-        )
-        event_board_year["event"] = 1
-        event_board_year[self.stay_col] = event_board_year[self.stay_col].astype(np.int8)
-
-        if self.panel_level == "quarter":
-            # Quarter mode places treatment and stay markers in Q1.
-            event_board_year = event_board_year.loc[event_board_year.index.repeat(4)].reset_index(drop=True)
-            event_board_year["quarter"] = event_board_year.groupby(["BoardName", "year"]).cumcount() + 1
-            event_board_year["quarter"] = event_board_year["quarter"].astype(np.int8)
-            event_board_year.loc[event_board_year["quarter"] != 1, ["event", self.stay_col]] = 0
-
-        merge_keys = ["BoardName", "year"] + (["quarter"] if self.panel_level == "quarter" else [])
-        merged = self.ssr_base.merge(event_board_year, on=merge_keys, how="left")
-        merged["event"] = merged["event"].fillna(0).astype(np.int8)
-        merged[self.stay_col] = merged[self.stay_col].fillna(0).astype(np.int8)
-
-        first_event_map = merged.loc[merged["event"].eq(1)].groupby("BoardName")["year"].min()
-        merged["first_event_year"] = merged["BoardName"].map(first_event_map)
-        
-        first_event_stay_map = (
-            event_board_year.loc[event_board_year["event"].eq(1)]
-            .sort_values("year")
-            .drop_duplicates("BoardName")
-            .set_index("BoardName")[self.stay_col]
-        )
-        merged["first_event_stay"] = merged["BoardName"].map(first_event_stay_map).fillna(0).astype(np.int8)
-
-        # Build the full cohort-year grid so every downstream event cohort file
-        # has a matching event_YYYY and balance_panel_YYYY column.
-        event_years = self._cohort_event_years()
-        for y in event_years:
-            boards = set(merged.loc[(merged["year"] == y) & merged["event"].eq(1), "BoardName"])
-            merged[f"event_{int(y)}"] = merged["BoardName"].isin(boards).astype(np.int8)
-
-        if self.panel_level == "quarter":
-            periods_lookup = (
-                merged.groupby(["BoardName", "product"])
-                .apply(lambda g: set(zip(g["year"].astype(int), g["quarter"].astype(int))), include_groups=False)
-                .to_dict()
-            )
-        else:
-            periods_lookup = (
-                merged.groupby(["BoardName", "product"])["year"]
-                .agg(lambda s: set(s.dropna().astype(int).tolist()))
-                .to_dict()
-            )
-
-        merged["balance_panel_first"] = merged.apply(
-            lambda r: int(
-                pd.notna(r["first_event_year"])
-                and r["first_event_stay"] == 1
-                # first-event balance uses the same configurable balance_window rule.
-                and self._required_periods(int(r["first_event_year"])).issubset(
-                    periods_lookup.get((r["BoardName"], r["product"]), set())
-                )
-            ),
-            axis=1,
-        ).astype(np.int8)
-
-        for y in event_years:
-            need_periods = self._required_periods(int(y))
-            event_col = f"event_{int(y)}"
-            bal_col = f"balance_panel_{int(y)}"
-            
-            stay_firms = set(
-                merged.loc[
-                    (merged[event_col] == 1) & (merged[self.stay_col] == 1),
-                    "BoardName",
-                ].unique()
-            )
-            
-            qualified = {
-                (bn, prod)
-                for (bn, prod), periods in periods_lookup.items()
-                if bn in stay_firms and need_periods.issubset(periods)
-            }
-            
-            # Board-product units qualify only if both stay and window-coverage conditions hold.
-            merged[bal_col] = (
-                pd.MultiIndex.from_frame(merged[["BoardName", "product"]]).isin(qualified).astype(np.int8)
-            )
-
-        return merged
+    # -------------------------- Output dispatch --------------------------
 
     def merge_event_data(self) -> pd.DataFrame:
-        if self.event_type == "indirect interlock":
-            output_path = OUTPUT_BASE_PATH / f"{self.panel_level}-level"
-            output_path.mkdir(parents=True, exist_ok=True)
-            for requirement_level in MOVEMENT_REQUIREMENTS:
-                indirect_panel = self._build_indirect_interlock_panel(requirement_level)
-                indirect_panel.to_csv(
-                    output_path / f"ssr_firm_panel_indirect_interlock_{requirement_level}.csv",
-                    index=False,
-                )
-            return pd.DataFrame()
+        if self.event_type not in MOVEMENT_EVENTS and self.event_type not in INTERLOCK_EVENTS:
+            raise ValueError(f"Unsupported event type: {self.event_type}")
 
-        output_group = self._movement_output_group_label()
-        output_path = OUTPUT_BASE_PATH / f"{self.panel_level}-level_{output_group}"
+        output_path = OUTPUT_BASE_PATH / f"{self.panel_level}-level"
+        if self.event_type in MOVEMENT_EVENTS:
+            output_path = OUTPUT_BASE_PATH / f"{self.panel_level}-level_{self.treatment_group}"
         output_path.mkdir(parents=True, exist_ok=True)
 
-        if self.event_type in MOVEMENT_EVENT_SPECS:
-            output_stem = MOVEMENT_EVENT_SPECS[self.event_type]["output_stem"]
-            for requirement_level in MOVEMENT_REQUIREMENTS:
-                movement_panel = self._build_movement_panel(requirement_level)
-                movement_panel.to_csv(
-                    output_path / f"ssr_firm_panel_{output_stem}_{requirement_level}.csv",
-                    index=False,
-                )
-            return pd.DataFrame()
-
-        if self.event_type == "direct interlock":
-            panel = self._build_interlock_panel()
-            panel.to_csv(output_path / f"ssr_firm_panel_{self.event_type.replace(' ', '_')}.csv", index=False)
-            return pd.DataFrame()
-
-        if self.event_type == "no event":
-            return pd.DataFrame()
-
-        raise ValueError("Unsupported event type")
+        output_stem = OUTPUT_STEM_OVERRIDES.get(self.event_type, self.event_type)
+        for requirement_level in EVENT_REQUIREMENTS:
+            panel = self._build_event_panel(requirement_level)
+            panel.to_csv(
+                output_path / f"ssr_firm_panel_{output_stem}_{requirement_level}.csv",
+                index=False,
+            )
+        return pd.DataFrame()
 
 
 def main() -> None:
@@ -679,7 +401,7 @@ def main() -> None:
     for panel_level in panel_levels:
         for treatment_group in treatment_groups:
             for event_type in event_types:
-                if event_type == "indirect interlock" and treatment_group != treatment_groups[0]:
+                if event_type in INTERLOCK_EVENTS and treatment_group != treatment_groups[0]:
                     continue
                 print(
                     f"Generating panel: '{event_type}' | level={panel_level} | "

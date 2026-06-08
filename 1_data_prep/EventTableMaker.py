@@ -1,16 +1,24 @@
 """
-Generate the movement firm-side event eligibility table.
+Purpose:
+Build firm-level event eligibility tables from RawEventTableMaker candidate files.
 
-This script reads movement event candidates, expands each candidate into
-A-side and B-side firm rows, computes row-level eligibility flags, and writes
-one grouped event table.
+Process:
+1. Read movement and interlock candidate tables from data/event_tables.
+2. Convert candidate rows to firm-year event rows.
+3. Build req0, req1, and req2 flags with nested requirement logic.
+4. Collapse duplicate firm-year event rows by groupby max.
+5. Write one movement event table and one interlock event table.
 
 Input:
-- data/movement_tables/movement_event_candidates.csv
+- data/event_tables/movement_event_candidates.csv
+- data/event_tables/interlock_event_candidates.csv
 
 Output:
-- data/event_table.csv
+- data/event_tables/movement_table.csv
+- data/event_tables/interlock_table.csv
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 
@@ -19,15 +27,21 @@ import pandas as pd
 
 CURRENT_PATH = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_PATH.parent.parent
-INPUT_PATH = PROJECT_ROOT / "data" / "movement_tables" / "movement_event_candidates.csv"
-OUTPUT_PATH = PROJECT_ROOT / "data" / "event_table.csv"
+EVENT_TABLE_DIR = PROJECT_ROOT / "data" / "event_tables"
 
-EVENT_TYPES = {
+MOVEMENT_CANDIDATES_PATH = EVENT_TABLE_DIR / "movement_event_candidates.csv"
+INTERLOCK_CANDIDATES_PATH = EVENT_TABLE_DIR / "interlock_event_candidates.csv"
+MOVEMENT_OUTPUT_PATH = EVENT_TABLE_DIR / "movement_table.csv"
+INTERLOCK_OUTPUT_PATH = EVENT_TABLE_DIR / "interlock_table.csv"
+
+REQUIREMENT_COLUMNS = ("req0", "req1", "req2")
+MOVEMENT_EVENT_TYPES = {
     "to_B_still_in_A",
     "to_B_not_in_A",
     "interlock_dissolution",
 }
-BASE_REQUIRED_COLUMNS = {
+INTERLOCK_EVENT_TYPES = {"direct_interlock", "indirect_interlock"}
+MOVEMENT_REQUIRED_COLUMNS = {
     "event_type",
     "event_year",
     "FirmA",
@@ -36,97 +50,153 @@ BASE_REQUIRED_COLUMNS = {
     "requirement2_A",
     "requirement2_B",
 }
-OUTPUT_COLUMNS = ["BoardName", "year", "event_type", "firm_type", "req0", "req1", "req2"]
-GROUP_KEYS = ["BoardName", "year", "event_type", "firm_type"]
+INTERLOCK_REQUIRED_COLUMNS = {
+    "event_type",
+    "event_year",
+    "BoardName",
+    "requirement1",
+    "requirement2",
+}
 
 
-def detect_stay_column(columns: pd.Index) -> str:
-    """Return the unique stay_{x}_years column name."""
+def build_event_table(candidates: pd.DataFrame, table_type: str, source_name: str) -> pd.DataFrame:
+    """
+    Build one firm-level event table from one raw candidate table.
+
+    Movement candidates are expanded to A-side and B-side firm rows with
+    firm_type. Interlock candidates are already firm-level and are kept
+    direction-free, without firm_type.
+    """
+    # RawEventTableMaker emits exactly one stay_{x}_years column under the
+    # current run configuration; req0 is defined from that column.
     stay_columns = [
-        col
-        for col in columns
-        if col.startswith("stay_") and col.endswith("_years")
+        column
+        for column in candidates.columns
+        if column.startswith("stay_") and column.endswith("_years")
     ]
     if len(stay_columns) != 1:
-        raise ValueError(
-            "Expected exactly one stay_{x}_years column; "
-            f"found {len(stay_columns)}: {stay_columns}"
+        raise ValueError(f"{source_name} should contain exactly one stay column, found {stay_columns}")
+    stay_column = stay_columns[0]
+
+    if table_type == "movement":
+        # Movement rows need FirmA/FirmB and side-specific requirement2 flags.
+        missing = sorted({*MOVEMENT_REQUIRED_COLUMNS, stay_column} - set(candidates.columns))
+        if missing:
+            raise ValueError(f"{source_name} is missing columns: {missing}")
+
+        # Keep only the three movement-style events.
+        movement = candidates.loc[candidates["event_type"].isin(MOVEMENT_EVENT_TYPES)]
+        shared_columns = ["event_type", "event_year", stay_column, "requirement1"]
+
+        # A-side treated rows use FirmA and requirement2_A.
+        a_side = movement[shared_columns + ["FirmA", "requirement2_A"]].rename(
+            columns={
+                "event_year": "year",
+                stay_column: "stay",
+                "FirmA": "BoardName",
+                "requirement2_A": "requirement2",
+            }
         )
-    return stay_columns[0]
+        a_side["firm_type"] = "A"
 
+        # B-side treated rows use FirmB and requirement2_B.
+        b_side = movement[shared_columns + ["FirmB", "requirement2_B"]].rename(
+            columns={
+                "event_year": "year",
+                stay_column: "stay",
+                "FirmB": "BoardName",
+                "requirement2_B": "requirement2",
+            }
+        )
+        b_side["firm_type"] = "B"
 
-def validate_columns(df: pd.DataFrame, stay_column: str) -> None:
-    """Validate the columns required to build the event table."""
-    required_columns = BASE_REQUIRED_COLUMNS | {stay_column}
-    missing_columns = sorted(required_columns - set(df.columns))
-    if missing_columns:
-        raise ValueError(f"Missing required columns: {missing_columns}")
+        firm_year = pd.concat([a_side, b_side], ignore_index=True)
+        group_columns = ["BoardName", "year", "event_type", "firm_type"]
+        sort_columns = ["event_type", "firm_type", "BoardName", "year"]
 
+    elif table_type == "interlock":
+        # Interlock events are direction-free here, so no A/B firm_type is added.
+        missing = sorted({*INTERLOCK_REQUIRED_COLUMNS, stay_column} - set(candidates.columns))
+        if missing:
+            raise ValueError(f"{source_name} is missing columns: {missing}")
 
-def expand_firm_sides(df: pd.DataFrame, stay_column: str) -> pd.DataFrame:
-    """Expand candidate rows into A-side and B-side firm rows."""
-    shared_columns = ["event_type", "event_year", stay_column, "requirement1"]
+        # Keep direct and indirect interlock rows in one output table.
+        interlock = candidates.loc[candidates["event_type"].isin(INTERLOCK_EVENT_TYPES)]
+        firm_year = interlock[
+            ["event_type", "event_year", stay_column, "BoardName", "requirement1", "requirement2"]
+        ].rename(
+            columns={
+                "event_year": "year",
+                stay_column: "stay",
+            }
+        )
+        group_columns = ["BoardName", "year", "event_type"]
+        sort_columns = ["event_type", "BoardName", "year"]
 
-    a_side = df[shared_columns + ["FirmA", "requirement2_A"]].rename(
-        columns={
-            "FirmA": "BoardName",
-            "event_year": "year",
-            stay_column: "stay",
-            "requirement2_A": "requirement2",
-        }
-    )
-    a_side["firm_type"] = "A"
+    else:
+        raise ValueError("table_type must be either 'movement' or 'interlock'")
 
-    b_side = df[shared_columns + ["FirmB", "requirement2_B"]].rename(
-        columns={
-            "FirmB": "BoardName",
-            "event_year": "year",
-            stay_column: "stay",
-            "requirement2_B": "requirement2",
-        }
-    )
-    b_side["firm_type"] = "B"
+    # Normalize key and requirement columns before boolean flag construction.
+    firm_year = firm_year.dropna(subset=["BoardName", "year"]).copy()
+    firm_year["BoardName"] = firm_year["BoardName"].astype(str)
+    firm_year["year"] = pd.to_numeric(firm_year["year"], errors="raise").astype(int)
+    for column in ("stay", "requirement1", "requirement2"):
+        firm_year[column] = pd.to_numeric(
+            firm_year[column],
+            errors="raise",
+        ).astype("int8")
 
-    expanded = pd.concat([a_side, b_side], ignore_index=True)
-    expanded = expanded.dropna(subset=["BoardName", "year"]).copy()
-    expanded["year"] = expanded["year"].astype(int)
-    return expanded
+    # req1 must first satisfy req0; req2 must first satisfy req1.
+    firm_year["req0"] = firm_year["stay"].eq(1).astype("int8")
+    firm_year["req1"] = (
+        firm_year["stay"].eq(1) & firm_year["requirement1"].eq(1)
+    ).astype("int8")
+    firm_year["req2"] = (
+        firm_year["stay"].eq(1)
+        & firm_year["requirement1"].eq(1)
+        & firm_year["requirement2"].eq(1)
+    ).astype("int8")
 
-
-def build_event_table(candidates: pd.DataFrame) -> pd.DataFrame:
-    """Build grouped movement firm-side event eligibility flags."""
-    stay_column = detect_stay_column(candidates.columns)
-    validate_columns(candidates, stay_column)
-
-    filtered = candidates.loc[candidates["event_type"].isin(EVENT_TYPES)].copy()
-    expanded = expand_firm_sides(filtered, stay_column)
-
-    stay_met = expanded["stay"].eq(1)
-    requirement1_met = expanded["requirement1"].eq(1)
-    requirement2_met = expanded["requirement2"].eq(1)
-
-    expanded["req0"] = stay_met.astype("int8")
-    expanded["req1"] = (stay_met & requirement1_met).astype("int8")
-    expanded["req2"] = (stay_met & requirement1_met & requirement2_met).astype("int8")
-
+    # Multiple candidate rows can map to the same firm-year event; one valid
+    # candidate is enough, so collapse with max.
     event_table = (
-        expanded.groupby(GROUP_KEYS, as_index=False)[["req0", "req1", "req2"]]
+        firm_year.groupby(group_columns, as_index=False)[list(REQUIREMENT_COLUMNS)]
         .max()
-        .sort_values(["event_type", "firm_type", "BoardName", "year"])
+        .sort_values(sort_columns)
         .reset_index(drop=True)
     )
-    event_table[["req0", "req1", "req2"]] = event_table[["req0", "req1", "req2"]].astype("int8")
-    return event_table[OUTPUT_COLUMNS]
+    event_table[list(REQUIREMENT_COLUMNS)] = event_table[
+        list(REQUIREMENT_COLUMNS)
+    ].astype("int8")
+    return event_table[[*group_columns, *REQUIREMENT_COLUMNS]]
 
 
 def main() -> None:
-    """Read movement candidates and write the firm-side event table."""
-    candidates = pd.read_csv(INPUT_PATH)
-    event_table = build_event_table(candidates)
+    """
+    Read raw candidate tables and write movement_table.csv and interlock_table.csv.
+    """
+    # Movement output preserves firm_type because A and B treated-side panels
+    # still need different firm definitions.
+    movement_candidates = pd.read_csv(MOVEMENT_CANDIDATES_PATH)
+    movement_table = build_event_table(
+        movement_candidates,
+        "movement",
+        MOVEMENT_CANDIDATES_PATH.name,
+    )
+    MOVEMENT_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    movement_table.to_csv(MOVEMENT_OUTPUT_PATH, index=False)
+    print(f"Saved: {MOVEMENT_OUTPUT_PATH} ({len(movement_table):,} rows)")
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    event_table.to_csv(OUTPUT_PATH, index=False)
-    print(f"Saved: {OUTPUT_PATH} ({len(event_table):,} rows)")
+    # Interlock output is direction-free and combines direct and indirect events.
+    interlock_candidates = pd.read_csv(INTERLOCK_CANDIDATES_PATH)
+    interlock_table = build_event_table(
+        interlock_candidates,
+        "interlock",
+        INTERLOCK_CANDIDATES_PATH.name,
+    )
+    INTERLOCK_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    interlock_table.to_csv(INTERLOCK_OUTPUT_PATH, index=False)
+    print(f"Saved: {INTERLOCK_OUTPUT_PATH} ({len(interlock_table):,} rows)")
 
 
 if __name__ == "__main__":

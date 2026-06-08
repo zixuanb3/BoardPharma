@@ -14,8 +14,8 @@ Input:
 - InterimData/boardex_ssr_price_sample.csv
 
 Output:
-- data/atc3mapping/atc3mapping_year_level*.csv
-- data/atc3mapping/atc3mapping_quarter_level*.csv
+- data/atc3mapping/atc*mapping_year.csv
+- data/atc3mapping/atc*mapping_quarter.csv
 """
 
 import pandas as pd
@@ -31,18 +31,18 @@ from pathlib import Path
 # - Quarter matching is stricter, so peer sets are usually smaller and more time-specific.
 #
 # atc_levels:
-# - 1 keeps original ATC3.
-# - 2 truncates the last character and coarsens therapeutic categories.
-# - 3 keeps "Device" if it starts with "Device", otherwise keeps only the first character.
+# - "atc1" keeps "Device" if it starts with "Device", otherwise keeps only the first character.
+# - "atc2" truncates the last character and coarsens therapeutic categories.
+# - "atc3" keeps original ATC3.
 
 RUN_CONFIG = {
     "levels": ["year"],
-    "atc_levels": [3],
+    "atc_levels": ["atc2","atc3"],
 }
 # ===============================================================
 
 
-def process_data(level='year', atc_level=1):
+def process_data(level='year', atc_level='atc3'):
     """
     Build peer mappings under one level and one ATC granularity.
     """
@@ -51,12 +51,12 @@ def process_data(level='year', atc_level=1):
     df = pd.read_csv(interim_data_path / "boardex_ssr_price_sample.csv")
     
     # atc_level controls therapeutic aggregation before matching.
-    if atc_level == 2:
-        df['atc3'] = df['atc3'].astype(str).str[:-1]
-    elif atc_level == 3:
+    if atc_level == 'atc1':
         df['atc3'] = df['atc3'].astype(str).apply(lambda x: 'Device' if x.startswith('Device') else x[0])
-    elif atc_level != 1:
-        raise ValueError("atc_level must be 1, 2, or 3")
+    elif atc_level == 'atc2':
+        df['atc3'] = df['atc3'].astype(str).str[:-1]
+    elif atc_level != 'atc3':
+        raise ValueError("atc_level must be 'atc1', 'atc2', or 'atc3'")
     
     # level defines time cell used for matching and uniqueness checks.
     if level == 'year':
@@ -128,11 +128,9 @@ def main():
     print(f"\nOutput directory: {output_dir}")
     
     for atc_level in atc_levels:
-        level_suffix = "" if atc_level == 1 else f"_level{atc_level}"
-
         for level in levels:
             result_df = process_data(level=level, atc_level=atc_level)
-            output_path = output_dir / f"atc3mapping_{level}_level{level_suffix}.csv"
+            output_path = output_dir / f"{atc_level}mapping_{level}.csv"
             result_df.to_csv(output_path, index=False)
             print(f"{level.capitalize()}-level data saved to: {output_path}")
 
