@@ -5,17 +5,17 @@ set trace off
 // ================================================================
 // Purpose:
 // Estimate stacked DDD specifications that compare post-event outcome
-// changes for treated products with and without ATC3 sharing, and report
+// changes for treated products with and without ATC sharing, and report
 // the corresponding did_imputation heterogeneity contrast as a check.
 //
 // Design:
 // - Build stacked cohort-specific samples for each event/control/event_type
 //   combination, then estimate Y = beta0 * (Treat x Post)
-//                        + beta1 * (Treat x Post x ATC3-sharing) + FE.
+//                        + beta1 * (Treat x Post x ATC-sharing) + FE.
 // - beta0 is the post-event treatment effect for treated products without
-//   ATC3 sharing; beta1 is the additional effect for sharing products; and
+//   ATC sharing; beta1 is the additional effect for sharing products; and
 //   beta0 + beta1 is the total effect for sharing products.
-// - did_imputation with hetby(atc3_sharing_het) provides an alternative
+// - did_imputation with hetby(atc_sharing_het) provides an alternative
 //   staggered-adoption estimator, where tau_1 - tau_0 summarizes the gap
 //   between sharing and non-sharing treatment effects.
 //
@@ -29,14 +29,14 @@ set trace off
 //   from extreme normalized trajectories.
 //
 // Output:
-// - logs/ddd_atc3sharing_fe*/
-// - tex/ddd_atc3sharing_fe*/
-// - csv/ddd_atc3sharing_fe*/
+// - logs/ddd_atcsharing_{atc}_fe*/
+// - tex/ddd_atcsharing_{atc}_fe*/
+// - csv/ddd_atcsharing_{atc}_fe*/
 // ================================================================
 
 * ================= user config =================
-local atc_level 3
-* 1 2 3
+local atcs atc3 atc2
+* atc3 atc2
 local outlier_treatment "winsorize"
 * trim winsorize none
 local outlier_treatment_percentile "p95"
@@ -48,13 +48,6 @@ local parent_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
 local project_path = regexr("`parent_path'", "[/\\][^/\\]+$", "")
 local project_path = subinstr("`project_path'", "\", "/", .)
 
-local level_suffix ""
-if `atc_level' != 1 {
-    local level_suffix "_level`atc_level'"
-}
-
-local data_root "`project_path'/data/cohort_data_with_atc3sharing`level_suffix'"
-local output_tag_base "ddd_atc3sharing`level_suffix'"
 local panel_levels quarter
 
 cap mkdir "`project_path'/logs"
@@ -71,14 +64,14 @@ local standardize_types log_transform
 * log_transform standardize normalize
 local event_types event
 * first_event
-local reqs 1
-* 1 2
-local control_for_other_events none
-* none pulse history
+local reqs 1 2
+* 0 1 2
+local control_for_other_events none other_event
+* none other_event
 local control_kappas kappa_asy kappa_norm
 * none kappa_asy kappa_norm
-local control_atc3s separate interaction
-* none separate interaction
+local control_atcs separate
+* separate
 local req2_control_variations all
 * all stable changing stable_interlock stable_no_interlock
 local treatment_groups A B
@@ -86,6 +79,15 @@ local include_eventpair_values 0
 * 1
 local fe_levels 1
 * 1 2
+
+foreach atc of local atcs {
+    if !inlist("`atc'", "atc2", "atc3") {
+        di as error "atc must be one of: atc2, atc3"
+        exit 198
+    }
+
+    local data_root "`project_path'/data/cohort_data_with_atcsharing_`atc'"
+    local output_tag_base "ddd_atcsharing_`atc'"
 
 foreach panel_level of local panel_levels {
     foreach treatment_group of local treatment_groups {
@@ -150,7 +152,7 @@ foreach panel_level of local panel_levels {
                                 foreach req of local reqs {
                                     foreach c_var of local control_for_other_events {
                                         foreach control_kappa of local control_kappas {
-                                            foreach control_atc3 of local control_atc3s {
+                                            foreach control_atc of local control_atcs {
                                     
                                 * -------- determine quarter cohort list --------
                                 local cohort_list ""
@@ -170,16 +172,11 @@ foreach panel_level of local panel_levels {
                                     exit 198
                                 }
 
-                                if !inlist(`atc_level', 2, 3) {
-                                    di as error "Unsupported atc_level for this cohort logic: atc_level=`atc_level'"
-                                    exit 198
-                                }
-
                                 if inlist("`req'", "0", "1") {
                                     local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
                                 }
                                 else if "`req'" == "2" {
-                                    if `atc_level' == 2 & "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
+                                    if "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
                                         local cohort_list ""
                                     }
                                     else if "`treatment_group'" == "A" {
@@ -188,9 +185,6 @@ foreach panel_level of local panel_levels {
                                         }
                                         else if "`event'" == "to_B_not_in_A" {
                                             local cohort_list 2009 2010 2012 2014 2015 2016 2017 2018
-                                        }
-                                        else if "`event'" == "to_B_still_in_A" {
-                                            local cohort_list 2009 2010 2011 2012 2013 2015 2017
                                         }
                                     }
                                     else if "`treatment_group'" == "B" {
@@ -208,6 +202,39 @@ foreach panel_level of local panel_levels {
 
                                 if "`cohort_list'" == "" {
                                     continue
+                                }
+
+                                local other_event_list ""
+                                if "`c_var'" == "other_event" {
+                                    if "`event'" == "to_B_not_in_A" {
+                                        if inlist("`req'", "0", "1") {
+                                            local other_event_list "other_event_still other_event_dissolution"
+                                        }
+                                    }
+                                    else if "`event'" == "to_B_still_in_A" {
+                                        if inlist("`req'", "0", "1") {
+                                            local other_event_list "other_event_not other_event_dissolution"
+                                        }
+                                        else if "`req'" == "2" {
+                                            local other_event_list "other_event_not"
+                                        }
+                                    }
+                                    else if "`event'" == "interlock_dissolution" {
+                                        if inlist("`req'", "0", "1") {
+                                            local other_event_list "other_event_not other_event_still"
+                                        }
+                                        else if "`req'" == "2" {
+                                            local other_event_list "other_event_not"
+                                        }
+                                    }
+
+                                    if "`other_event_list'" == "" {
+                                        continue
+                                    }
+                                }
+                                else if "`c_var'" != "none" {
+                                    di as error "control_for_other_events must be one of: none, other_event"
+                                    exit 198
                                 }
 
                                 if "`control'" == "notyet" {
@@ -255,8 +282,8 @@ foreach panel_level of local panel_levels {
                                 if "`control_kappa'" != "none" {
                                     local kappa_tag "_kappa_`control_kappa'"
                                 }
-                                local atc3_tag "_atc3_`control_atc3'"
-                                local file_stub "`event_type'_`control_fname'_`std'`control_var_tag'`kappa_tag'`atc3_tag'"
+                                local atc_tag "_atc_`control_atc'"
+                                local file_stub "`event_type'_`control_fname'_`std'`control_var_tag'`kappa_tag'`atc_tag'"
 
                                 cap mkdir "`fe_log_root'/`panel_group_folder'/`event'/req`req'"
                                 cap mkdir "`fe_tex_root'/`panel_group_folder'/`event'/req`req'"
@@ -285,7 +312,8 @@ foreach panel_level of local panel_levels {
                                     str20 model ///
                                     str15 control_var ///
                                     str15 control_kappa ///
-                                    str15 control_atc3 ///
+                                    str15 atc ///
+                                    str15 control_atc ///
                                     double beta0 beta0_se beta0_p ///
                                     double beta1 beta1_se beta1_p ///
                                     double te_share te_share_se te_share_p ///
@@ -301,7 +329,7 @@ foreach panel_level of local panel_levels {
                                     local first 1
 
                                     foreach cohort of local cohort_list {
-                                        local data_file "`data_path'/`event_type'/req`req'/`control_folder'/`event'_`panel_level'_cohort_`cohort'`suffix'_balanced.csv"
+                                        local data_file "`data_path'/`event_type'/req`req'/`control_folder'/`event'_`panel_level'_cohort_`cohort'`suffix'_balanced_`atc'.csv"
 
                                         import delimited "`data_file'", clear
                                         gen target_raw = `target'
@@ -414,8 +442,8 @@ foreach panel_level of local panel_levels {
                                     gen treat = treated_in_stack
                                     gen post = q_time >= yq(data_cohort, 1)
                                     gen did = treat * post
-                                    * g marks the heterogeneity dimension of interest: ATC3 sharing status among treated units.
-                                    gen g = atc3_sharing if treat == 1
+                                    * g marks the heterogeneity dimension of interest: ATC sharing status among treated units.
+                                    gen g = atc_sharing if treat == 1
                                     replace g = 0 if missing(g)
                                     * did_g is the DDD interaction. Its coefficient is the incremental treatment effect for sharing products relative to non-sharing ones.
                                     gen did_g = did * g
@@ -427,34 +455,34 @@ foreach panel_level of local panel_levels {
                                     local basesd_share = .
 
                                     if "`std'" == "standardize" {
-                                        quietly summarize target_raw if treat == 1 & atc3_sharing == 0 & pre_period == 1
+                                        quietly summarize target_raw if treat == 1 & atc_sharing == 0 & pre_period == 1
                                         local premean_notshare = r(mean)
                                         local basesd_notshare = r(sd)
 
-                                        quietly summarize target_raw if treat == 1 & atc3_sharing == 1 & pre_period == 1
+                                        quietly summarize target_raw if treat == 1 & atc_sharing == 1 & pre_period == 1
                                         local premean_share = r(mean)
                                         local basesd_share = r(sd)
                                     }
                                     else {
-                                        quietly summarize `target' if treat == 1 & atc3_sharing == 0 & pre_period == 1, meanonly
+                                        quietly summarize `target' if treat == 1 & atc_sharing == 0 & pre_period == 1, meanonly
                                         local premean_notshare = r(mean)
-                                        quietly summarize `target' if treat == 1 & atc3_sharing == 1 & pre_period == 1, meanonly
+                                        quietly summarize `target' if treat == 1 & atc_sharing == 1 & pre_period == 1, meanonly
                                         local premean_share = r(mean)
                                     }
 
-                                    quietly count if treat == 1 & atc3_sharing == 0
+                                    quietly count if treat == 1 & atc_sharing == 0
                                     local N_notshare = r(N)
-                                    quietly count if treat == 1 & atc3_sharing == 1
+                                    quietly count if treat == 1 & atc_sharing == 1
                                     local N_share = r(N)
                                     quietly count if treat == 0
                                     local N_control = r(N)
 
-                                    egen tag_id_notshare = tag(id) if treat == 1 & atc3_sharing == 0
+                                    egen tag_id_notshare = tag(id) if treat == 1 & atc_sharing == 0
                                     quietly count if tag_id_notshare == 1
                                     local product_notshare = r(N)
                                     drop tag_id_notshare
 
-                                    egen tag_id_share = tag(id) if treat == 1 & atc3_sharing == 1
+                                    egen tag_id_share = tag(id) if treat == 1 & atc_sharing == 1
                                     quietly count if tag_id_share == 1
                                     local product_share = r(N)
                                     drop tag_id_share
@@ -465,12 +493,12 @@ foreach panel_level of local panel_levels {
                                     drop tag_id_control
 
                                     * Also calculate unique boardnames
-                                    egen tag_board_notshare = tag(boardname) if treat == 1 & atc3_sharing == 0
+                                    egen tag_board_notshare = tag(boardname) if treat == 1 & atc_sharing == 0
                                     quietly count if tag_board_notshare == 1
                                     local board_notshare = r(N)
                                     drop tag_board_notshare
 
-                                    egen tag_board_share = tag(boardname) if treat == 1 & atc3_sharing == 1
+                                    egen tag_board_share = tag(boardname) if treat == 1 & atc_sharing == 1
                                     quietly count if tag_board_share == 1
                                     local board_share = r(N)
                                     drop tag_board_share
@@ -481,47 +509,33 @@ foreach panel_level of local panel_levels {
                                     drop tag_board_control
 
                                     gen event_cohort_did_imputation = yq(event_cohort, 1) if !missing(event_cohort)
-                                    gen atc3_sharing_het = atc3_sharing if treat == 1
-                                    replace atc3_sharing_het = 0 if treat == 0
+                                    gen atc_sharing_het = atc_sharing if treat == 1
+                                    replace atc_sharing_het = 0 if treat == 0
                                     
                                     egen cohort_q_time_fe = group(data_cohort q_time)
-                                    cap egen atc3_id = group(atc3)
-
-                                    local cv_list ""
-                                    if "`c_var'" == "pulse" | "`c_var'" == "history" {
-                                        if "`event'" == "to_B_not_in_A" {
-                                            if inlist("`req'", "0", "1", "2") {
-                                                local cv_list "event_still_`c_var' event_dissolution_`c_var'"
-                                            }
-                                        }
-                                        else if "`event'" == "to_B_still_in_A" {
-                                            if inlist("`req'", "0", "1") {
-                                                local cv_list "event_not_`c_var' event_dissolution_`c_var'"
-                                            }
-                                            else if "`req'" == "2" {
-                                                local cv_list "event_not_`c_var'"
-                                            }
-                                        }
-                                        else if "`event'" == "interlock_dissolution" {
-                                            if inlist("`req'", "0", "1") {
-                                                local cv_list "event_not_`c_var' event_still_`c_var'"
-                                            }
-                                            else if "`req'" == "2" {
-                                                local cv_list "event_not_`c_var'"
-                                            }
-                                        }
+                                    capture confirm variable `atc'
+                                    if _rc {
+                                        di as error "Missing ATC variable: `atc'"
+                                        exit 111
                                     }
-                                    
+                                    egen atc_id = group(`atc')
+
                                     local final_cv_list ""
-                                    foreach cv of local cv_list {
-                                        cap confirm variable `cv'
+                                    foreach other_event of local other_event_list {
+                                        capture confirm variable `other_event'
                                         if _rc {
-                                            di as error "Missing other-event control variable: `cv'"
+                                            di as error "Missing other-event control variable: `other_event'"
                                             exit 111
                                         }
-                                        quietly summarize `cv', meanonly
+
+                                        tempvar first_other_q
+                                        bysort boardname data_cohort: egen `first_other_q' = min(cond(`other_event' == 1, q_time, .))
+                                        gen `other_event'_history = !missing(`first_other_q') & q_time >= `first_other_q'
+                                        drop `first_other_q'
+
+                                        quietly summarize `other_event'_history, meanonly
                                         if r(max) > 0 {
-                                            local final_cv_list "`final_cv_list' `cv'"
+                                            local final_cv_list "`final_cv_list' `other_event'_history"
                                         }
                                     }
 
@@ -544,8 +558,8 @@ foreach panel_level of local panel_levels {
                                         exit 198
                                     }
 
-                                    if !inlist("`control_atc3'", "none", "separate", "interaction") {
-                                        di as error "control_atc3 must be one of: none, separate, interaction"
+                                    if !inlist("`control_atc'", "separate") {
+                                        di as error "control_atc must be: separate"
                                         exit 198
                                     }
 
@@ -556,22 +570,8 @@ foreach panel_level of local panel_levels {
                                         local did_controls "controls(`kappa_control_var')"
                                     }
 
-                                    if "`control_atc3'" == "separate" {
-                                        local fe_spec "`fe_spec' atc3_id"
-                                    }
-                                    else if "`control_atc3'" == "interaction" {
-                                        if "`control_kappa'" == "none" {
-                                            di as error "control_atc3=interaction requires control_kappa != none"
-                                            exit 198
-                                        }
-                                        local reghdfe_controls "i.atc3_id#c.`kappa_control_var'"
-                                        local atc3_kappa_controls ""
-                                        levelsof atc3_id if !missing(atc3_id), local(atc3_levels)
-                                        foreach atc3_level of local atc3_levels {
-                                            gen atc3_`atc3_level'_`kappa_control_var' = (atc3_id == `atc3_level') * `kappa_control_var'
-                                            local atc3_kappa_controls "`atc3_kappa_controls' atc3_`atc3_level'_`kappa_control_var'"
-                                        }
-                                        local did_controls "controls(`atc3_kappa_controls')"
+                                    if "`control_atc'" == "separate" {
+                                        local fe_spec "`fe_spec' atc_id"
                                     }
 
                                     reghdfe `target' did did_g `reghdfe_controls', absorb(`fe_spec')
@@ -618,7 +618,7 @@ foreach panel_level of local panel_levels {
                                     * tau_1 - tau_0 is the heterogeneity contrast between sharing and non-sharing treated products under that estimator.
                                     did_imputation `target' id q_time event_cohort_did_imputation, ///
                                         fe(`fe_spec') ///
-                                        hetby(atc3_sharing_het) ///
+                                        hetby(atc_sharing_het) ///
                                         autosample tol(0.1) `did_controls'
 
                                     local N_obs_didimp = e(N)
@@ -639,7 +639,8 @@ foreach panel_level of local panel_levels {
                                         ("reghdfe") ///
                                         ("`c_var'") ///
                                         ("`control_kappa'") ///
-                                        ("`control_atc3'") ///
+                                        ("`atc'") ///
+                                        ("`control_atc'") ///
                                         (`beta0') (`beta0_se') (`beta0_p') ///
                                         (`beta1') (`beta1_se') (`beta1_p') ///
                                         (`te_share') (`te_share_se') (`te_share_p') ///
@@ -661,7 +662,8 @@ foreach panel_level of local panel_levels {
                                         ("did_imputation") ///
                                         ("`c_var'") ///
                                         ("`control_kappa'") ///
-                                        ("`control_atc3'") ///
+                                        ("`atc'") ///
+                                        ("`control_atc'") ///
                                         (.) (.) (.) ///
                                         (.) (.) (.) ///
                                         (.) (.) (.) ///
@@ -764,7 +766,7 @@ foreach panel_level of local panel_levels {
                                             "did-imputation p-value" ///
                                         ) ///
                                     ) ///
-                                    title("DDD: `event', `event_type', `control_title', `std' | `group_label' | FE `fe_level' | kappa=`control_kappa' | atc3=`control_atc3'")
+                                    title("DDD: `event', `event_type', `control_title', `std' | `group_label' | FE `fe_level' | kappa=`control_kappa' | atc=`atc' | control_atc=`control_atc'")
 
                                 tempname fhin fhout
                                 file open `fhin' using "`tex_fragment'", read text
@@ -795,6 +797,7 @@ foreach panel_level of local panel_levels {
             }
         }
     }
+}
 }
 }
 clear all
