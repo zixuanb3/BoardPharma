@@ -4,28 +4,35 @@ set trace off
 
 // ================================================================
 // Purpose:
-// Run stacked event-study estimation using did_imputation only,
-// and overlay sharingatc=0 and sharingatc=1 dynamic effects.
+// Run stacked did_imputation event-study regressions for ATC-sharing
+// heterogeneity in movement-event cohorts.
 //
-// Mode:
-// - separate = 0: one did_imputation with hetby(atc_sharing);
-//                 pretrends are common, so only one pretrend series is plotted.
-// - separate = 1: split treated units by sharingatc, combine each treated
-//                 subgroup with the common control group, and run two separate
-//                 did_imputation regressions; pretrends differ by subgroup.
-// - normalize branch: after normalization, compute within-group max/min ratio
-//                     for each (boardname, product, data_cohort) group,
-//                     then drop the top 5% groups by this ratio in full sample.
+// Process:
+// 1. Loop over ATC level, treatment group, event type, requirement level,
+//    control definition, target outcome, transformation, and fixed-effect setup.
+// 2. Import balanced cohort CSVs with ATC-sharing labels and stack cohorts.
+// 3. Apply the configured outcome transformation and optional controls.
+// 4. Estimate did_imputation either with hetby(atc_sharing) or with separate
+//    sharing/non-sharing samples.
+// 5. Export coefficient CSVs, logs, and overlaid dynamic-effect figures.
+//
+// Input:
+// - data/cohort_data_with_atcsharing_{atc}/quarter-level_{group}/event/req*/.../*.csv
+// - data/cohort_data_with_atcsharing_{atc}/quarter-level_{group}_large_sample_{definition}/event/req*/.../*_large_sample_{definition}_*.csv when large_sample == 1
+// - data/kappa/ssr_kappa_firm_level_v5.csv when kappa controls are enabled
 //
 // Output:
-// - figures/did_imputation_event_study_sharingatc_{atc}/
-// - csv/did_imputation_event_study_sharingatc_{atc}/
-// - logs/did_imputation_event_study_sharingatc_{atc}/
+// - figures/did_imputation_event_study_sharingatc_{atc}*/quarter-level_*/.../*.png
+// - csv/did_imputation_event_study_sharingatc_{atc}*/quarter-level_*/.../*.csv
+// - logs/did_imputation_event_study_sharingatc_{atc}*/quarter-level_*/.../*.log
 // ================================================================
 
 * ================= user config =================
 local atcs atc3 atc2
 * atc3 atc2
+local large_sample 1
+local personnel_definition broad
+* narrow medium broad
 local separate_modes 0
 * 1
 local outlier_treatment "winsorize"
@@ -42,6 +49,7 @@ local project_path = subinstr("`project_path'", "\", "/", .)
 cap mkdir "`project_path'/figures"
 cap mkdir "`project_path'/csv"
 cap mkdir "`project_path'/logs"
+local failure_log_path "`project_path'/logs/did_imputation_event_study_failure.log"
 
 local events interlock_dissolution to_B_still_in_A to_B_not_in_A
 *direct_interlock indirect_interlock to_B_still_in_A to_B_not_in_A
@@ -53,11 +61,11 @@ local standardize_types log_transform
 * log_transform standardize normalize
 local event_types event
 * first_event
-local reqs 1
+local reqs 0 1 2
 * 0 1 2
-local control_for_other_events none other_event
+local control_for_other_events other_event
 * none other_event
-local control_kappas none
+local control_kappas kappa_asy
 * none kappa_asy kappa_norm
 local control_atcs separate
 * separate
@@ -82,6 +90,19 @@ local did_pretrend 3
 local timevar q_time
 local gvar event_cohort_q
 
+if !inlist(`large_sample', 0, 1) {
+    di as error "large_sample must be 0 or 1"
+    exit 198
+}
+if `large_sample' == 1 & !inlist("`personnel_definition'", "narrow", "medium", "broad") {
+    di as error "personnel_definition must be one of: narrow, medium, broad"
+    exit 198
+}
+local movement_suffix ""
+if `large_sample' == 1 {
+    local movement_suffix "_large_sample_`personnel_definition'"
+}
+
 * ================= loop =================
 foreach atc of local atcs {
     if !inlist("`atc'", "atc2", "atc3") {
@@ -90,7 +111,7 @@ foreach atc of local atcs {
     }
 
     local data_root "`project_path'/data/cohort_data_with_atcsharing_`atc'"
-    local output_tag_base "did_imputation_event_study_sharingatc_`atc'"
+    local output_tag_base "did_imputation_event_study_sharingatc_`atc'`movement_suffix'"
 
 foreach treatment_group of local treatment_groups {
     local treatment_group = upper("`treatment_group'")
@@ -116,7 +137,7 @@ foreach treatment_group of local treatment_groups {
         }
 
         local group_label "`treatment_group'_`relation'_`counterpart'"
-        local panel_group_folder "quarter-level_`group_label'"
+        local panel_group_folder "quarter-level_`group_label'`movement_suffix'"
         local data_path "`data_root'/`panel_group_folder'"
 
         foreach fe_level of local fe_levels {
@@ -173,30 +194,95 @@ foreach treatment_group of local treatment_groups {
                                     exit 198
                                 }
 
-                                if inlist("`req'", "0", "1") {
-                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                if `large_sample' == 0 {
+                                    if inlist("`req'", "0", "1") {
+                                        local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                    }
+                                    else if "`req'" == "2" {
+                                        if "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
+                                            local cohort_list ""
+                                        }
+                                        else if "`treatment_group'" == "A" {
+                                            if "`event'" == "interlock_dissolution" {
+                                                local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`event'" == "to_B_not_in_A" {
+                                                local cohort_list 2009 2010 2012 2014 2015 2016 2017 2018
+                                            }
+                                        }
+                                        else if "`treatment_group'" == "B" {
+                                            if "`event'" == "interlock_dissolution" {
+                                                local cohort_list 2010 2011 2012 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`event'" == "to_B_not_in_A" {
+                                                local cohort_list 2012 2015 2017 2018
+                                            }
+                                            else if "`event'" == "to_B_still_in_A" {
+                                                local cohort_list 2009 2010 2012 2013 2015 2016 2017 2018
+                                            }
+                                        }
+                                    }
                                 }
-                                else if "`req'" == "2" {
-                                    if "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
-                                        local cohort_list ""
+                                else {
+                                    if "`req'" == "0" {
+                                        local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
                                     }
-                                    else if "`treatment_group'" == "A" {
-                                        if "`event'" == "interlock_dissolution" {
-                                            local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
-                                        }
-                                        else if "`event'" == "to_B_not_in_A" {
-                                            local cohort_list 2009 2010 2012 2014 2015 2016 2017 2018
+                                    else if "`req'" == "1" {
+                                        local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                        if "`personnel_definition'" == "narrow" & "`event'" == "to_B_not_in_A" {
+                                            local cohort_list 2009 2010 2012 2013 2014 2015 2016 2017 2018
                                         }
                                     }
-                                    else if "`treatment_group'" == "B" {
+                                    else if "`req'" == "2" {
                                         if "`event'" == "interlock_dissolution" {
-                                            local cohort_list 2010 2011 2012 2014 2015 2016 2017 2018
+                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                            if "`treatment_group'" == "B" & "`personnel_definition'" == "narrow" {
+                                                local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
+                                            }
                                         }
-                                        else if "`event'" == "to_B_not_in_A" {
-                                            local cohort_list 2012 2015 2017 2018
+                                        else if "`treatment_group'" == "A" & "`event'" == "to_B_not_in_A" {
+                                            if "`personnel_definition'" == "broad" {
+                                                local cohort_list 2012 2017
+                                            }
+                                            else if "`personnel_definition'" == "medium" {
+                                                local cohort_list 2012 2014 2017
+                                            }
+                                            else if "`personnel_definition'" == "narrow" {
+                                                local cohort_list 2010 2012 2013 2014 2016 2017
+                                            }
                                         }
-                                        else if "`event'" == "to_B_still_in_A" {
-                                            local cohort_list 2009 2010 2012 2013 2015 2016 2017 2018
+                                        else if "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
+                                            if "`atc'" == "atc3" {
+                                                local cohort_list ""
+                                            }
+                                            else if "`personnel_definition'" == "broad" {
+                                                local cohort_list 2010 2011 2012 2013 2014 2016 2017 2018
+                                            }
+                                            else if "`personnel_definition'" == "medium" {
+                                                local cohort_list 2009 2010 2011 2012 2013 2014 2016 2017 2018
+                                            }
+                                            else if "`personnel_definition'" == "narrow" {
+                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017
+                                            }
+                                        }
+                                        else if "`treatment_group'" == "B" & "`event'" == "to_B_not_in_A" {
+                                            if "`personnel_definition'" == "broad" {
+                                                local cohort_list 2010 2016
+                                            }
+                                            else if "`personnel_definition'" == "medium" {
+                                                local cohort_list 2010 2011 2014 2016
+                                            }
+                                            else if "`personnel_definition'" == "narrow" {
+                                                local cohort_list 2010 2012 2015 2016
+                                            }
+                                        }
+                                        else if "`treatment_group'" == "B" & "`event'" == "to_B_still_in_A" {
+                                            if inlist("`personnel_definition'", "broad", "medium") {
+                                                local cohort_list 2010 2012 2016 2017 2018
+                                            }
+                                            else if "`personnel_definition'" == "narrow" {
+                                                local cohort_list 2010 2012 2015 2016 2017 2018
+                                            }
                                         }
                                     }
                                 }
@@ -300,16 +386,33 @@ foreach treatment_group of local treatment_groups {
                                 cap mkdir "`event_csv_path'"
                                 cap mkdir "`event_log_path'"
 
+                                local std_tag "`std'"
+                                if "`std'" == "log_transform" {
+                                    local std_tag "log"
+                                }
+                                else if "`std'" == "standardize" {
+                                    local std_tag "std"
+                                }
+                                else if "`std'" == "normalize" {
+                                    local std_tag "norm"
+                                }
+                                local mode_file_tag "h"
+                                if "`mode_tag'" == "separate" {
+                                    local mode_file_tag "s"
+                                }
                                 local control_var_tag ""
                                 if "`c_var'" != "none" {
-                                    local control_var_tag "_cv_`c_var'"
+                                    local control_var_tag "_oe"
                                 }
                                 local kappa_tag ""
-                                if "`control_kappa'" != "none" {
-                                    local kappa_tag "_kappa_`control_kappa'"
+                                if "`control_kappa'" == "kappa_asy" {
+                                    local kappa_tag "_ka"
                                 }
-                                local atc_tag "_atc_`control_atc'"
-                                local file_stub "`event_type'_`control_fname'_`std'_`mode_tag'`control_var_tag'`kappa_tag'`atc_tag'"
+                                else if "`control_kappa'" == "kappa_norm" {
+                                    local kappa_tag "_kn"
+                                }
+                                local atc_tag "_atc`control_atc'"
+                                local file_stub "`event_type'_`control_fname'_`std_tag'_`mode_file_tag'`control_var_tag'`kappa_tag'`atc_tag'"
 
                                 cap log close
                                 log using "`event_log_path'/`file_stub'.log", text replace
@@ -317,7 +420,7 @@ foreach treatment_group of local treatment_groups {
                                 local first = 1
 
                                 foreach cohort of local cohort_list {
-                                    local data_file "`data_path'/`event_type'/req`req'/`control_folder'/`event'_quarter_cohort_`cohort'`suffix'_balanced_`atc'.csv"
+                                    local data_file "`data_path'/`event_type'/req`req'/`control_folder'/`event'_quarter_cohort_`cohort'`suffix'_balanced`movement_suffix'_`atc'.csv"
 
                                     import delimited "`data_file'", clear
                                     
@@ -534,6 +637,7 @@ foreach treatment_group of local treatment_groups {
                                     matrix colnames did2_V_s`sval' = `coef_names'
                                     matrix rownames did2_V_s`sval' = `coef_names'
                                 }
+                                local spec_failed 0
 
                                 * ============================================================
                                 * 1. separate = 0: one did_imputation with hetby
@@ -542,7 +646,54 @@ foreach treatment_group of local treatment_groups {
                                     gen atc_sharing_het = atc_sharing if treated == 1
                                     replace atc_sharing_het = 0 if treated == 0
 
-                                    did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') hetby(atc_sharing_het) autosample tol(0.1) minn(0) `did_controls'
+                                    capture noisily did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') hetby(atc_sharing_het) autosample tol(0.1) minn(0) `did_controls'
+                                    local did_rc = _rc
+                                    if `did_rc' != 0 {
+                                        local spec_failed 1
+                                        local failure_reason "did_imputation failed in hetby mode: r(`did_rc')"
+                                        capture confirm file "`failure_log_path'"
+                                        if _rc {
+                                            file open failure_log using "`failure_log_path'", write text replace
+                                        }
+                                        else {
+                                            file open failure_log using "`failure_log_path'", write text append
+                                        }
+                                        file write failure_log "============================================================" _n
+                                        file write failure_log "`c(current_date)' `c(current_time)'" _n
+                                        file write failure_log "`failure_reason'" _n
+                                        file write failure_log "atc=`atc'" _n
+                                        file write failure_log "large_sample=`large_sample'" _n
+                                        file write failure_log "personnel_definition=`personnel_definition'" _n
+                                        file write failure_log "panel_group_folder=`panel_group_folder'" _n
+                                        file write failure_log "event=`event'" _n
+                                        file write failure_log "req=`req'" _n
+                                        file write failure_log "control_variation=`control_variation_title'" _n
+                                        file write failure_log "target=`target'" _n
+                                        file write failure_log "event_type=`event_type'" _n
+                                        file write failure_log "control=`control_fname'" _n
+                                        file write failure_log "standardize=`std'" _n
+                                        file write failure_log "mode=`mode_tag'" _n
+                                        file write failure_log "control_for_other_events=`c_var'" _n
+                                        file write failure_log "control_kappa=`control_kappa'" _n
+                                        file write failure_log "control_atc=`control_atc'" _n
+                                        file write failure_log "cohort_list=`cohort_list'" _n
+                                        file write failure_log "obs_control=`obs_control'" _n
+                                        file write failure_log "obs_treated0=`obs_treated0'" _n
+                                        file write failure_log "obs_treated1=`obs_treated1'" _n
+                                        file write failure_log "brd_control=`brd_control'" _n
+                                        file write failure_log "brd_treated0=`brd_treated0'" _n
+                                        file write failure_log "brd_treated1=`brd_treated1'" _n
+                                        file write failure_log "prd_control=`prd_control'" _n
+                                        file write failure_log "prd_treated0=`prd_treated0'" _n
+                                        file write failure_log "prd_treated1=`prd_treated1'" _n
+                                        file write failure_log "log_path=`event_log_path'/`file_stub'.log" _n
+                                        file close failure_log
+                                    }
+
+                                    if `spec_failed' == 1 {
+                                        log close
+                                        continue
+                                    }
 
                                     matrix did2_b_full = e(b)
                                     matrix did2_V_full = e(V)
@@ -582,11 +733,53 @@ foreach treatment_group of local treatment_groups {
                                                 matrix did2_b_s`sval'[1, `i'] = did2_b_full[1, `found_col']
                                             }
                                             else {
-                                                di as error "Coefficient not estimated in hetby mode: `coef_name' for sharingatc=`sval'"
-                                                exit 498
+                                                local spec_failed 1
+                                                local failure_reason "Coefficient not estimated in hetby mode: `coef_name' for sharingatc=`sval'"
+                                                di as error "`failure_reason'"
+                                                capture confirm file "`failure_log_path'"
+                                                if _rc {
+                                                    file open failure_log using "`failure_log_path'", write text replace
+                                                }
+                                                else {
+                                                    file open failure_log using "`failure_log_path'", write text append
+                                                }
+                                                file write failure_log "============================================================" _n
+                                                file write failure_log "`c(current_date)' `c(current_time)'" _n
+                                                file write failure_log "`failure_reason'" _n
+                                                file write failure_log "atc=`atc'" _n
+                                                file write failure_log "large_sample=`large_sample'" _n
+                                                file write failure_log "personnel_definition=`personnel_definition'" _n
+                                                file write failure_log "panel_group_folder=`panel_group_folder'" _n
+                                                file write failure_log "event=`event'" _n
+                                                file write failure_log "req=`req'" _n
+                                                file write failure_log "control_variation=`control_variation_title'" _n
+                                                file write failure_log "target=`target'" _n
+                                                file write failure_log "event_type=`event_type'" _n
+                                                file write failure_log "control=`control_fname'" _n
+                                                file write failure_log "standardize=`std'" _n
+                                                file write failure_log "mode=`mode_tag'" _n
+                                                file write failure_log "control_for_other_events=`c_var'" _n
+                                                file write failure_log "control_kappa=`control_kappa'" _n
+                                                file write failure_log "control_atc=`control_atc'" _n
+                                                file write failure_log "cohort_list=`cohort_list'" _n
+                                                file write failure_log "obs_control=`obs_control'" _n
+                                                file write failure_log "obs_treated0=`obs_treated0'" _n
+                                                file write failure_log "obs_treated1=`obs_treated1'" _n
+                                                file write failure_log "brd_control=`brd_control'" _n
+                                                file write failure_log "brd_treated0=`brd_treated0'" _n
+                                                file write failure_log "brd_treated1=`brd_treated1'" _n
+                                                file write failure_log "prd_control=`prd_control'" _n
+                                                file write failure_log "prd_treated0=`prd_treated0'" _n
+                                                file write failure_log "prd_treated1=`prd_treated1'" _n
+                                                file write failure_log "log_path=`event_log_path'/`file_stub'.log" _n
+                                                file close failure_log
+                                                continue, break
                                             }
                                         }
 
+                                        if `spec_failed' == 1 {
+                                            continue, break
+                                        }
                                         forvalues i = 1/`n_total' {
                                             local ci = el(`col_map', 1, `i')
                                             if `ci' == 0 {
@@ -603,13 +796,15 @@ foreach treatment_group of local treatment_groups {
                                     }
 
                                     * Common pretrends should be shown only once in the graph.
-                                    forvalues i = 1/`n_total' {
-                                        local coef_name : word `i' of `coef_names'
-                                        if substr("`coef_name'", 1, 4) == "pre_" {
-                                            matrix did2_b_s1[1, `i'] = .
-                                            forvalues j = 1/`n_total' {
-                                                matrix did2_V_s1[`i', `j'] = 0
-                                                matrix did2_V_s1[`j', `i'] = 0
+                                    if `spec_failed' == 0 {
+                                        forvalues i = 1/`n_total' {
+                                            local coef_name : word `i' of `coef_names'
+                                            if substr("`coef_name'", 1, 4) == "pre_" {
+                                                matrix did2_b_s1[1, `i'] = .
+                                                forvalues j = 1/`n_total' {
+                                                    matrix did2_V_s1[`i', `j'] = 0
+                                                    matrix did2_V_s1[`j', `i'] = 0
+                                                }
                                             }
                                         }
                                     }
@@ -623,7 +818,51 @@ foreach treatment_group of local treatment_groups {
                                         preserve
                                         drop if treated == 1 & atc_sharing != `sval'
 
-                                        did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') autosample tol(0.1) minn(0) `did_controls'
+                                        capture noisily did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') autosample tol(0.1) minn(0) `did_controls'
+                                        local did_rc = _rc
+                                        if `did_rc' != 0 {
+                                            local spec_failed 1
+                                            local failure_reason "did_imputation failed in separate mode for sharingatc=`sval': r(`did_rc')"
+                                            capture confirm file "`failure_log_path'"
+                                            if _rc {
+                                                file open failure_log using "`failure_log_path'", write text replace
+                                            }
+                                            else {
+                                                file open failure_log using "`failure_log_path'", write text append
+                                            }
+                                            file write failure_log "============================================================" _n
+                                            file write failure_log "`c(current_date)' `c(current_time)'" _n
+                                            file write failure_log "`failure_reason'" _n
+                                            file write failure_log "atc=`atc'" _n
+                                            file write failure_log "large_sample=`large_sample'" _n
+                                            file write failure_log "personnel_definition=`personnel_definition'" _n
+                                            file write failure_log "panel_group_folder=`panel_group_folder'" _n
+                                            file write failure_log "event=`event'" _n
+                                            file write failure_log "req=`req'" _n
+                                            file write failure_log "control_variation=`control_variation_title'" _n
+                                            file write failure_log "target=`target'" _n
+                                            file write failure_log "event_type=`event_type'" _n
+                                            file write failure_log "control=`control_fname'" _n
+                                            file write failure_log "standardize=`std'" _n
+                                            file write failure_log "mode=`mode_tag'" _n
+                                            file write failure_log "control_for_other_events=`c_var'" _n
+                                            file write failure_log "control_kappa=`control_kappa'" _n
+                                            file write failure_log "control_atc=`control_atc'" _n
+                                            file write failure_log "cohort_list=`cohort_list'" _n
+                                            file write failure_log "obs_control=`obs_control'" _n
+                                            file write failure_log "obs_treated0=`obs_treated0'" _n
+                                            file write failure_log "obs_treated1=`obs_treated1'" _n
+                                            file write failure_log "brd_control=`brd_control'" _n
+                                            file write failure_log "brd_treated0=`brd_treated0'" _n
+                                            file write failure_log "brd_treated1=`brd_treated1'" _n
+                                            file write failure_log "prd_control=`prd_control'" _n
+                                            file write failure_log "prd_treated0=`prd_treated0'" _n
+                                            file write failure_log "prd_treated1=`prd_treated1'" _n
+                                            file write failure_log "log_path=`event_log_path'/`file_stub'.log" _n
+                                            file close failure_log
+                                            restore
+                                            continue, break
+                                        }
 
 										matrix did2_b_full = e(b)
                                         matrix did2_V_full = e(V)
@@ -682,6 +921,11 @@ foreach treatment_group of local treatment_groups {
                                         }
                                         restore
                                     }
+                                }
+
+                                if `spec_failed' == 1 {
+                                    log close
+                                    continue
                                 }
 
                                 * -------- export regression results for re-plotting --------

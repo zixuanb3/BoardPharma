@@ -20,6 +20,7 @@ Process:
 
 Input:
 - InterimData/boardex_pharma.dta
+- InterimData/ssr_company_roster.csv when RUN_CONFIG["large_sample"] == 1
 - InterimData/boardex_ssr_price_sample.csv
 - InterimData/boardex_interlock_indirect_firmpair.dta
 - InterimData/boardex_interlock_direct_firmpair.dta
@@ -27,6 +28,8 @@ Input:
 Output:
 - data/event_tables/firm_interlock_panel.csv
 - data/event_tables/movement_event_candidates.csv
+- data/event_tables/firm_interlock_panel_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
+- data/event_tables/movement_event_candidates_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
 - data/event_tables/interlock_event_candidates.csv
 """
 
@@ -45,12 +48,11 @@ INTERIM_DATA_PATH = PROJECT_ROOT / "InterimData"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "event_tables"
 
 PHARMA_PATH = INTERIM_DATA_PATH / "boardex_pharma.dta"
+LARGE_SAMPLE_ROSTER_PATH = INTERIM_DATA_PATH / "ssr_company_roster.csv"
 SSR_SAMPLE_PATH = INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv"
 INDIRECT_INPUT_PATH = INTERIM_DATA_PATH / "boardex_interlock_indirect_firmpair.dta"
 DIRECT_INPUT_PATH = INTERIM_DATA_PATH / "boardex_interlock_direct_firmpair.dta"
 
-FIRM_INTERLOCK_EDGES_PATH = OUTPUT_DIR / "firm_interlock_panel.csv"
-MOVEMENT_CANDIDATES_PATH = OUTPUT_DIR / "movement_event_candidates.csv"
 INTERLOCK_CANDIDATES_PATH = OUTPUT_DIR / "interlock_event_candidates.csv"
 
 PairYearSet = set[tuple[str, str, int]]
@@ -61,6 +63,8 @@ CounterpartLookup = dict[tuple[str, int], set[str]]
 RUN_CONFIG = {
     "stay_x_years": 2,
     "requirement2_window": (-1, 1),
+    "large_sample": 1,
+    "personnel_definition": "broad",
 }
 # ===============================================================
 
@@ -89,11 +93,31 @@ def build_counterpart_lookup(
 class MovementEventBuilder:
     """Build director-movement events from in-SSR BoardEx membership histories."""
 
-    def __init__(self, input_path: Path, stay_x_years: int, requirement2_window: tuple[int, int]) -> None:
+    PERSONNEL_TIERS = {
+        "narrow": {"board"},
+        "medium": {"board", "csuite"},
+        "broad": {"board", "csuite", "vp_tech_hr"},
+    }
+
+    def __init__(
+        self,
+        input_path: Path,
+        stay_x_years: int,
+        requirement2_window: tuple[int, int],
+        large_sample: int = 0,
+        personnel_definition: str = "narrow",
+    ) -> None:
         """Store movement-event configuration and derive stay-window lengths."""
+        if large_sample not in {0, 1}:
+            raise ValueError("large_sample must be 0 or 1")
+        if large_sample == 1 and personnel_definition not in self.PERSONNEL_TIERS:
+            raise ValueError("personnel_definition must be one of: narrow, medium, broad")
+
         self.input_path = input_path
         self.stay_x_years = stay_x_years
         self.requirement2_window = requirement2_window
+        self.large_sample = large_sample
+        self.personnel_definition = personnel_definition
         self.stay_col = f"stay_{stay_x_years}_years"
 
         start_offset, end_offset = requirement2_window
@@ -102,11 +126,20 @@ class MovementEventBuilder:
 
     def build(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Return movement candidates and membership-derived firm-interlock edges."""
-        # 1) Load movement source universe from boardex_pharma.dta.
-        memberships = pd.read_stata(
-            self.input_path,
-            columns=["DirectorID", "year", "BoardName", "inSSR"],
-        )
+        # 1) Load movement source universe.
+        if self.large_sample == 1:
+            memberships = pd.read_csv(
+                self.input_path,
+                usecols=["DirectorID", "year", "BoardName", "inSSR", "leader_tier"],
+            )
+            memberships = memberships.loc[
+                memberships["leader_tier"].isin(self.PERSONNEL_TIERS[self.personnel_definition])
+            ].copy()
+        else:
+            memberships = pd.read_stata(
+                self.input_path,
+                columns=["DirectorID", "year", "BoardName", "inSSR"],
+            )
         memberships = memberships.dropna(subset=["DirectorID", "year", "BoardName"])
         # Movement events are defined only on directors' in-SSR board seats.
         memberships = memberships.loc[
@@ -481,15 +514,26 @@ def main() -> None:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Build and save movement-side raw tables first because they use boardex_pharma memberships.
+    # Build and save movement-side raw tables first.
+    large_sample = int(RUN_CONFIG["large_sample"])
+    personnel_definition = str(RUN_CONFIG["personnel_definition"])
+    movement_input_path = LARGE_SAMPLE_ROSTER_PATH if large_sample == 1 else PHARMA_PATH
+    movement_output_suffix = f"_large_sample_{personnel_definition}" if large_sample == 1 else ""
+    firm_interlock_edges_path = OUTPUT_DIR / f"firm_interlock_panel{movement_output_suffix}.csv"
+    movement_candidates_path = OUTPUT_DIR / f"movement_event_candidates{movement_output_suffix}.csv"
     movement_candidates, firm_interlock_edges = MovementEventBuilder(
-        input_path=PHARMA_PATH,
+        input_path=movement_input_path,
         stay_x_years=stay_x_years,
         requirement2_window=requirement2_window,
+        large_sample=large_sample,
+        personnel_definition=personnel_definition,
     ).build()
-    firm_interlock_edges.to_csv(FIRM_INTERLOCK_EDGES_PATH, index=False)
-    movement_candidates.to_csv(MOVEMENT_CANDIDATES_PATH, index=False)
+    firm_interlock_edges.to_csv(firm_interlock_edges_path, index=False)
+    movement_candidates.to_csv(movement_candidates_path, index=False)
+    print(f"Saved {len(firm_interlock_edges):,} rows to {firm_interlock_edges_path}")
+    print(f"Saved {len(movement_candidates):,} rows to {movement_candidates_path}")
 
+"""
     # Build and save one combined direct/indirect interlock raw table.
     interlock_candidates = InterlockEventBuilder(
         ssr_sample_path=SSR_SAMPLE_PATH,
@@ -503,10 +547,8 @@ def main() -> None:
     )
     interlock_candidates.to_csv(INTERLOCK_CANDIDATES_PATH, index=False)
 
-    print(f"Saved {len(firm_interlock_edges):,} rows to {FIRM_INTERLOCK_EDGES_PATH}")
-    print(f"Saved {len(movement_candidates):,} rows to {MOVEMENT_CANDIDATES_PATH}")
     print(f"Saved {len(interlock_candidates):,} rows to {INTERLOCK_CANDIDATES_PATH}")
-
+"""
 
 if __name__ == "__main__":
     main()

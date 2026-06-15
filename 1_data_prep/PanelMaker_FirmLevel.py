@@ -20,6 +20,7 @@ Process:
 Input:
 - InterimData/boardex_ssr_price_sample.csv
 - data/event_tables/movement_table.csv
+- data/event_tables/movement_table_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
 - data/event_tables/interlock_table.csv
 
 Provenance of the `revenue` variable in boardex_ssr_price_sample.csv:
@@ -37,6 +38,7 @@ So the `revenue` carried through every downstream panel here is SSR `avgnet`.
 Output:
 - data/year-level_{A|B}/ssr_firm_panel_*.csv
 - data/quarter-level_{A|B}/ssr_firm_panel_*.csv
+- movement output files add _large_sample_{definition} before .csv when RUN_CONFIG["large_sample"] == 1
 - data/year-level/ssr_firm_panel_*.csv
 - data/quarter-level/ssr_firm_panel_*.csv
 """
@@ -57,9 +59,9 @@ INTERIM_DATA_PATH = PROJECT_ROOT / "InterimData"
 OUTPUT_BASE_PATH = PROJECT_ROOT / "data"
 OUTPUT_BASE_PATH.mkdir(parents=True, exist_ok=True)
 EVENT_TABLE_DIR = OUTPUT_BASE_PATH / "event_tables"
-MOVEMENT_EVENT_TABLE_PATH = EVENT_TABLE_DIR / "movement_table.csv"
 INTERLOCK_EVENT_TABLE_PATH = EVENT_TABLE_DIR / "interlock_table.csv"
 
+PERSONNEL_DEFINITIONS = {"narrow", "medium", "broad"}
 MOVEMENT_EVENTS = {"to_B_still_in_A", "to_B_not_in_A", "interlock_dissolution"}
 INTERLOCK_EVENTS = {"direct_interlock", "indirect_interlock"}
 OUTPUT_STEM_OVERRIDES = {"interlock_dissolution": "interlock_dissolution_leave_B"}
@@ -88,23 +90,39 @@ EVENT_REQUIREMENTS = ("req0", "req1", "req2")
 # treatment_groups:
 # - "B": destination firm as treated group (legacy behavior)
 # - "A": origin firm as treated group
+#
+# large_sample/personnel_definition:
+# - affect movement event input and movement panel output filenames only
 RUN_CONFIG = {
     "event_types": [
         "to_B_not_in_A",
         "to_B_still_in_A",
         "interlock_dissolution",
-        "direct_interlock",
-        "indirect_interlock",
+        #"direct_interlock",
+        #"indirect_interlock",
     ],
     "panel_levels": ["quarter"],
     "stay_x_years": 2,
     "balance_window": (-1, 1),
     "treatment_groups": ["B","A"],
+    "large_sample": 1,
+    "personnel_definition": "broad",
 }
 # ===============================================================
 
 
 # ========================== DATA LOADERS ==========================
+
+
+def build_large_sample_suffix(large_sample: int, personnel_definition: str) -> str:
+    """Return movement file suffix for the configured sample definition."""
+    if large_sample not in {0, 1}:
+        raise ValueError("large_sample must be 0 or 1")
+    if large_sample == 0:
+        return ""
+    if personnel_definition not in PERSONNEL_DEFINITIONS:
+        raise ValueError("personnel_definition must be one of: narrow, medium, broad")
+    return f"_large_sample_{personnel_definition}"
 
 
 @lru_cache(maxsize=None)
@@ -130,12 +148,12 @@ def load_ssr_panel(panel_level: str) -> pd.DataFrame:
 
 
 @lru_cache(maxsize=None)
-def load_event_table(table_type: str) -> pd.DataFrame:
+def load_event_table(table_type: str, movement_suffix: str = "") -> pd.DataFrame:
     """
     Load a standardized firm-side event eligibility table.
     """
     if table_type == "movement":
-        path = MOVEMENT_EVENT_TABLE_PATH
+        path = EVENT_TABLE_DIR / f"movement_table{movement_suffix}.csv"
         required_columns = {"BoardName", "year", "event_type", "firm_type", *EVENT_REQUIREMENTS}
     elif table_type == "interlock":
         path = INTERLOCK_EVENT_TABLE_PATH
@@ -172,6 +190,8 @@ class EventStudyPanelSSR:
         stay_x_years: int = 3,
         balance_window: tuple[int, int] = (-4, 3),
         treatment_group: str = "B",
+        large_sample: int = 0,
+        personnel_definition: str = "narrow",
     ):
         self.event_type = event_type
         self.panel_level = panel_level.lower()
@@ -179,6 +199,7 @@ class EventStudyPanelSSR:
         self.stay_col = f"stay_{stay_x_years}_years"
         self.balance_window = balance_window
         self.treatment_group = treatment_group.upper()
+        self.movement_suffix = build_large_sample_suffix(large_sample, personnel_definition)
 
         if self.stay_x_years < 1:
             raise ValueError("stay_x_years must be >= 1")
@@ -201,7 +222,7 @@ class EventStudyPanelSSR:
             raise ValueError(f"Unsupported requirement level: {requirement_level}")
 
         if self.event_type in MOVEMENT_EVENTS:
-            event_table = load_event_table("movement").copy()
+            event_table = load_event_table("movement", self.movement_suffix).copy()
             event_table = event_table.loc[
                 event_table["event_type"].eq(self.event_type)
                 & event_table["firm_type"].eq(self.treatment_group)
@@ -376,10 +397,11 @@ class EventStudyPanelSSR:
         output_path.mkdir(parents=True, exist_ok=True)
 
         output_stem = OUTPUT_STEM_OVERRIDES.get(self.event_type, self.event_type)
+        movement_suffix = self.movement_suffix if self.event_type in MOVEMENT_EVENTS else ""
         for requirement_level in EVENT_REQUIREMENTS:
             panel = self._build_event_panel(requirement_level)
             panel.to_csv(
-                output_path / f"ssr_firm_panel_{output_stem}_{requirement_level}.csv",
+                output_path / f"ssr_firm_panel_{output_stem}_{requirement_level}{movement_suffix}.csv",
                 index=False,
             )
         return pd.DataFrame()
@@ -397,6 +419,8 @@ def main() -> None:
     stay_req = int(RUN_CONFIG["stay_x_years"])
     balance_window = tuple(RUN_CONFIG["balance_window"])
     treatment_groups = [str(x).upper() for x in ensure_list(RUN_CONFIG.get("treatment_groups", ["B"]))]
+    large_sample = int(RUN_CONFIG["large_sample"])
+    personnel_definition = str(RUN_CONFIG["personnel_definition"])
     
     for panel_level in panel_levels:
         for treatment_group in treatment_groups:
@@ -414,6 +438,8 @@ def main() -> None:
                     stay_x_years=stay_req,
                     balance_window=balance_window,
                     treatment_group=treatment_group,
+                    large_sample=large_sample,
+                    personnel_definition=personnel_definition,
                 ).merge_event_data()
     
     print("All panels generated!")

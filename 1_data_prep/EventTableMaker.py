@@ -11,10 +11,12 @@ Process:
 
 Input:
 - data/event_tables/movement_event_candidates.csv
+- data/event_tables/movement_event_candidates_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
 - data/event_tables/interlock_event_candidates.csv
 
 Output:
 - data/event_tables/movement_table.csv
+- data/event_tables/movement_table_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
 - data/event_tables/interlock_table.csv
 """
 
@@ -29,11 +31,10 @@ CURRENT_PATH = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_PATH.parent.parent
 EVENT_TABLE_DIR = PROJECT_ROOT / "data" / "event_tables"
 
-MOVEMENT_CANDIDATES_PATH = EVENT_TABLE_DIR / "movement_event_candidates.csv"
 INTERLOCK_CANDIDATES_PATH = EVENT_TABLE_DIR / "interlock_event_candidates.csv"
-MOVEMENT_OUTPUT_PATH = EVENT_TABLE_DIR / "movement_table.csv"
 INTERLOCK_OUTPUT_PATH = EVENT_TABLE_DIR / "interlock_table.csv"
 
+PERSONNEL_DEFINITIONS = {"narrow", "medium", "broad"}
 REQUIREMENT_COLUMNS = ("req0", "req1", "req2")
 MOVEMENT_EVENT_TYPES = {
     "to_B_still_in_A",
@@ -57,6 +58,23 @@ INTERLOCK_REQUIRED_COLUMNS = {
     "requirement1",
     "requirement2",
 }
+
+
+RUN_CONFIG = {
+    "large_sample": 1,
+    "personnel_definition": "broad",
+}
+
+
+def build_large_sample_suffix(large_sample: int, personnel_definition: str) -> str:
+    """Return movement file suffix for the configured sample definition."""
+    if large_sample not in {0, 1}:
+        raise ValueError("large_sample must be 0 or 1")
+    if large_sample == 0:
+        return ""
+    if personnel_definition not in PERSONNEL_DEFINITIONS:
+        raise ValueError("personnel_definition must be one of: narrow, medium, broad")
+    return f"_large_sample_{personnel_definition}"
 
 
 def build_event_table(candidates: pd.DataFrame, table_type: str, source_name: str) -> pd.DataFrame:
@@ -175,18 +193,25 @@ def main() -> None:
     """
     Read raw candidate tables and write movement_table.csv and interlock_table.csv.
     """
+    large_sample = int(RUN_CONFIG["large_sample"])
+    personnel_definition = str(RUN_CONFIG["personnel_definition"])
+    movement_suffix = build_large_sample_suffix(large_sample, personnel_definition)
+    movement_candidates_path = EVENT_TABLE_DIR / f"movement_event_candidates{movement_suffix}.csv"
+    movement_output_path = EVENT_TABLE_DIR / f"movement_table{movement_suffix}.csv"
+
     # Movement output preserves firm_type because A and B treated-side panels
     # still need different firm definitions.
-    movement_candidates = pd.read_csv(MOVEMENT_CANDIDATES_PATH)
+    movement_candidates = pd.read_csv(movement_candidates_path)
     movement_table = build_event_table(
         movement_candidates,
         "movement",
-        MOVEMENT_CANDIDATES_PATH.name,
+        movement_candidates_path.name,
     )
-    MOVEMENT_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    movement_table.to_csv(MOVEMENT_OUTPUT_PATH, index=False)
-    print(f"Saved: {MOVEMENT_OUTPUT_PATH} ({len(movement_table):,} rows)")
+    movement_output_path.parent.mkdir(parents=True, exist_ok=True)
+    movement_table.to_csv(movement_output_path, index=False)
+    print(f"Saved: {movement_output_path} ({len(movement_table):,} rows)")
 
+"""
     # Interlock output is direction-free and combines direct and indirect events.
     interlock_candidates = pd.read_csv(INTERLOCK_CANDIDATES_PATH)
     interlock_table = build_event_table(
@@ -197,7 +222,7 @@ def main() -> None:
     INTERLOCK_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     interlock_table.to_csv(INTERLOCK_OUTPUT_PATH, index=False)
     print(f"Saved: {INTERLOCK_OUTPUT_PATH} ({len(interlock_table):,} rows)")
-
+"""
 
 if __name__ == "__main__":
     main()

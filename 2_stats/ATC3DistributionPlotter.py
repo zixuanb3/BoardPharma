@@ -1,10 +1,26 @@
 """
+Purpose:
 Generate ATC-sharing labels and diagnostics for movement event cohorts.
 
-This script only processes quarter-level event cohorts from the current
-CohortPanelMaker pipeline. It reads movement event candidates, builds a
-req-valid event partner table, labels treated BoardName-product units with
-atc_sharing, and writes enriched cohorts plus Pure Control yearly summaries.
+Process:
+1. Read movement event candidates and build req-valid event partner tables.
+2. Read ATC2/ATC3 product-firm mapping files.
+3. Read balanced quarter-level movement cohort files from CohortPanelMaker.
+4. Label treated BoardName-product rows with atc_sharing indicators.
+5. Save enriched cohorts and Pure Control yearly sharing summaries.
+
+Input:
+- data/event_tables/movement_event_candidates.csv
+- data/event_tables/movement_event_candidates_large_sample_{definition}.csv when LARGE_SAMPLE == 1
+- data/atc3mapping/atc2mapping_year.csv
+- data/atc3mapping/atc3mapping_year.csv
+- data/cohort_data/quarter-level_{A|B}_{with|without}_{A|B}/event/req*/.../*_balanced.csv
+- data/cohort_data/quarter-level_{A|B}_{with|without}_{A|B}_large_sample_{definition}/event/req*/.../*_balanced_large_sample_{definition}.csv when LARGE_SAMPLE == 1
+
+Output:
+- data/cohort_data_with_atcsharing_{atc2|atc3}/quarter-level*/event/req*/.../*.csv
+- csv/cohort_sharing_atc_{atc2|atc3}/quarter-level*/event/req*/Pure Control/*.csv
+- figures/cohort_sharing_atc_{atc2|atc3}/quarter-level*/event/req*/Pure Control/*.png
 """
 
 from pathlib import Path
@@ -13,12 +29,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
+PERSONNEL_DEFINITIONS = {"narrow", "medium", "broad"}
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 COHORT_ROOT = PROJECT_ROOT / "data" / "cohort_data"
 ATC_MAP_DIR = PROJECT_ROOT / "data" / "atc3mapping"
-MOVEMENT_CANDIDATES_PATH = (
-    PROJECT_ROOT / "data" / "event_tables" / "movement_event_candidates.csv"
-)
+EVENT_TABLES_DIR = PROJECT_ROOT / "data" / "event_tables"
 
 # ========================== USER CONFIG ==========================
 ATCS = ["atc3","atc2"]
@@ -35,7 +51,19 @@ CONTROL_FOLDERS = ["Not", "Not Yet", "Pure Control"]
 PLOT_CONTROL_FOLDER = "Pure Control"
 PANEL = "quarter"
 EVENT_TYPE = "event"
+LARGE_SAMPLE = 1
+PERSONNEL_DEFINITION = "broad"
 # ================================================================
+
+def build_large_sample_suffix(large_sample: int, personnel_definition: str) -> str:
+    """Return movement file suffix for the configured sample definition."""
+    if large_sample not in {0, 1}:
+        raise ValueError("large_sample must be 0 or 1")
+    if large_sample == 0:
+        return ""
+    if personnel_definition not in PERSONNEL_DEFINITIONS:
+        raise ValueError("personnel_definition must be one of: narrow, medium, broad")
+    return f"_large_sample_{personnel_definition}"
 
 
 def load_atc_mapping(atc: str) -> pd.DataFrame:
@@ -85,7 +113,7 @@ def build_partner_table(
     ]
     missing = [col for col in required if col not in movement.columns]
     if missing:
-        raise KeyError(f"{MOVEMENT_CANDIDATES_PATH} is missing required columns: {missing}")
+        raise KeyError(f"movement candidates are missing required columns: {missing}")
 
     data = movement.copy()
     int_cols = ["event_year", "stay_2_years", "requirement1", "requirement2_A", "requirement2_B"]
@@ -148,11 +176,12 @@ def process_one_config(
     include_eventpair: int,
     event_requirement: int,
     event: str,
+    movement_suffix: str,
 ) -> None:
     """Label one treatment-side/event/req cohort set and save diagnostics."""
     counterpart = "B" if treatment_group == "A" else "A"
     relation = "with" if int(include_eventpair) == 1 else "without"
-    cohort_folder = f"{PANEL}-level_{treatment_group}_{relation}_{counterpart}"
+    cohort_folder = f"{PANEL}-level_{treatment_group}_{relation}_{counterpart}{movement_suffix}"
     req_folder = f"req{event_requirement}"
     data_out_root = PROJECT_ROOT / "data" / f"cohort_data_with_atcsharing_{atc}"
     fig_root = PROJECT_ROOT / "figures" / f"cohort_sharing_atc_{atc}"
@@ -164,7 +193,7 @@ def process_one_config(
         dst_dir = data_out_root / cohort_folder / EVENT_TYPE / req_folder / control_folder
 
         for cohort_year in COHORT_YEARS:
-            src_path = src_dir / f"{event}_{PANEL}_cohort_{cohort_year}_balanced.csv"
+            src_path = src_dir / f"{event}_{PANEL}_cohort_{cohort_year}_balanced{movement_suffix}.csv"
             if not src_path.exists():
                 if control_folder == PLOT_CONTROL_FOLDER:
                     rows.append(
@@ -300,7 +329,9 @@ def main() -> None:
     if invalid_atcs:
         raise ValueError(f"ATCS only supports atc2 and atc3, got: {invalid_atcs}")
 
-    movement = pd.read_csv(MOVEMENT_CANDIDATES_PATH)
+    movement_suffix = build_large_sample_suffix(int(LARGE_SAMPLE), str(PERSONNEL_DEFINITION))
+    movement_candidates_path = EVENT_TABLES_DIR / f"movement_event_candidates{movement_suffix}.csv"
+    movement = pd.read_csv(movement_candidates_path)
     for atc in ATCS:
         mapping = load_atc_mapping(atc)
         print(f"Processing {atc}")
@@ -325,6 +356,7 @@ def main() -> None:
                             include_eventpair=int(include_eventpair),
                             event_requirement=int(event_requirement),
                             event=event,
+                            movement_suffix=movement_suffix,
                         )
 
 
