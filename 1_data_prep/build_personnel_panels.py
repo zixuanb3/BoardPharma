@@ -28,10 +28,10 @@ All window lengths and retain-duration thresholds are PARAMETERISED
 in RUN_CONFIG.
 
 Input:
-  D:\pharma\ssr_company_roster.csv          (master roster, 122751 rows)
-  D:\Dropbox\BoardPharma\InterimData\boardex_ssr_price_sample.csv (optional SSR data)
+  InterimData\ssr_company_roster.csv          (master roster, 122751 rows)
+  InterimData\boardex_ssr_price_sample.csv (optional SSR data)
 
-Output (under D:\pharma\output\personnel_panels\):
+Output (under data\personnel_panels\):
   {definition}/pair_movement_panel.csv       (pair-year movement counts)
   {definition}/cohort_panels/{control_set}/reg_panel_cohort_{year}.csv
   sample_size_summary.csv
@@ -49,11 +49,13 @@ import numpy as np
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ========================== PATHS ==========================
-ROSTER_PATH = Path(r"D:\pharma\ssr_company_roster.csv")
-SSR_PRICE_PATH = Path(
-    r"D:\Dropbox\BoardPharma\InterimData\boardex_ssr_price_sample.csv"
-)
-OUTPUT_ROOT = Path(r"D:\pharma\output\personnel_panels")
+CURRENT_PATH = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_PATH.parent.parent
+INTERIM_DATA_PATH = PROJECT_ROOT / "InterimData"
+
+ROSTER_PATH = INTERIM_DATA_PATH / "ssr_company_roster.csv"
+SSR_PRICE_PATH = INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv"
+OUTPUT_ROOT = PROJECT_ROOT / "data" / "personnel_panels"
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 # ========================== USER CONFIG ==========================
@@ -583,6 +585,19 @@ def build_control_sets(
 
     pairs_with_event_window = _has_event_in_window(pair_panel, event_type, window_years)
     pairs_with_event_ever = _has_event_ever(pair_panel, event_type)
+    event_col = (
+        "retain"
+        if event_type == "to_B_still_in_A"
+        else "exit"
+        if event_type == "to_B_not_in_A"
+        else "dissolution"
+    )
+    event_window_df = pair_panel[
+        pair_panel["year"].isin(window_years) & (pair_panel[event_col] > 0)
+    ]
+    firms_with_event_window = set(event_window_df["A"].unique()) | set(event_window_df["B"].unique())
+    event_ever_df = pair_panel[pair_panel[event_col] > 0]
+    firms_with_event_ever = set(event_ever_df["A"].unique()) | set(event_ever_df["B"].unique())
 
     # C1-A: never treated in window (set operations, fast)
     c1a_pairs = all_pairs_set - treated_pairs - pairs_with_event_window
@@ -666,8 +681,8 @@ def build_control_sets(
     }
 
     return {
-        "C1A": _exclude_treated_firms(c1a_pairs, treated_firms),
-        "C1B": _exclude_treated_firms(c1b_pairs, treated_firms),
+        "C1A": _exclude_treated_firms(c1a_pairs, firms_with_event_window),
+        "C1B": _exclude_treated_firms(c1b_pairs, firms_with_event_ever),
         "C2A": _exclude_treated_firms(c2a_pairs, treated_firms),
         "C2B": _exclude_treated_firms(c2b_pairs, treated_firms),
         "C3":  _exclude_treated_firms(c3_pairs, treated_firms),
