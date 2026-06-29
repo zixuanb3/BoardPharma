@@ -21,6 +21,7 @@ Process:
 Input:
 - InterimData/boardex_pharma.dta
 - InterimData/ssr_company_roster.csv when RUN_CONFIG["large_sample"] == 1
+- InterimData/formulary_company_roster.csv when RUN_CONFIG["formulary"] == 1
 - InterimData/boardex_ssr_price_sample.csv
 - InterimData/boardex_interlock_indirect_firmpair.dta
 - InterimData/boardex_interlock_direct_firmpair.dta
@@ -30,6 +31,8 @@ Output:
 - data/event_tables/movement_event_candidates.csv
 - data/event_tables/firm_interlock_panel_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
 - data/event_tables/movement_event_candidates_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
+- data/event_tables/firm_interlock_panel_formulary_large_sample_{definition}.csv when RUN_CONFIG["formulary"] == 1
+- data/event_tables/movement_event_candidates_formulary_large_sample_{definition}.csv when RUN_CONFIG["formulary"] == 1
 - data/event_tables/interlock_event_candidates.csv
 """
 
@@ -49,6 +52,7 @@ OUTPUT_DIR = PROJECT_ROOT / "data" / "event_tables"
 
 PHARMA_PATH = INTERIM_DATA_PATH / "boardex_pharma.dta"
 LARGE_SAMPLE_ROSTER_PATH = INTERIM_DATA_PATH / "ssr_company_roster.csv"
+FORMULARY_ROSTER_PATH = INTERIM_DATA_PATH / "formulary_company_roster.csv"
 SSR_SAMPLE_PATH = INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv"
 INDIRECT_INPUT_PATH = INTERIM_DATA_PATH / "boardex_interlock_indirect_firmpair.dta"
 DIRECT_INPUT_PATH = INTERIM_DATA_PATH / "boardex_interlock_direct_firmpair.dta"
@@ -63,8 +67,9 @@ CounterpartLookup = dict[tuple[str, int], set[str]]
 RUN_CONFIG = {
     "stay_x_years": 2,
     "requirement2_window": (-1, 1),
-    "large_sample": 0,
-    "personnel_definition": "narrow",
+    "large_sample": 1,
+    "formulary": 1,
+    "personnel_definition": "medium",
 }
 # ===============================================================
 
@@ -519,9 +524,22 @@ def main() -> None:
 
     # Build and save movement-side raw tables first.
     large_sample = int(RUN_CONFIG["large_sample"])
+    formulary = int(RUN_CONFIG["formulary"])
     personnel_definition = str(RUN_CONFIG["personnel_definition"])
-    movement_input_path = LARGE_SAMPLE_ROSTER_PATH if large_sample == 1 else PHARMA_PATH
-    movement_output_suffix = f"_large_sample_{personnel_definition}" if large_sample == 1 else ""
+    if formulary not in {0, 1}:
+        raise ValueError("formulary must be 0 or 1")
+    if formulary == 1 and large_sample != 1:
+        raise ValueError("formulary requires large_sample == 1")
+
+    if formulary == 1:
+        movement_input_path = FORMULARY_ROSTER_PATH
+        movement_output_suffix = f"_formulary_large_sample_{personnel_definition}"
+    elif large_sample == 1:
+        movement_input_path = LARGE_SAMPLE_ROSTER_PATH
+        movement_output_suffix = f"_large_sample_{personnel_definition}"
+    else:
+        movement_input_path = PHARMA_PATH
+        movement_output_suffix = ""
     firm_interlock_edges_path = OUTPUT_DIR / f"firm_interlock_panel{movement_output_suffix}.csv"
     movement_candidates_path = OUTPUT_DIR / f"movement_event_candidates{movement_output_suffix}.csv"
     movement_candidates, firm_interlock_edges = MovementEventBuilder(

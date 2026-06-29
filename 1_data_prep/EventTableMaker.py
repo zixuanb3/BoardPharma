@@ -12,11 +12,13 @@ Process:
 Input:
 - data/event_tables/movement_event_candidates.csv
 - data/event_tables/movement_event_candidates_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
+- data/event_tables/movement_event_candidates_formulary_large_sample_{definition}.csv when RUN_CONFIG["formulary"] == 1
 - data/event_tables/interlock_event_candidates.csv
 
 Output:
 - data/event_tables/movement_table.csv
 - data/event_tables/movement_table_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
+- data/event_tables/movement_table_formulary_large_sample_{definition}.csv when RUN_CONFIG["formulary"] == 1
 - data/event_tables/interlock_table.csv
 """
 
@@ -62,18 +64,25 @@ INTERLOCK_REQUIRED_COLUMNS = {
 
 RUN_CONFIG = {
     "large_sample": 1,
-    "personnel_definition": "narrow",
+    "formulary": 1,
+    "personnel_definition": "medium",
 }
 
 
-def build_large_sample_suffix(large_sample: int, personnel_definition: str) -> str:
+def build_movement_suffix(large_sample: int, formulary: int, personnel_definition: str) -> str:
     """Return movement file suffix for the configured sample definition."""
     if large_sample not in {0, 1}:
         raise ValueError("large_sample must be 0 or 1")
+    if formulary not in {0, 1}:
+        raise ValueError("formulary must be 0 or 1")
+    if formulary == 1 and large_sample != 1:
+        raise ValueError("formulary requires large_sample == 1")
     if large_sample == 0:
         return ""
     if personnel_definition not in PERSONNEL_DEFINITIONS:
         raise ValueError("personnel_definition must be one of: narrow, medium, broad")
+    if formulary == 1:
+        return f"_formulary_large_sample_{personnel_definition}"
     return f"_large_sample_{personnel_definition}"
 
 
@@ -194,8 +203,9 @@ def main() -> None:
     Read raw candidate tables and write movement_table.csv and interlock_table.csv.
     """
     large_sample = int(RUN_CONFIG["large_sample"])
+    formulary = int(RUN_CONFIG["formulary"])
     personnel_definition = str(RUN_CONFIG["personnel_definition"])
-    movement_suffix = build_large_sample_suffix(large_sample, personnel_definition)
+    movement_suffix = build_movement_suffix(large_sample, formulary, personnel_definition)
     movement_candidates_path = EVENT_TABLE_DIR / f"movement_event_candidates{movement_suffix}.csv"
     movement_output_path = EVENT_TABLE_DIR / f"movement_table{movement_suffix}.csv"
 

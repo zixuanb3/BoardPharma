@@ -1,7 +1,7 @@
 r"""
 Purpose:
   Build firm-pair-year movement panels and regression-ready cohort panels
-  from ssr_company_roster.csv under the personnel definitions configured in
+  from the configured personnel roster under the personnel definitions in
   RUN_CONFIG.
 
 Process:
@@ -14,11 +14,13 @@ Process:
 
 Input:
   InterimData\ssr_company_roster.csv
+  InterimData\formulary_company_roster.csv when RUN_CONFIG["formulary"] == 1
 
 Output:
   data\personnel_panels\{definition}\pair_movement_panel_retain{n}yr.csv
   data\personnel_panels\{definition}\cohort_panels\retain{n}yr\{event_type}\{control_set}\reg_panel_cohort_{year}.csv
   data\personnel_panels\sample_size_summary.csv
+  data\personnel_panels\formulary\{definition}\... when RUN_CONFIG["formulary"] == 1
 """
 
 import os
@@ -36,6 +38,7 @@ PROJECT_ROOT = CURRENT_PATH.parent.parent
 INTERIM_DATA_PATH = PROJECT_ROOT / "InterimData"
 
 ROSTER_PATH = INTERIM_DATA_PATH / "ssr_company_roster.csv"
+FORMULARY_ROSTER_PATH = INTERIM_DATA_PATH / "formulary_company_roster.csv"
 SSR_PRICE_PATH = INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv"
 OUTPUT_ROOT = PROJECT_ROOT / "data" / "personnel_panels"
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -43,6 +46,8 @@ OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 # ========================== USER CONFIG ==========================
 # All key parameters are here – change freely.
 RUN_CONFIG = {
+    "formulary": 0,
+
     # ── Personnel definitions ──
     "personnel_defs": {
         "narrow_board":       ["board", "boardex"],
@@ -69,7 +74,8 @@ RUN_CONFIG = {
     "post_period_variant": "A",
 
     # ── Control sets ──
-    "control_sets": ["C4", "C6A", "C6B"],
+    "control_sets": ["C4"],
+    # "C6A", "C6B"
 
     # ── Event types to build panels for ──
     "event_types": [
@@ -85,9 +91,32 @@ RUN_CONFIG = {
 # ║  STEP 1: Load & filter personnel roster                     ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-def load_roster() -> pd.DataFrame:
+def validate_run_config(cfg: dict) -> int:
+    """Validate sample switch and return the formulary flag."""
+    formulary = int(cfg["formulary"])
+    if formulary not in {0, 1}:
+        raise ValueError("formulary must be 0 or 1")
+    return formulary
+
+
+def apply_formulary_year_window(cfg: dict, formulary: int) -> dict:
+    """Use the formulary data coverage when building formulary personnel panels."""
+    result = cfg.copy()
+    if formulary == 1:
+        result.update(
+            {
+                "min_year": 2019,
+                "max_year": 2025,
+                "cohort_year_min": 2020,
+                "cohort_year_max": 2024,
+            }
+        )
+    return result
+
+
+def load_roster(roster_path: Path) -> pd.DataFrame:
     """Load the master personnel roster and normalize firm names."""
-    df = pd.read_csv(ROSTER_PATH)
+    df = pd.read_csv(roster_path)
     df["BoardName"] = df["BoardName"].astype(str).str.upper()
     df["year"] = df["year"].astype(int)
     df["DirectorID"] = df["DirectorID"].astype(int)
@@ -825,14 +854,20 @@ def count_sample_size(cohort_df: pd.DataFrame) -> dict:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def main():
-    cfg = RUN_CONFIG
+    formulary = validate_run_config(RUN_CONFIG)
+    cfg = apply_formulary_year_window(RUN_CONFIG, formulary)
+    roster_path = FORMULARY_ROSTER_PATH if formulary == 1 else ROSTER_PATH
+    output_root = OUTPUT_ROOT / "formulary" if formulary == 1 else OUTPUT_ROOT
+    output_root.mkdir(parents=True, exist_ok=True)
+
     print("=" * 70)
     print("BUILDING PERSONNEL-DEFINITION MOVEMENT PANELS")
     print("=" * 70)
 
     # Load roster
     print("\n[1] Loading master roster...")
-    roster_full = load_roster()
+    print(f"    Source: {roster_path}")
+    roster_full = load_roster(roster_path)
     print(f"    Total rows: {len(roster_full)}")
     print(f"    Unique firms: {roster_full['BoardName'].nunique()}")
     print(f"    Unique directors: {roster_full['DirectorID'].nunique()}")
@@ -845,7 +880,7 @@ def main():
         print(f"  Tiers: {tiers}")
         print(f"{'='*60}")
 
-        def_dir = OUTPUT_ROOT / def_name
+        def_dir = output_root / def_name
         def_dir.mkdir(parents=True, exist_ok=True)
 
         # Filter roster
@@ -986,7 +1021,7 @@ def main():
     print(f"{'='*70}")
     if all_sample_sizes:
         summary_df = pd.DataFrame(all_sample_sizes)
-        summary_path = OUTPUT_ROOT / "sample_size_summary.csv"
+        summary_path = output_root / "sample_size_summary.csv"
         summary_df.to_csv(summary_path, index=False)
         print(f"Saved: {summary_path}")
         print(f"Total records: {len(summary_df)}")

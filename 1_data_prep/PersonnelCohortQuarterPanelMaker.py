@@ -8,20 +8,24 @@ Process:
    event type, control set, treatment group, and cohort year 2009-2017.
 2. Expand each pair-year row to four quarters and zero annual movement flags
    outside Q1.
-3. Attach SSR product-quarter outcomes for the selected treatment-group firm.
-4. Add cohort-year directional ATC3 product-sharing indicators, directed
-   pairwise kappa, and balanced A-B panel flags.
+3. Attach SSR product-quarter outcomes, or formulary drug-quarter outcomes
+   when FORMULARY == 1, for the selected treatment-group firm.
+4. Add directional ATC product-sharing indicators, directed pairwise kappa,
+   and balanced A-B panel flags.
 5. Save one product-quarter regression panel per cohort year and parameter
    combination.
 
 Input:
 - data/personnel_panels/{definition}/cohort_panels/retain{retain_years}yr/{event_type}/{control_set}/reg_panel_cohort_YYYY.csv
+- data/personnel_panels/formulary/{definition}/cohort_panels/retain{retain_years}yr/{event_type}/{control_set}/reg_panel_cohort_YYYY.csv when FORMULARY == 1
 - InterimData/boardex_ssr_price_sample.csv
 - data/atc3mapping/atc3mapping_year.csv
+- InterimData/task1_final_panel_with_atc_boardname.parquet when FORMULARY == 1
 - InterimData/ssr_kappa_pairwise_v5.csv
 
 Output:
 - data/personnel_regression_panels/{definition}/retain{retain_years}yr/{event_type}/{control_set}/treatment_group_{A|B}/reg_panel_cohort_YYYY_tg{A|B}.csv
+- data/personnel_regression_panels/formulary/{definition}/retain{retain_years}yr/{event_type}/{control_set}/treatment_group_{A|B}/reg_panel_cohort_YYYY_tg{A|B}.csv when FORMULARY == 1
 """
 
 from __future__ import annotations
@@ -42,14 +46,26 @@ OUTPUT_ROOT = PROJECT_ROOT / "data" / "personnel_regression_panels"
 SSR_OUTCOME_PATH = PROJECT_ROOT / "InterimData" / "boardex_ssr_price_sample.csv"
 ATC3_MAPPING_PATH = PROJECT_ROOT / "data" / "atc3mapping" / "atc3mapping_year.csv"
 KAPPA_PATH = PROJECT_ROOT / "InterimData" / "ssr_kappa_pairwise_v5.csv"
+FORMULARY_PANEL_SOURCE_PATH = Path(r"D:\task1_final_panel_with_atc.csv")
+FORMULARY_PANEL_PATH = (
+    PROJECT_ROOT / "InterimData" / "task1_final_panel_with_atc_boardname.parquet"
+)
 
-DEFINITIONS = ("narrow_board", "medium_board_csuite")
-# broad_board_c_vp
-EVENT_TYPES = ("to_B_still_in_A", "to_B_not_in_A", "dissolution")
-CONTROL_SETS = ("C4", "C6A", "C6B")
-TREATMENT_GROUPS = ("A", "B")
-COHORT_YEARS = tuple(range(2009, 2019))
+DEFINITIONS = ("medium_board_csuite",)
+# broad_board_c_vp narrow_board
+EVENT_TYPES = ("dissolution",)
+# "to_B_still_in_A", "to_B_not_in_A", 
+CONTROL_SETS = ("C4",)
+TREATMENT_GROUPS = ("B",)
+# A
+COHORT_YEARS = tuple(range(2020, 2023))
+# tuple(range(2009, 2019))
 RETAIN_YEARS = 2
+FORMULARY = 1
+FORMULARY_CHUNKSIZE = 5_000_000
+BALANCED_WINDOW_PRE_YEARS = 1
+BALANCED_WINDOW_POST_YEARS = 1
+BALANCED_REQUIRED_QUARTERS_BY_YEAR = {2025: 3}
 
 SSR_COLS = (
     "year",
@@ -66,6 +82,16 @@ SSR_KEY_COLS = ("year", "quarter", "BoardName", "product", "atc3")
 
 ATC3_MAPPING_COLS = ("year", "product", "atc3", "BoardName", "BoardNamePair")
 KAPPA_COLS = ("rdate", "firm_j", "firm_k", "kappa")
+
+FORMULARY_ATC_LEVELS = ("ATC2", "ATC3")
+FORMULARY_EXCLUDED_COLS = (
+    "ATC1",
+    "ATC1_name",
+    "ATC4",
+    "ATC4_name",
+    "ATC5",
+    "ATC5_name",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,6 +126,33 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=RETAIN_YEARS,
         help="Years a director must stay on B in the upstream personnel panels.",
+    )
+    parser.add_argument(
+        "--formulary",
+        dest="formulary",
+        type=int,
+        choices=(0, 1),
+        default=FORMULARY,
+        help="Use formulary personnel panels when set to 1.",
+    )
+    parser.add_argument(
+        "--formulary-path",
+        "--formulary_path",
+        dest="formulary_path",
+        type=Path,
+        default=FORMULARY_PANEL_PATH,
+        help=(
+            "Mapped formulary panel used when --formulary 1. Defaults to the "
+            "InterimData Parquet cache produced by FormularyPanelCacheMaker.py."
+        ),
+    )
+    parser.add_argument(
+        "--formulary-chunksize",
+        "--formulary_chunksize",
+        dest="formulary_chunksize",
+        type=int,
+        default=FORMULARY_CHUNKSIZE,
+        help="Rows per chunk when reading the large formulary CSV.",
     )
     return parser.parse_args()
 
@@ -252,6 +305,184 @@ def load_atc3_mapping() -> pd.DataFrame:
     return mapping
 
 
+def parse_year_quarter(data: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    """Parse YEAR_Q values such as '2019 Q1' into integer year and quarter."""
+    result = data.copy()
+    parsed = result["YEAR_Q"].astype("string").str.extract(r"^\s*(\d{4})\s*Q([1-4])\s*$")
+    invalid = parsed[0].isna() | parsed[1].isna()
+    if invalid.any():
+        examples = result.loc[invalid, ["YEAR_Q"]].drop_duplicates().head(10)
+        raise ValueError(f"{source_name}.YEAR_Q has invalid values. Examples:\n{examples}")
+    result["year"] = parsed[0].astype("int32")
+    result["quarter"] = parsed[1].astype("int32")
+    return result
+
+
+def normalize_formulary_chunk(chunk: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    """Clean one formulary chunk and drop rows without a mapped BoardName."""
+    result = chunk.copy()
+    result = clean_string_keys(result, result.columns)
+    result = clean_string_keys(result, ["BoardName"], uppercase=True)
+    result = result.dropna(subset=["BoardName"]).copy()
+    if result.empty:
+        return result.assign(year=pd.Series(dtype="int32"), quarter=pd.Series(dtype="int32"))
+
+    result = parse_year_quarter(result, source_name)
+    result["product"] = result["NDC"]
+    return result
+
+
+def is_parquet_path(path: Path) -> bool:
+    """Return whether a path points to a Parquet file."""
+    return path.suffix.lower() in {".parquet", ".pq"}
+
+
+def formulary_input_columns(path: Path) -> list[str]:
+    """Read formulary input columns without loading the full data."""
+    if is_parquet_path(path):
+        import pyarrow.parquet as pq
+
+        return list(pq.ParquetFile(path).schema_arrow.names)
+    return list(pd.read_csv(path, nrows=0).columns)
+
+
+def selected_formulary_columns(path: Path) -> list[str]:
+    """Return formulary columns to read, excluding unused ATC levels."""
+    return [
+        col
+        for col in formulary_input_columns(path)
+        if col not in set(FORMULARY_EXCLUDED_COLS)
+    ]
+
+
+def load_cached_formulary_outcomes(
+    path: Path,
+    needed_firms: set[str],
+    needed_years: set[int],
+    columns: Sequence[str],
+) -> pd.DataFrame:
+    """Load filtered rows from the mapped formulary Parquet cache."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Mapped formulary cache not found: {path}. "
+            "Run 1_data_prep/FormularyPanelCacheMaker.py first, or pass "
+            "--formulary-path pointing to the raw CSV."
+        )
+    data = pd.read_parquet(
+        path,
+        columns=list(columns),
+        filters=[
+            ("year", "in", sorted(needed_years)),
+            ("BoardName", "in", sorted(needed_firms)),
+        ],
+    )
+    require_columns(
+        data,
+        (
+            "BoardName",
+            "FORMULARY_ID",
+            "NDC",
+            "year",
+            "quarter",
+            "product",
+            *FORMULARY_ATC_LEVELS,
+        ),
+        path.name,
+    )
+    return data
+
+
+def load_raw_formulary_outcomes(
+    path: Path,
+    needed_firms: set[str],
+    needed_years: set[int],
+    chunksize: int,
+    columns: Sequence[str],
+) -> list[pd.DataFrame]:
+    """Load filtered rows from the raw formulary CSV in chunks."""
+    filtered_parts: list[pd.DataFrame] = []
+    for chunk in pd.read_csv(
+        path,
+        usecols=list(columns),
+        dtype="string",
+        chunksize=chunksize,
+    ):
+        data = normalize_formulary_chunk(chunk, path.name)
+        if data.empty:
+            continue
+        data = data.loc[
+            data["year"].isin(needed_years)
+            & data["BoardName"].isin(needed_firms)
+        ].copy()
+        if not data.empty:
+            filtered_parts.append(data)
+    return filtered_parts
+
+
+def load_formulary_outcomes(
+    path: Path,
+    needed_firms: set[str],
+    needed_years: set[int],
+    chunksize: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load filtered formulary outcomes in chunks.
+
+    The source file can be very large, so only rows for cohort firms and years are kept.
+    Rows with missing BoardName are intentionally dropped before any merge or overlap logic.
+    """
+    if is_parquet_path(path) and not path.exists():
+        raise FileNotFoundError(
+            f"Mapped formulary cache not found: {path}. "
+            "Run 1_data_prep/FormularyPanelCacheMaker.py first, or pass "
+            "--formulary-path pointing to the raw CSV."
+        )
+    require_path(path, "formulary panel")
+    if chunksize < 1:
+        raise ValueError("formulary_chunksize must be >= 1")
+
+    input_columns = selected_formulary_columns(path)
+    if is_parquet_path(path):
+        filtered_parts = [
+            load_cached_formulary_outcomes(
+                path=path,
+                needed_firms=needed_firms,
+                needed_years=needed_years,
+                columns=input_columns,
+            )
+        ]
+    else:
+        filtered_parts = load_raw_formulary_outcomes(
+            path=path,
+            needed_firms=needed_firms,
+            needed_years=needed_years,
+            chunksize=chunksize,
+            columns=input_columns,
+        )
+
+    if filtered_parts:
+        outcomes = (
+            pd.concat(filtered_parts, ignore_index=True)
+            .drop_duplicates()
+            .sort_values(["BoardName", "FORMULARY_ID", "year", "quarter", "NDC"])
+            .reset_index(drop=True)
+        )
+    else:
+        outcomes = pd.DataFrame(columns=[*input_columns, "year", "quarter", "product"])
+    require_columns(
+        outcomes,
+        ("BoardName", "FORMULARY_ID", "NDC", "year", "quarter", "product", *FORMULARY_ATC_LEVELS),
+        path.name,
+    )
+
+    presence = (
+        outcomes[["BoardName", "FORMULARY_ID", "year", "quarter"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    return outcomes, presence
+
+
 def load_kappa() -> pd.DataFrame:
     """Load directed pairwise kappa and derive year-quarter merge keys."""
     kappa = read_csv_with_required_columns(KAPPA_PATH, KAPPA_COLS, KAPPA_PATH.name)
@@ -284,10 +515,33 @@ def require_unique_keys(df: pd.DataFrame, key_cols: Sequence[str], source_name: 
         )
 
 
-def input_dir(definition: str, event_type: str, control_set: str, retain_years: int) -> Path:
+def validate_formulary(formulary: int) -> int:
+    """Validate and return the formulary sample flag."""
+    if formulary not in {0, 1}:
+        raise ValueError("formulary must be 0 or 1")
+    return formulary
+
+
+def input_root(formulary: int) -> Path:
+    """Return the upstream personnel panel root for the configured sample."""
+    return PERSONNEL_PANEL_ROOT / "formulary" if formulary == 1 else PERSONNEL_PANEL_ROOT
+
+
+def regression_output_root(formulary: int) -> Path:
+    """Return the product-quarter regression panel root for the configured sample."""
+    return OUTPUT_ROOT / "formulary" if formulary == 1 else OUTPUT_ROOT
+
+
+def input_dir(
+    personnel_panel_root: Path,
+    definition: str,
+    event_type: str,
+    control_set: str,
+    retain_years: int,
+) -> Path:
     """Return the input cohort directory for one parameter combination."""
     return (
-        PERSONNEL_PANEL_ROOT
+        personnel_panel_root
         / definition
         / "cohort_panels"
         / f"retain{retain_years}yr"
@@ -297,6 +551,7 @@ def input_dir(definition: str, event_type: str, control_set: str, retain_years: 
 
 
 def output_dir(
+    panel_output_root: Path,
     definition: str,
     event_type: str,
     control_set: str,
@@ -305,7 +560,7 @@ def output_dir(
 ) -> Path:
     """Return the output directory for one parameter combination."""
     return (
-        OUTPUT_ROOT
+        panel_output_root
         / definition
         / f"retain{retain_years}yr"
         / event_type
@@ -331,6 +586,36 @@ def outcome_and_counterparty_cols(treatment_group: str) -> tuple[str, str]:
     raise ValueError("treatment_group must be either A or B")
 
 
+def balanced_window_years(cohort_year: int) -> set[int]:
+    """Return cohort-year window used for outcome balanced-panel checks."""
+    return set(
+        range(
+            cohort_year - BALANCED_WINDOW_PRE_YEARS,
+            cohort_year + BALANCED_WINDOW_POST_YEARS + 1,
+        )
+    )
+
+
+def collect_cohort_scope(in_dir: Path) -> tuple[set[str], set[int]]:
+    """Read only A/B/year columns to identify formulary rows needed downstream."""
+    firms: set[str] = set()
+    years: set[int] = set()
+    for cohort_year in COHORT_YEARS:
+        path = in_dir / f"reg_panel_cohort_{cohort_year}.csv"
+        require_path(path, "cohort file")
+        header = pd.read_csv(path, nrows=0)
+        missing_cols = sorted({"A", "B", "year"} - set(header.columns))
+        if missing_cols:
+            raise KeyError(f"{path.name} is missing required columns: {missing_cols}")
+        data = pd.read_csv(path, usecols=["A", "B", "year"])
+        data = clean_string_keys(data, ["A", "B"], uppercase=True)
+        firms.update(data["A"].dropna().astype(str).unique())
+        firms.update(data["B"].dropna().astype(str).unique())
+        years.update(pd.to_numeric(data["year"], errors="raise").astype(int).unique())
+        years.update(balanced_window_years(cohort_year))
+    return firms, years
+
+
 def load_cohort(path: Path, cohort_year: int, retain_years: int) -> pd.DataFrame:
     """Load a cohort pair-year panel and validate the columns used downstream."""
     require_path(path, "cohort file")
@@ -351,7 +636,7 @@ def load_cohort(path: Path, cohort_year: int, retain_years: int) -> pd.DataFrame
         ),
         path.name,
     )
-    cohort = clean_string_keys(cohort, ["A", "B"])
+    cohort = clean_string_keys(cohort, ["A", "B"], uppercase=True)
 
     cohort["year"] = convert_required_int(cohort, "year", path.name)
     cohort["event_time"] = convert_required_int(cohort, "event_time", path.name)
@@ -410,6 +695,21 @@ def merge_ssr_outcomes(
     return merged
 
 
+def merge_formulary_outcomes(
+    expanded: pd.DataFrame,
+    formulary_outcomes: pd.DataFrame,
+    treatment_group: str,
+) -> pd.DataFrame:
+    """Attach formulary drug-quarter rows for the selected outcome firm."""
+    outcome_col, _ = outcome_and_counterparty_cols(treatment_group)
+    return expanded.merge(
+        formulary_outcomes,
+        left_on=[outcome_col, "year", "quarter"],
+        right_on=["BoardName", "year", "quarter"],
+        how="inner",
+    )
+
+
 def add_share_atc3(
     panel: pd.DataFrame,
     mapping: pd.DataFrame,
@@ -443,6 +743,75 @@ def add_share_atc3(
     return result
 
 
+def add_formulary_share_flags(
+    panel: pd.DataFrame,
+    formulary_outcomes: pd.DataFrame,
+    treatment_group: str,
+    cohort_year: int,
+) -> pd.DataFrame:
+    """Add cohort-Q1 fixed formulary ATC overlap flags for ATC2 and ATC3."""
+    result = panel.copy()
+    outcome_col, counterparty_col = outcome_and_counterparty_cols(treatment_group)
+    treated = result["treat"].eq(1)
+    baseline = formulary_outcomes.loc[
+        formulary_outcomes["year"].eq(cohort_year)
+        & formulary_outcomes["quarter"].eq(1)
+    ].copy()
+
+    for atc_col in FORMULARY_ATC_LEVELS:
+        share_col = f"share_{atc_col.lower()}"
+
+        outcome_keys = (
+            baseline[["BoardName", "FORMULARY_ID", "product", atc_col]]
+            .dropna(subset=["BoardName", "FORMULARY_ID", "product", atc_col])
+            .drop_duplicates()
+            .rename(columns={"BoardName": outcome_col})
+        )
+        partner_keys = (
+            baseline[["BoardName", "FORMULARY_ID", atc_col]]
+            .dropna(subset=["BoardName", "FORMULARY_ID", atc_col])
+            .drop_duplicates()
+            .rename(columns={"BoardName": counterparty_col})
+        )
+
+        if outcome_keys.empty or partner_keys.empty:
+            result[share_col] = 0
+            continue
+
+        share_keys = outcome_keys.merge(
+            partner_keys,
+            on=["FORMULARY_ID", atc_col],
+            how="inner",
+        )
+        share_keys = share_keys.loc[
+            share_keys[outcome_col].ne(share_keys[counterparty_col]),
+            [outcome_col, counterparty_col, "FORMULARY_ID", "product"],
+        ].drop_duplicates()
+
+        if share_keys.empty:
+            result[share_col] = 0
+            continue
+
+        share_keys = share_keys.assign(_share_match=1)
+        require_unique_keys(
+            share_keys,
+            [outcome_col, counterparty_col, "FORMULARY_ID", "product"],
+            f"formulary {atc_col} Q1 share keys for {cohort_year}",
+        )
+
+        matches = result[
+            [outcome_col, counterparty_col, "FORMULARY_ID", "product"]
+        ].merge(
+            share_keys,
+            on=[outcome_col, counterparty_col, "FORMULARY_ID", "product"],
+            how="left",
+            validate="many_to_one",
+        )["_share_match"].fillna(0)
+        result[share_col] = (treated & matches.eq(1)).astype("int8")
+
+    return result
+
+
 def validate_share_atc3_consistency(panel: pd.DataFrame) -> None:
     """Ensure share_atc3 is constant within each A-B-product in a cohort file."""
     if panel.empty:
@@ -471,7 +840,7 @@ def add_kappa(panel: pd.DataFrame, kappa: pd.DataFrame, treatment_group: str) ->
 
 
 def add_balanced_panel(panel: pd.DataFrame, ssr_presence: pd.DataFrame, cohort_year: int) -> pd.DataFrame:
-    """Mark whether each A-B pair has full SSR presence for both firms in the five-year window."""
+    """Mark whether each A-B pair has full SSR presence for both firms in the configured window."""
     result = panel.copy()
     if result.empty:
         result["balanced_panel"] = pd.Series(dtype="int8")
@@ -479,7 +848,7 @@ def add_balanced_panel(panel: pd.DataFrame, ssr_presence: pd.DataFrame, cohort_y
 
     pairs = result[["A", "B"]].drop_duplicates().reset_index(drop=True)
     needed_firms = set(pairs["A"]).union(set(pairs["B"]))
-    window_years = set(range(cohort_year - 2, cohort_year + 3))
+    window_years = balanced_window_years(cohort_year)
     required_quarter_count = len(window_years) * 4
 
     window_presence = ssr_presence[
@@ -495,6 +864,50 @@ def add_balanced_panel(panel: pd.DataFrame, ssr_presence: pd.DataFrame, cohort_y
         pairs["A"].isin(balanced_firms) & pairs["B"].isin(balanced_firms)
     ).astype("int8")
     result = result.merge(pairs, on=["A", "B"], how="left", validate="many_to_one")
+    result["balanced_panel"] = result["balanced_panel"].fillna(0).astype("int8")
+    return result
+
+
+def required_balanced_quarters(window_years: set[int]) -> int:
+    """Return required quarter count, allowing known partial-coverage years."""
+    return sum(BALANCED_REQUIRED_QUARTERS_BY_YEAR.get(year, 4) for year in window_years)
+
+
+def add_formulary_balanced_panel(
+    panel: pd.DataFrame,
+    formulary_presence: pd.DataFrame,
+    cohort_year: int,
+) -> pd.DataFrame:
+    """Mark whether each A-B-formulary has full presence for both firms in the configured window."""
+    result = panel.copy()
+    if result.empty:
+        result["balanced_panel"] = pd.Series(dtype="int8")
+        return result
+
+    pairs = result[["A", "B", "FORMULARY_ID"]].drop_duplicates().reset_index(drop=True)
+    needed_firms = set(pairs["A"]).union(set(pairs["B"]))
+    needed_formularies = set(pairs["FORMULARY_ID"])
+    window_years = balanced_window_years(cohort_year)
+    required_quarter_count = required_balanced_quarters(window_years)
+
+    window_presence = formulary_presence[
+        formulary_presence["year"].isin(window_years)
+        & formulary_presence["quarter"].between(1, 4)
+        & formulary_presence["BoardName"].isin(needed_firms)
+        & formulary_presence["FORMULARY_ID"].isin(needed_formularies)
+    ].drop_duplicates(["FORMULARY_ID", "BoardName", "year", "quarter"])
+
+    counts = window_presence.groupby(["FORMULARY_ID", "BoardName"]).size()
+    balanced_firm_formularies = set(counts[counts.eq(required_quarter_count)].index)
+    pairs["balanced_panel"] = [
+        int(
+            (formulary_id, firm_a) in balanced_firm_formularies
+            and (formulary_id, firm_b) in balanced_firm_formularies
+        )
+        for firm_a, firm_b, formulary_id in pairs[["A", "B", "FORMULARY_ID"]].itertuples(index=False, name=None)
+    ]
+
+    result = result.merge(pairs, on=["A", "B", "FORMULARY_ID"], how="left", validate="many_to_one")
     result["balanced_panel"] = result["balanced_panel"].fillna(0).astype("int8")
     return result
 
@@ -519,23 +932,79 @@ def process_cohort_file(
     return panel
 
 
+def process_formulary_cohort_file(
+    cohort_path: Path,
+    formulary_outcomes: pd.DataFrame,
+    formulary_presence: pd.DataFrame,
+    kappa: pd.DataFrame,
+    treatment_group: str,
+    retain_years: int,
+) -> pd.DataFrame:
+    """Build one cohort-year formulary drug-quarter panel."""
+    cohort_year = cohort_year_from_filename(cohort_path)
+    cohort = load_cohort(cohort_path, cohort_year, retain_years)
+    expanded = expand_to_quarters(cohort, retain_years)
+    panel = merge_formulary_outcomes(expanded, formulary_outcomes, treatment_group)
+    panel = add_formulary_share_flags(
+        panel,
+        formulary_outcomes,
+        treatment_group,
+        cohort_year,
+    )
+    panel = add_kappa(panel, kappa, treatment_group)
+    panel = add_formulary_balanced_panel(panel, formulary_presence, cohort_year)
+    return panel
+
+
 def run(
     definition: str,
     event_type: str,
     control_set: str,
     treatment_group: str,
     retain_years: int,
+    formulary: int,
+    formulary_path: Path,
+    formulary_chunksize: int,
 ) -> None:
     """Run all 2009-2017 cohort files for one parameter combination."""
-    in_dir = input_dir(definition, event_type, control_set, retain_years)
-    out_dir = output_dir(definition, event_type, control_set, treatment_group, retain_years)
+    formulary = validate_formulary(formulary)
+    in_dir = input_dir(
+        input_root(formulary),
+        definition,
+        event_type,
+        control_set,
+        retain_years,
+    )
+    out_dir = output_dir(
+        regression_output_root(formulary),
+        definition,
+        event_type,
+        control_set,
+        treatment_group,
+        retain_years,
+    )
     require_path(in_dir, "input cohort directory")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading shared inputs...")
-    ssr_outcomes, ssr_presence = load_ssr_outcomes()
-    mapping = load_atc3_mapping()
     kappa = load_kappa()
+    if formulary == 1:
+        needed_firms, needed_years = collect_cohort_scope(in_dir)
+        formulary_outcomes, formulary_presence = load_formulary_outcomes(
+            path=formulary_path,
+            needed_firms=needed_firms,
+            needed_years=needed_years,
+            chunksize=formulary_chunksize,
+        )
+        print(
+            f"Loaded formulary rows: {len(formulary_outcomes):,} "
+            f"for {len(needed_firms):,} firms and {len(needed_years):,} years"
+        )
+        ssr_outcomes = ssr_presence = mapping = None
+    else:
+        ssr_outcomes, ssr_presence = load_ssr_outcomes()
+        mapping = load_atc3_mapping()
+        formulary_outcomes = formulary_presence = None
 
     print(f"Input directory: {in_dir}")
     print(f"Output directory: {out_dir}")
@@ -543,15 +1012,25 @@ def run(
     for cohort_year in COHORT_YEARS:
         cohort_path = in_dir / f"reg_panel_cohort_{cohort_year}.csv"
         require_path(cohort_path, "cohort file")
-        panel = process_cohort_file(
-            cohort_path=cohort_path,
-            ssr_outcomes=ssr_outcomes,
-            ssr_presence=ssr_presence,
-            mapping=mapping,
-            kappa=kappa,
-            treatment_group=treatment_group,
-            retain_years=retain_years,
-        )
+        if formulary == 1:
+            panel = process_formulary_cohort_file(
+                cohort_path=cohort_path,
+                formulary_outcomes=formulary_outcomes,
+                formulary_presence=formulary_presence,
+                kappa=kappa,
+                treatment_group=treatment_group,
+                retain_years=retain_years,
+            )
+        else:
+            panel = process_cohort_file(
+                cohort_path=cohort_path,
+                ssr_outcomes=ssr_outcomes,
+                ssr_presence=ssr_presence,
+                mapping=mapping,
+                kappa=kappa,
+                treatment_group=treatment_group,
+                retain_years=retain_years,
+            )
         out_path = out_dir / f"reg_panel_cohort_{cohort_year}_tg{treatment_group}.csv"
         panel.to_csv(out_path, index=False)
         n_pairs = panel[["A", "B"]].drop_duplicates().shape[0] if not panel.empty else 0
@@ -568,6 +1047,9 @@ def main() -> None:
         [args.treatment_group] if args.treatment_group else list(TREATMENT_GROUPS)
     )
     retain_years = args.retain_years
+    formulary = validate_formulary(args.formulary)
+    formulary_path = args.formulary_path
+    formulary_chunksize = args.formulary_chunksize
 
     total = (
         len(definitions)
@@ -585,7 +1067,7 @@ def main() -> None:
                         f"\n=== Combination {current}/{total}: "
                         f"definition={definition}, event_type={event_type}, "
                         f"control_set={control_set}, treatment_group={treatment_group}, "
-                        f"retain_years={retain_years} ==="
+                        f"retain_years={retain_years}, formulary={formulary} ==="
                     )
                     run(
                         definition=definition,
@@ -593,6 +1075,9 @@ def main() -> None:
                         control_set=control_set,
                         treatment_group=treatment_group,
                         retain_years=retain_years,
+                        formulary=formulary,
+                        formulary_path=formulary_path,
+                        formulary_chunksize=formulary_chunksize,
                     )
 
 

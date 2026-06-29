@@ -19,8 +19,8 @@ Input:
 
 Output:
 - data/cohort_data_with_atcsharing_{atc2|atc3}/quarter-level*/event/req*/.../*.csv
-- csv/cohort_sharing_atc_{atc2|atc3}/quarter-level*/event/req*/Pure Control/*.csv
-- figures/cohort_sharing_atc_{atc2|atc3}/quarter-level*/event/req*/Pure Control/*.png
+- csv/cohort_sharing_{atc2|atc3}/quarter-level*/event/req*/Pure Control/*.csv
+- figures/cohort_sharing_{atc2|atc3}/quarter-level*/event/req*/Pure Control/*.png
 """
 
 from pathlib import Path
@@ -51,8 +51,8 @@ CONTROL_FOLDERS = ["Not", "Not Yet", "Pure Control"]
 PLOT_CONTROL_FOLDER = "Pure Control"
 PANEL = "quarter"
 EVENT_TYPE = "event"
-LARGE_SAMPLE = 1
-PERSONNEL_DEFINITION = "broad"
+LARGE_SAMPLE = 0
+PERSONNEL_DEFINITION = "medium"
 # ================================================================
 
 def build_large_sample_suffix(large_sample: int, personnel_definition: str) -> str:
@@ -184,8 +184,8 @@ def process_one_config(
     cohort_folder = f"{PANEL}-level_{treatment_group}_{relation}_{counterpart}{movement_suffix}"
     req_folder = f"req{event_requirement}"
     data_out_root = PROJECT_ROOT / "data" / f"cohort_data_with_atcsharing_{atc}"
-    fig_root = PROJECT_ROOT / "figures" / f"cohort_sharing_atc_{atc}"
-    csv_root = PROJECT_ROOT / "csv" / f"cohort_sharing_atc_{atc}"
+    fig_root = PROJECT_ROOT / "figures" / f"cohort_sharing_{atc}"
+    csv_root = PROJECT_ROOT / "csv" / f"cohort_sharing_{atc}"
 
     rows = []
     for control_folder in CONTROL_FOLDERS:
