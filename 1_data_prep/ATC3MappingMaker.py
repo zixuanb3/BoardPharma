@@ -49,6 +49,7 @@ def process_data(level='year', atc_level='atc3'):
 
     # Load source rows for peer-cell construction.
     df = pd.read_csv(interim_data_path / "boardex_ssr_price_sample.csv")
+    df["BoardName"] = df["BoardName"].astype(str).str.upper()
     
     # atc_level controls therapeutic aggregation before matching.
     if atc_level == 'atc1':

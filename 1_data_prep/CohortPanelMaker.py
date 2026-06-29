@@ -124,8 +124,8 @@ RUN_CONFIG = {
     "include_eventpair": [0],
     "plot_start_year": 2009,
     "plot_end_year": 2018,
-    "large_sample": 1,
-    "personnel_definition": "broad",
+    "large_sample": 0,
+    "personnel_definition": "medium",
 }
 """
         "to_B_not_in_A",

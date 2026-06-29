@@ -4,20 +4,15 @@ set trace off
 
 // ================================================================
 // Purpose:
-// Estimate stacked DDD specifications that compare post-event outcome
-// changes for treated products with and without ATC sharing, and report
-// the corresponding did_imputation heterogeneity contrast as a check.
+// Estimate stacked did_imputation specifications that compare post-event
+// outcome changes for treated products with and without ATC sharing.
 //
 // Design:
 // - Build stacked cohort-specific samples for each event/control/event_type
-//   combination, then estimate Y = beta0 * (Treat x Post)
-//                        + beta1 * (Treat x Post x ATC-sharing) + FE.
-// - beta0 is the post-event treatment effect for treated products without
-//   ATC sharing; beta1 is the additional effect for sharing products; and
-//   beta0 + beta1 is the total effect for sharing products.
-// - did_imputation with hetby(atc_sharing_het) provides an alternative
-//   staggered-adoption estimator, where tau_1 - tau_0 summarizes the gap
-//   between sharing and non-sharing treatment effects.
+//   combination, then run did_imputation with hetby(atc_sharing_het).
+// - beta0 is tau_0, the ATT for treated products without ATC sharing.
+// - beta1 is tau_1 - tau_0, the additional ATT for sharing products.
+// - beta0 + beta1 is tau_1, the total ATT for sharing products.
 //
 // Sample / Measurement:
 // - The script loops over treatment-side definitions, whether event-pair
@@ -29,9 +24,9 @@ set trace off
 //   from extreme normalized trajectories.
 //
 // Output:
-// - logs/ddd_atcsharing_{atc}*_fe*/
-// - tex/ddd_atcsharing_{atc}*_fe*/
-// - csv/ddd_atcsharing_{atc}*_fe*/
+// - logs/ddd_atcsharing_did_imputation_{atc}*_fe*/
+// - tex/ddd_atcsharing_did_imputation_{atc}*_fe*/
+// - csv/ddd_atcsharing_did_imputation_{atc}*_fe*/
 // ================================================================
 
 * ================= user config =================
@@ -58,7 +53,7 @@ local panel_levels quarter
 cap mkdir "`project_path'/logs"
 cap mkdir "`project_path'/tex"
 cap mkdir "`project_path'/csv"
-local failure_log_path "`project_path'/logs/ddd_atcsharing_failure.log"
+local failure_log_path "`project_path'/logs/ddd_atcsharing_did_imputation_failure.log"
 
 local events interlock_dissolution to_B_not_in_A to_B_still_in_A
 * interlock_dissolution to_B_not_in_A to_B_still_in_A
@@ -107,7 +102,7 @@ foreach atc of local atcs {
     }
 
     local data_root "`project_path'/data/cohort_data_with_atcsharing_`atc'"
-    local output_tag_base "ddd_atcsharing_`atc'`movement_suffix'"
+    local output_tag_base "ddd_atcsharing_did_imputation_`atc'`movement_suffix'"
 
 foreach panel_level of local panel_levels {
     foreach treatment_group of local treatment_groups {
@@ -377,14 +372,18 @@ foreach panel_level of local panel_levels {
                                 cap mkdir "`fe_tex_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
                                 cap mkdir "`fe_csv_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
 
+                                local log_file "`fe_log_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.log"
+
                                 cap log close
-                                log using "`fe_log_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.log", text replace
+                                log using "`log_file'", text replace
 
                                 estimates clear
 
                                 local csv_file "`fe_csv_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.csv"
+                                local tex_file "`fe_tex_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.tex"
                                 tempfile run_results
                                 tempname posth
+                                local skip_specification 0
 
                                 postfile `posth' ///
                                     str12 panel_level ///
@@ -402,7 +401,6 @@ foreach panel_level of local panel_levels {
                                     double beta0 beta0_se beta0_p ///
                                     double beta1 beta1_se beta1_p ///
                                     double te_share te_share_se te_share_p ///
-                                    double didimp_diff didimp_diff_se didimp_diff_p ///
                                     double pcteff_notshare pcteff_share ///
                                     double premean_notshare premean_share ///
                                     double N_obs N_control N_notshare N_share ///
@@ -526,12 +524,6 @@ foreach panel_level of local panel_levels {
                                     * Post is defined relative to each stack's own cohort entry date
                                     gen treat = treated_in_stack
                                     gen post = q_time >= yq(data_cohort, 1)
-                                    gen did = treat * post
-                                    * g marks the heterogeneity dimension of interest: ATC sharing status among treated units.
-                                    gen g = atc_sharing if treat == 1
-                                    replace g = 0 if missing(g)
-                                    * did_g is the DDD interaction. Its coefficient is the incremental treatment effect for sharing products relative to non-sharing ones.
-                                    gen did_g = did * g
                                     gen pre_period = q_time < yq(data_cohort, 1)
 
                                     local premean_notshare = .
@@ -648,10 +640,8 @@ foreach panel_level of local panel_levels {
                                         exit 198
                                     }
 
-                                    local reghdfe_controls ""
                                     local did_controls ""
                                     if "`kappa_control_var'" != "" {
-                                        local reghdfe_controls "c.`kappa_control_var'"
                                         local did_controls "controls(`kappa_control_var')"
                                     }
 
@@ -659,23 +649,64 @@ foreach panel_level of local panel_levels {
                                         local fe_spec "`fe_spec' atc_id"
                                     }
 
-                                    reghdfe `target' did did_g `reghdfe_controls', absorb(`fe_spec')
-                                    local N_obs_reghdfe = e(N)
+                                    local N_obs_didimp = .
+                                    local beta0 = .
+                                    local beta0_se = .
+                                    local beta0_p = .
+                                    local beta1 = .
+                                    local beta1_se = .
+                                    local beta1_p = .
+                                    local te_share = .
+                                    local te_share_se = .
+                                    local te_share_p = .
+                                    local failure_reason ""
 
-                                    lincom did
-                                    local beta0 = r(estimate)
-                                    local beta0_se = r(se)
-                                    local beta0_p = r(p)
+                                    capture noisily did_imputation `target' id q_time event_cohort_did_imputation, ///
+                                        fe(`fe_spec') ///
+                                        hetby(atc_sharing_het) ///
+                                        autosample tol(0.1) minn(0) `did_controls'
+                                    local did_rc = _rc
 
-                                    lincom did_g
-                                    local beta1 = r(estimate)
-                                    local beta1_se = r(se)
-                                    local beta1_p = r(p)
+                                    if `did_rc' != 0 {
+                                        local failure_reason "did_imputation failed in main DDD estimator: r(`did_rc')"
+                                    }
+                                    else {
+                                        quietly count if e(sample)
+                                        local N_obs_didimp = r(N)
 
-                                    lincom did + did_g
-                                    local te_share = r(estimate)
-                                    local te_share_se = r(se)
-                                    local te_share_p = r(p)
+                                        capture noisily lincom tau_0
+                                        local lincom_beta0_rc = _rc
+                                        if `lincom_beta0_rc' != 0 {
+                                            local failure_reason "lincom tau_0 failed in main DDD estimator: r(`lincom_beta0_rc')"
+                                        }
+                                        else {
+                                            local beta0 = r(estimate)
+                                            local beta0_se = r(se)
+                                            local beta0_p = r(p)
+                                        }
+
+                                        capture noisily lincom tau_1 - tau_0
+                                        local lincom_beta1_rc = _rc
+                                        if `lincom_beta1_rc' != 0 {
+                                            local failure_reason "lincom tau_1 - tau_0 failed in main DDD estimator: r(`lincom_beta1_rc')"
+                                        }
+                                        else {
+                                            local beta1 = r(estimate)
+                                            local beta1_se = r(se)
+                                            local beta1_p = r(p)
+                                        }
+
+                                        capture noisily lincom tau_1
+                                        local lincom_share_rc = _rc
+                                        if `lincom_share_rc' != 0 {
+                                            local failure_reason "lincom tau_1 failed in main DDD estimator: r(`lincom_share_rc')"
+                                        }
+                                        else {
+                                            local te_share = r(estimate)
+                                            local te_share_se = r(se)
+                                            local te_share_p = r(p)
+                                        }
+                                    }
 
                                     local pcteff_notshare = .
                                     if "`std'" == "standardize" {
@@ -695,40 +726,6 @@ foreach panel_level of local panel_levels {
                                     }
                                     else if !missing(`premean_share') & `premean_share' != 0 {
                                         local pcteff_share = 100 * `te_share' / abs(`premean_share')
-                                    }
-
-                                    estimates store m_`target'
-
-                                    * did_imputation serves as a staggered-adoption robustness check;
-                                    * tau_1 - tau_0 is the heterogeneity contrast between sharing and non-sharing treated products under that estimator.
-                                    local N_obs_didimp = .
-                                    local didimp_diff = .
-                                    local didimp_diff_se = .
-                                    local didimp_diff_p = .
-
-                                    capture noisily did_imputation `target' id q_time event_cohort_did_imputation, ///
-                                        fe(`fe_spec') ///
-                                        hetby(atc_sharing_het) ///
-                                        autosample tol(0.1) minn(0) `did_controls'
-                                    local did_rc = _rc
-
-                                    if `did_rc' != 0 {
-                                        local failure_reason "did_imputation failed in DDD check: r(`did_rc')"
-                                    }
-                                    else {
-                                        local N_obs_didimp = e(N)
-
-                                        capture noisily lincom tau_1 - tau_0
-                                        local lincom_rc = _rc
-                                        if `lincom_rc' != 0 {
-                                            local failure_reason "lincom tau_1 - tau_0 failed in DDD check: r(`lincom_rc')"
-                                        }
-                                        else {
-                                            local failure_reason ""
-                                            local didimp_diff = r(estimate)
-                                            local didimp_diff_se = r(se)
-                                            local didimp_diff_p = r(p)
-                                        }
                                     }
 
                                     if "`failure_reason'" != "" {
@@ -757,32 +754,24 @@ foreach panel_level of local panel_levels {
                                         file write failure_log "control_kappa=`control_kappa'" _n
                                         file write failure_log "control_atc=`control_atc'" _n
                                         file write failure_log "cohort_list=`cohort_list'" _n
-                                        file write failure_log "log_path=`fe_log_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.log" _n
+                                        file write failure_log "log_path=`log_file'" _n
                                         file close failure_log
+
+                                        local skip_specification 1
+                                        continue, break
                                     }
 
-                                    post `posth' ///
-                                        ("`panel_level'") ///
-                                        ("`event'") ///
-                                        ("`control'") ///
-                                        ("`control_variation_title'") ///
-                                        ("`std'") ///
-                                        ("`event_type'") ///
-                                        ("`target'") ///
-                                        ("reghdfe") ///
-                                        ("`c_var'") ///
-                                        ("`control_kappa'") ///
-                                        ("`atc'") ///
-                                        ("`control_atc'") ///
-                                        (`beta0') (`beta0_se') (`beta0_p') ///
-                                        (`beta1') (`beta1_se') (`beta1_p') ///
-                                        (`te_share') (`te_share_se') (`te_share_p') ///
-                                        (.) (.) (.) ///
-                                        (`pcteff_notshare') (`pcteff_share') ///
-                                        (`premean_notshare') (`premean_share') ///
-                                        (`N_obs_reghdfe') (`N_control') (`N_notshare') (`N_share') ///
-                                        (`product_control') (`product_notshare') (`product_share') ///
-                                        (`board_control') (`board_notshare') (`board_share')
+                                    tempname didimp_b didimp_V
+                                    matrix `didimp_b' = (`beta0', `beta1')
+                                    matrix colnames `didimp_b' = beta0 beta1
+                                    matrix `didimp_V' = J(2, 2, 0)
+                                    matrix rownames `didimp_V' = beta0 beta1
+                                    matrix colnames `didimp_V' = beta0 beta1
+                                    matrix `didimp_V'[1, 1] = `beta0_se'^2
+                                    matrix `didimp_V'[2, 2] = `beta1_se'^2
+                                    ereturn post `didimp_b' `didimp_V', obs(`N_obs_didimp')
+                                    ereturn local cmd "did_imputation"
+                                    estimates store m_`target'
 
                                     post `posth' ///
                                         ("`panel_level'") ///
@@ -797,31 +786,14 @@ foreach panel_level of local panel_levels {
                                         ("`control_kappa'") ///
                                         ("`atc'") ///
                                         ("`control_atc'") ///
-                                        (.) (.) (.) ///
-                                        (.) (.) (.) ///
-                                        (.) (.) (.) ///
-                                        (`didimp_diff') (`didimp_diff_se') (`didimp_diff_p') ///
+                                        (`beta0') (`beta0_se') (`beta0_p') ///
+                                        (`beta1') (`beta1_se') (`beta1_p') ///
+                                        (`te_share') (`te_share_se') (`te_share_p') ///
                                         (`pcteff_notshare') (`pcteff_share') ///
                                         (`premean_notshare') (`premean_share') ///
                                         (`N_obs_didimp') (`N_control') (`N_notshare') (`N_share') ///
                                         (`product_control') (`product_notshare') (`product_share') ///
                                         (`board_control') (`board_notshare') (`board_share')
-
-                                    local didimp_star ""
-                                    if !missing(`didimp_diff_p') {
-                                        if `didimp_diff_p' < 0.01 {
-                                            local didimp_star "***"
-                                        }
-                                        else if `didimp_diff_p' < 0.05 {
-                                            local didimp_star "**"
-                                        }
-                                        else if `didimp_diff_p' < 0.10 {
-                                            local didimp_star "*"
-                                        }
-                                    }
-                                    local didimp_diff_disp : display %9.3f `didimp_diff'
-                                    local didimp_diff_disp = strtrim("`didimp_diff_disp'")
-                                    local didimp_diff_star "`didimp_diff_disp'`didimp_star'"
 
                                     estimates restore m_`target'
                                     estadd scalar premean_notshare = `premean_notshare'
@@ -837,10 +809,14 @@ foreach panel_level of local panel_levels {
                                     estadd scalar board_control = `board_control'
                                     estadd scalar board_notshare = `board_notshare'
                                     estadd scalar board_share = `board_share'
-                                    estadd local didimp_diff_star = "`didimp_diff_star'"
-                                    estadd scalar didimp_diff = `didimp_diff'
-                                    estadd scalar didimp_diff_se = `didimp_diff_se'
-                                    estadd scalar didimp_diff_p = `didimp_diff_p'
+                                }
+
+                                if `skip_specification' {
+                                    capture erase "`csv_file'"
+                                    capture erase "`tex_file'"
+                                    postclose `posth'
+                                    log close
+                                    continue
                                 }
 
                                 postclose `posth'
@@ -849,15 +825,14 @@ foreach panel_level of local panel_levels {
                                 export delimited using "`csv_file'", replace
                                 restore
 
-                                local tex_file "`fe_tex_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.tex"
                                 tempfile tex_fragment
 
                                 esttab m_price using "`tex_fragment'", ///
                                     replace booktabs se star(* 0.10 ** 0.05 *** 0.01) ///
-                                    keep(did did_g) ///
+                                    keep(beta0 beta1) ///
                                     coeflabels( ///
-                                        did "beta0: Treat x Post" ///
-                                        did_g "beta1: Treat x Post x G" ///
+                                        beta0 "beta0: ATT (Not Share)" ///
+                                        beta1 "beta1: ATT gap (Share - Not Share)" ///
                                     ) ///
                                     mtitles("Price") ///
                                     stats( ///
@@ -874,11 +849,8 @@ foreach panel_level of local panel_levels {
                                         board_notshare ///
                                         product_control ///
                                         product_share ///
-                                        product_notshare ///
-                                        didimp_diff_star ///
-                                        didimp_diff_se ///
-                                        didimp_diff_p, ///
-                                        fmt(3 3 2 2 0 0 0 0 0 0 0 0 0 0 %9s 3 3) ///
+                                        product_notshare, ///
+                                        fmt(3 3 2 2 0 0 0 0 0 0 0 0 0 0) ///
                                         labels( ///
                                             "Pre-treatment mean Y (Not Share)" ///
                                             "Pre-treatment mean Y (Share)" ///
@@ -894,12 +866,9 @@ foreach panel_level of local panel_levels {
                                             "Unique Products (Control)" ///
                                             "Unique Products (Share, Treated)" ///
                                             "Unique Products (Not Share, Treated)" ///
-                                            "did-imputation: tau1-tau0" ///
-                                            "did-imputation SE" ///
-                                            "did-imputation p-value" ///
                                         ) ///
                                     ) ///
-                                    title("DDD: `event', `event_type', `control_title', `std' | `group_label' | FE `fe_level' | kappa=`control_kappa' | atc=`atc' | control_atc=`control_atc'")
+                                    title("did_imputation DDD: `event', `event_type', `control_title', `std' | `group_label' | FE `fe_level' | kappa=`control_kappa' | atc=`atc' | control_atc=`control_atc'")
 
                                 tempname fhin fhout
                                 file open `fhin' using "`tex_fragment'", read text

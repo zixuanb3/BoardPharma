@@ -1,42 +1,24 @@
 r"""
 Purpose:
-  Build firm-pair–year movement panels and regression-ready cohort panels
-  under THREE alternative personnel definitions, directly from
-  ssr_company_roster.csv (the master personnel roster with role tiers).
+  Build firm-pair-year movement panels and regression-ready cohort panels
+  from ssr_company_roster.csv under the personnel definitions configured in
+  RUN_CONFIG.
 
-Personnel Definitions (PARAMETERISED):
-  NARROW  – board only     : leader_tier in ["board", "boardex"]
-  MEDIUM  – board + C-suite: above + ["csuite"]
-  BROAD   – board + C + VP : above + ["vp_tech_hr"]
-
-For each definition:
-  1. Build director-year-board assignments from the filtered roster.
-  2. Detect director movements (A -> B) and classify:
-       to_B_still_in_A  – director retains seat on A in year t
-       to_B_not_in_A    – director leaves A in year t
-       dissolution      – director was on both A and B in t-1, leaves A in t
-  3. Aggregate to firm-pair–year level with stay counters.
-  4. Construct event dummy controls per empirical_specification.tex:
-       pre_retain, pre_exit, pre_dissolved     (before window)
-       sameq_retain, sameq_exit, sameq_dissolved (same year)
-       post_retain, post_exit, post_dissolved   (post window)
-       retain_Xyr                               (persistence dummy)
-  5. Build control groups C1A, C1B, C2A, C2B with per-cohort non-overlap.
-  6. Output regression-ready panel + sample size summary.
-
-All window lengths and retain-duration thresholds are PARAMETERISED
-in RUN_CONFIG.
+Process:
+  1. Load the master roster, uppercase BoardName, and filter by personnel tier.
+  2. Build director-year-board assignments and detect A-to-B movements:
+     to_B_still_in_A, to_B_not_in_A, and dissolution.
+  3. Aggregate movements to firm-pair-year panels with retain-duration counters.
+  4. Build configured control sets and cohort regression panels, then summarize
+     sample sizes.
 
 Input:
-  InterimData\ssr_company_roster.csv          (master roster, 122751 rows)
-  InterimData\boardex_ssr_price_sample.csv (optional SSR data)
+  InterimData\ssr_company_roster.csv
 
-Output (under data\personnel_panels\):
-  {definition}/pair_movement_panel.csv       (pair-year movement counts)
-  {definition}/cohort_panels/{control_set}/reg_panel_cohort_{year}.csv
-  sample_size_summary.csv
-
-Author: Generated for pharma project
+Output:
+  data\personnel_panels\{definition}\pair_movement_panel_retain{n}yr.csv
+  data\personnel_panels\{definition}\cohort_panels\retain{n}yr\{event_type}\{control_set}\reg_panel_cohort_{year}.csv
+  data\personnel_panels\sample_size_summary.csv
 """
 
 import os
@@ -65,7 +47,7 @@ RUN_CONFIG = {
     "personnel_defs": {
         "narrow_board":       ["board", "boardex"],
         "medium_board_csuite": ["board", "boardex", "csuite"],
-        "broad_board_c_vp":    ["board", "boardex", "csuite", "vp_tech_hr"],
+        #"broad_board_c_vp":    ["board", "boardex", "csuite", "vp_tech_hr"],
     },
 
     # ── Movement detection ──
@@ -73,11 +55,11 @@ RUN_CONFIG = {
     "max_year": 2023,             # latest year to consider
 
     # ── Retain persistence ──
-    "retain_years_list": [3],  # years a director must stay on B to count as "retained"
+    "retain_years_list": [2],  # years a director must stay on B to count as "retained"
 
     # ── Window & cohort params ──
-    "window_pre_years": 2,        # years before event in estimation window
-    "window_post_years": 2,       # years after event in estimation window
+    "window_pre_years": 1,        # years before event in estimation window
+    "window_post_years": 1,       # years after event in estimation window
     "cohort_year_min": 2003,      # first cohort year (must be >= min_year + window_pre)
     "cohort_year_max": 2021,      # last cohort year  (must be <= max_year - window_post)
 
@@ -87,7 +69,7 @@ RUN_CONFIG = {
     "post_period_variant": "A",
 
     # ── Control sets ──
-    "control_sets": ["C1A", "C1B","C4", "C6A", "C6B"],
+    "control_sets": ["C4", "C6A", "C6B"],
 
     # ── Event types to build panels for ──
     "event_types": [
@@ -106,6 +88,7 @@ RUN_CONFIG = {
 def load_roster() -> pd.DataFrame:
     """Load the master personnel roster and normalize firm names."""
     df = pd.read_csv(ROSTER_PATH)
+    df["BoardName"] = df["BoardName"].astype(str).str.upper()
     df["year"] = df["year"].astype(int)
     df["DirectorID"] = df["DirectorID"].astype(int)
     df["CompanyID"] = df["CompanyID"].astype(int)
@@ -438,6 +421,7 @@ def build_event_dummies(
     window_pre: int,
     window_post: int,
     pair_panel: pd.DataFrame,
+    retain_years: int,
 ) -> dict:
     """
     Construct event-level dummy controls for a specific firm PAIR (A, B).
@@ -453,14 +437,16 @@ def build_event_dummies(
     event_type : 'to_B_still_in_A', 'to_B_not_in_A', or 'dissolution'
     window_pre : years before event
     window_post : years after event
-    pair_panel : full pair-year panel (A, B, year, retain, exit, dissolution, stay_3_years)
+    pair_panel : full pair-year panel (A, B, year, retain, exit, dissolution, stay_X_years)
     """
+    stay_col = f"stay_{retain_years}_years"
+    retain_dummy = f"retain_{retain_years}yr"
     dummies = {
         "pre_retain_W": 0, "pre_exit_W": 0, "pre_dissolved_W": 0,
         "pre_retain_F": 0, "pre_exit_F": 0, "pre_dissolved_F": 0,
         "sameq_retain": 0, "sameq_exit": 0, "sameq_dissolved": 0,
         "post_retain": 0, "post_exit": 0, "post_dissolved": 0,
-        "retain_3yr": 0,
+        retain_dummy: 0,
     }
 
     # Filter pair_panel to this specific pair (A, B)
@@ -507,11 +493,11 @@ def build_event_dummies(
         if post["dissolution"].max() > 0:
             dummies["post_dissolved"] = 1
 
-    # --- retain_3yr: THIS pair had a retain event with stay_3_years >= 1 in cohort_year ---
+    # --- retain_Xyr: THIS pair had a retain event with stay_X_years >= 1 in cohort_year ---
     if event_type == "to_B_still_in_A":
         firm_retains = pp[pp["year"] == cohort_year]
-        if "stay_3_years" in firm_retains.columns and firm_retains["stay_3_years"].sum() > 0:
-            dummies["retain_3yr"] = 1
+        if stay_col in firm_retains.columns and firm_retains[stay_col].sum() > 0:
+            dummies[retain_dummy] = 1
 
     return dummies
 
@@ -705,6 +691,7 @@ def build_regression_panel(
     window_post: int,
     control_set: str,
     control_pairs: set,
+    retain_years: int,
     post_period_variant: str = "A",
 ) -> pd.DataFrame | None:
     """
@@ -767,6 +754,7 @@ def build_regression_panel(
             window_pre=window_pre,
             window_post=window_post,
             pair_panel=pair_panel,
+            retain_years=retain_years,
         )
     for (a, b), dvals in dummy_cache.items():
         mask = (treated_window["A"] == a) & (treated_window["B"] == b)
@@ -965,6 +953,7 @@ def main():
                             window_post=cfg["window_post_years"],
                             control_set=cs_name,
                             control_pairs=ctrl_pairs,
+                            retain_years=retain_years,
                             post_period_variant=cfg["post_period_variant"],
                         )
 

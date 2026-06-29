@@ -105,8 +105,8 @@ RUN_CONFIG = {
     "stay_x_years": 2,
     "balance_window": (-1, 1),
     "treatment_groups": ["B","A"],
-    "large_sample": 1,
-    "personnel_definition": "broad",
+    "large_sample": 0,
+    "personnel_definition": "medium",
 }
 # ===============================================================
 
@@ -129,6 +129,7 @@ def build_large_sample_suffix(large_sample: int, personnel_definition: str) -> s
 def load_ssr_panel(panel_level: str) -> pd.DataFrame:
     """Load and aggregate SSR data to the requested panel level."""
     ssr = pd.read_csv(INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv")
+    ssr["BoardName"] = ssr["BoardName"].astype(str).str.upper()
     group_cols = ["BoardName", "year", "product", "atc3"]
     sort_cols = ["BoardName", "product", "year"]
     if panel_level == "quarter":

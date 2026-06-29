@@ -125,6 +125,7 @@ def load_firm_level() -> pd.DataFrame:
         FIRM_LEVEL_INPUT_PATH,
         key_cols=["rdate", "cusip", "firm"],
     )
+    firm_level["firm"] = firm_level["firm"].str.upper()
     _require_columns(firm_level, FIRM_LEVEL_REQUIRED_COLS, FIRM_LEVEL_INPUT_PATH.name)
     _require_no_missing_keys(firm_level, KEY_COLS, FIRM_LEVEL_INPUT_PATH.name)
     _require_unique_keys(firm_level, KEY_COLS, FIRM_LEVEL_INPUT_PATH.name)
@@ -137,6 +138,8 @@ def build_raw_kappa_moments() -> pd.DataFrame:
         PAIRWISE_INPUT_PATH,
         key_cols=["rdate", "cusip_j", "firm_j"],
     )
+    pairwise["firm_j"] = pairwise["firm_j"].str.upper()
+    pairwise["firm_k"] = pairwise["firm_k"].astype("string").str.strip().str.upper()
     _require_columns(pairwise, PAIRWISE_REQUIRED_COLS, PAIRWISE_INPUT_PATH.name)
     _require_no_missing_keys(pairwise, ["rdate", "firm_j", "cusip_j"], PAIRWISE_INPUT_PATH.name)
 

@@ -62,7 +62,7 @@ INTERLOCK_REQUIRED_COLUMNS = {
 
 RUN_CONFIG = {
     "large_sample": 1,
-    "personnel_definition": "broad",
+    "personnel_definition": "narrow",
 }
 
 

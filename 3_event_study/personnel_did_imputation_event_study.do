@@ -16,7 +16,7 @@ set trace off
 // 5. Export group4 x event-time coefficient CSVs and event_plot figures.
 //
 // Input:
-// - data/personnel_regression_panels/{definition}/retain3yr/{event_type}/
+// - data/personnel_regression_panels/{definition}/retain{retain_years}yr/{event_type}/
 //   {control_set}/treatment_group_{A|B}/reg_panel_cohort_{cohort}_tg{A|B}.csv
 //
 // Output:
@@ -26,10 +26,10 @@ set trace off
 // ================================================================
 
 * ================= user config =================
-local definitions narrow_board medium_board_csuite broad_board_c_vp
+local definitions narrow_board medium_board_csuite
 * narrow_board medium_board_csuite broad_board_c_vp
 local event_types to_B_still_in_A to_B_not_in_A dissolution
-local control_sets C6A
+local control_sets C4 C6B C6A
 * C1A C1B C4 C6B C6A
 local treatment_groups A B
 * A B
@@ -39,15 +39,16 @@ local fe_levels 2
 * 1 2
 local balanced_only_values 0
 * 1
-local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017
+local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+local retain_years 2
 
-local did_horizons 0/11
-local did_pretrend 6
-local coef_names pre_6 pre_5 pre_4 pre_3 pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7 post_8 post_9 post_10 post_11
-local n_total 18
-local trimlead 6
-local trimlag 11
-local xlabel_spec "-6(1)11"
+local did_horizons 0/7
+local did_pretrend 3
+local coef_names pre_4 pre_3 pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
+local n_total 12
+local trimlead 3
+local trimlag 7
+local xlabel_spec "-3(1)7"
 local graph_width 3000
 local perturb_step 0.10
 local perturb_span 0.30
@@ -111,7 +112,7 @@ foreach std of local standardize_types {
     }
 
     * -------- setup paths for this iteration --------
-    local input_path "`input_root'/`definition'/retain3yr/`event_type'/`control_set'/treatment_group_`treatment_group'"
+    local input_path "`input_root'/`definition'/retain`retain_years'yr/`event_type'/`control_set'/treatment_group_`treatment_group'"
 
     foreach base in "`fig_root'" "`csv_root'" "`log_root'" {
         cap mkdir "`base'/`definition'"
@@ -626,10 +627,10 @@ foreach std of local standardize_types {
         }
     }
 
-    * -------- plot four group4 ATT curves together --------
-    capture noisily event_plot did_b_g0#did_V_g0 did_b_g1#did_V_g1 did_b_g2#did_V_g2 did_b_g3#did_V_g3, ///
-        stub_lag(post_# post_# post_# post_#) ///
-        stub_lead(pre_# pre_# pre_# pre_#) ///
+    * -------- plot clean group4 ATT curves together --------
+    capture noisily event_plot did_b_g0#did_V_g0 did_b_g1#did_V_g1, ///
+        stub_lag(post_# post_#) ///
+        stub_lead(pre_# pre_#) ///
         trimlead(`trimlead') trimlag(`trimlag') ///
         plottype(scatter) ciplottype(rcap) ///
         together perturb(-`perturb_span'(`perturb_increment')`perturb_span') noautolegend ///
@@ -638,17 +639,15 @@ foreach std of local standardize_types {
             xtitle("Quarters since event", size(small)) ///
             ytitle("log(`target')", size(small)) ///
             xlabel(`xlabel_spec', nogrid) ///
-            legend(order(1 "clean, non-share" 3 "clean, share" 5 "confounded, non-share" 7 "confounded, share") ///
-                rows(2) position(6) region(style(none))) ///
+            legend(order(1 "clean, non-share" 3 "clean, share") ///
+                rows(1) position(6) region(style(none))) ///
             xline(-0.5, lcolor(gs8) lpattern(dash)) ///
             yline(0, lcolor(gs8)) ///
             graphregion(color(white)) bgcolor(white) ///
             ylabel(, angle(horizontal)) ///
         ) ///
         lag_opt1(msymbol(O) color(black)) lag_ci_opt1(color(black)) ///
-        lag_opt2(msymbol(Th) color(navy)) lag_ci_opt2(color(navy)) ///
-        lag_opt3(msymbol(S) color(maroon)) lag_ci_opt3(color(maroon)) ///
-        lag_opt4(msymbol(D) color(green)) lag_ci_opt4(color(green))
+        lag_opt2(msymbol(Th) color(navy)) lag_ci_opt2(color(navy))
     local plot_rc = _rc
 
     if `plot_rc' == 0 {

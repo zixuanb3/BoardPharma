@@ -63,8 +63,8 @@ CounterpartLookup = dict[tuple[str, int], set[str]]
 RUN_CONFIG = {
     "stay_x_years": 2,
     "requirement2_window": (-1, 1),
-    "large_sample": 1,
-    "personnel_definition": "broad",
+    "large_sample": 0,
+    "personnel_definition": "narrow",
 }
 # ===============================================================
 
@@ -147,7 +147,7 @@ class MovementEventBuilder:
             ["DirectorID", "year", "BoardName"],
         ].copy()
         memberships["year"] = memberships["year"].astype(int)
-        memberships["BoardName"] = memberships["BoardName"].astype(str)
+        memberships["BoardName"] = memberships["BoardName"].astype(str).str.upper()
         memberships = memberships.drop_duplicates(subset=["DirectorID", "year", "BoardName"])
 
         # 2) Collapse each director-year to a sorted board list, then complete
@@ -413,14 +413,17 @@ class InterlockEventBuilder:
         """Return one combined interlock candidate table for all provided interlock inputs."""
         # SSR universe comes from the SSR price sample, not boardex_pharma.
         ssr = pd.read_csv(self.ssr_sample_path, usecols=["BoardName"])
+        ssr["BoardName"] = ssr["BoardName"].astype(str).str.upper()
         ssr_boards = set(ssr["BoardName"].dropna().astype(str).unique())
         all_interlock_parts: list[pd.DataFrame] = []
 
         for interlock_type, input_path in input_paths:
             pairs = pd.read_stata(input_path, columns=["BoardName1", "BoardName2", "year"])
             pairs = pairs.dropna(subset=["BoardName1", "BoardName2", "year"]).copy()
-            pairs["BoardName"] = pairs["BoardName1"].astype(str)
-            pairs["BoardNamePair"] = pairs["BoardName2"].astype(str)
+            pairs["BoardName1"] = pairs["BoardName1"].astype(str).str.upper()
+            pairs["BoardName2"] = pairs["BoardName2"].astype(str).str.upper()
+            pairs["BoardName"] = pairs["BoardName1"]
+            pairs["BoardNamePair"] = pairs["BoardName2"]
             # Keep only pair-years where both firms are in the SSR price-sample universe.
             pairs = pairs.loc[
                 pairs["BoardName"].isin(ssr_boards) & pairs["BoardNamePair"].isin(ssr_boards)

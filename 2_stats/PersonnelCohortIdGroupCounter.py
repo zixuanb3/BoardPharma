@@ -1,20 +1,22 @@
 """
-Count unique personnel regression-panel ids by treatment subgroup.
+Purpose:
+Count unique personnel regression-panel ids by treatment subgroup, matching
+the personnel did_imputation id definition: group(A B product data_cohort).
 
-The id definition matches the personnel did_imputation do-file:
-    id = group(A B product data_cohort)
+Process:
+1. Read personnel product-quarter cohort panels for each selected definition,
+   event type, control set, treatment group, and cohort year 2009-2017.
+2. Optionally keep only the regression event window, event_time in [-8, 11].
+3. Classify ids into control, treated clean/nonshare, treated clean/share,
+   treated confounded/nonshare, and treated confounded/share groups.
+4. Count unique ids after checking id-level group consistency.
+5. Save one summary CSV with counts and file status by cohort specification.
 
-For every definition x event_type x control_set x treatment_group combination,
-this script reads all 2009-2017 cohort CSVs and counts unique ids by:
-    - control
-    - treated clean non-share
-    - treated clean share
-    - treated confounded non-share
-    - treated confounded share
+Input:
+- data/personnel_regression_panels/{definition}/retain{retain_years}yr/{event_type}/{control_set}/treatment_group_{A|B}/reg_panel_cohort_YYYY_tg{A|B}.csv
 
-By default, the count uses the same event-study window as the regression
-do-file, event_time in [-8, 11]. Use --no-event-window to count all rows in
-each cohort file before event-window filtering.
+Output:
+- csv/personnel_cohort_id_counts/personnel_cohort_id_group_counts.csv
 """
 
 from __future__ import annotations
@@ -31,17 +33,19 @@ CODE_ROOT = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = CODE_ROOT.parent
 INPUT_ROOT = PROJECT_ROOT / "data" / "personnel_regression_panels"
 DEFAULT_OUTPUT_PATH = (
-    CODE_ROOT
-    / "output"
+    PROJECT_ROOT
+    / "csv"
     / "personnel_cohort_id_counts"
     / "personnel_cohort_id_group_counts.csv"
 )
 
-DEFINITIONS = ("narrow_board", "medium_board_csuite", "broad_board_c_vp")
+DEFINITIONS = ("narrow_board", "medium_board_csuite")
+# broad_board_c_vp
 EVENT_TYPES = ("to_B_still_in_A", "to_B_not_in_A", "dissolution")
-CONTROL_SETS = ("C1A", "C1B", "C4", "C6A", "C6B")
+CONTROL_SETS = ("C4", "C6A", "C6B")
 TREATMENT_GROUPS = ("A", "B")
-COHORT_YEARS = tuple(range(2009, 2018))
+COHORT_YEARS = tuple(range(2009, 2019))
+RETAIN_YEARS = 2
 
 ID_COLS = ("A", "B", "product", "data_cohort")
 CONFOUNDING_COLS = (
@@ -83,6 +87,7 @@ class CohortSpec:
     control_set: str
     treatment_group: str
     cohort_year: int
+    retain_years: int
 
     @property
     def input_path(self) -> Path:
@@ -90,7 +95,7 @@ class CohortSpec:
         return (
             INPUT_ROOT
             / self.definition
-            / "retain3yr"
+            / f"retain{self.retain_years}yr"
             / self.event_type
             / self.control_set
             / f"treatment_group_{self.treatment_group}"
@@ -113,6 +118,14 @@ def parse_args() -> argparse.Namespace:
         choices=TREATMENT_GROUPS,
     )
     parser.add_argument("--cohort-year", type=int, choices=COHORT_YEARS)
+    parser.add_argument(
+        "--retain-years",
+        "--retain_years",
+        dest="retain_years",
+        type=int,
+        default=RETAIN_YEARS,
+        help="Years a director must stay on B in the upstream personnel panels.",
+    )
     parser.add_argument(
         "--no-event-window",
         action="store_true",
@@ -153,6 +166,7 @@ def iter_specs(args: argparse.Namespace) -> Iterable[CohortSpec]:
                             control_set=str(control_set),
                             treatment_group=str(treatment_group),
                             cohort_year=int(cohort_year),
+                            retain_years=args.retain_years,
                         )
 
 
