@@ -31,7 +31,7 @@ set trace off
 local atcs atc3 atc2
 * atc3 atc2
 local large_sample 1
-local personnel_definition broad
+local personnel_definition narrow
 * narrow medium broad
 local separate_modes 0
 * 1
@@ -61,7 +61,7 @@ local standardize_types log_transform
 * log_transform standardize normalize
 local event_types event
 * first_event
-local reqs 0 1 2
+local reqs 0 1
 * 0 1 2
 local control_for_other_events other_event
 * none other_event

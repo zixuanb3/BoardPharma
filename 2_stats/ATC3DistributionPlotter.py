@@ -7,7 +7,8 @@ Process:
 2. Read ATC2/ATC3 product-firm mapping files.
 3. Read balanced quarter-level movement cohort files from CohortPanelMaker.
 4. Label treated BoardName-product rows with atc_sharing indicators.
-5. Save enriched cohorts and Pure Control yearly sharing summaries.
+5. Add pre-event rival-share and HHI exposure measures.
+6. Save enriched cohorts and Pure Control yearly sharing summaries.
 
 Input:
 - data/event_tables/movement_event_candidates.csv
@@ -35,6 +36,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 COHORT_ROOT = PROJECT_ROOT / "data" / "cohort_data"
 ATC_MAP_DIR = PROJECT_ROOT / "data" / "atc3mapping"
 EVENT_TABLES_DIR = PROJECT_ROOT / "data" / "event_tables"
+INTERIM_DATA_DIR = PROJECT_ROOT / "InterimData"
+SSR_PRICE_SAMPLE_PATH = INTERIM_DATA_DIR / "boardex_ssr_price_sample.csv"
+HHI_COLUMNS = [
+    "hhi_quantity_atc3",
+    "hhi_revenue_atc3",
+    "hhi_quantity_atc2",
+    "hhi_revenue_atc2",
+]
+RIVAL_SHARE_COLUMNS = [
+    "rival_share_quantity_atc3",
+    "rival_share_revenue_atc3",
+    "rival_share_quantity_atc2",
+    "rival_share_revenue_atc2",
+]
 
 # ========================== USER CONFIG ==========================
 ATCS = ["atc3","atc2"]
@@ -51,9 +66,14 @@ CONTROL_FOLDERS = ["Not", "Not Yet", "Pure Control"]
 PLOT_CONTROL_FOLDER = "Pure Control"
 PANEL = "quarter"
 EVENT_TYPE = "event"
-LARGE_SAMPLE = 0
-PERSONNEL_DEFINITION = "medium"
+LARGE_SAMPLE = 1
+PERSONNEL_DEFINITION = "narrow"
 # ================================================================
+
+
+def firm_key(series: pd.Series) -> pd.Series:
+    """Normalize firm names for cross-file matching."""
+    return series.astype(str).str.upper()
 
 def build_large_sample_suffix(large_sample: int, personnel_definition: str) -> str:
     """Return movement file suffix for the configured sample definition."""
@@ -147,6 +167,222 @@ def build_partner_table(
     return partners
 
 
+def build_market_exposures(cohort_years: list[int]) -> dict[str, pd.DataFrame]:
+    """Build pre-event firm-share and HHI lookup tables from SSR sales."""
+    required = ["BoardName", "year", "quarter", "atc3", "revenue", "quantity"]
+    ssr = pd.read_csv(SSR_PRICE_SAMPLE_PATH, usecols=required)
+    ssr["year"] = pd.to_numeric(ssr["year"], errors="raise").astype(int)
+    ssr["quarter"] = pd.to_numeric(ssr["quarter"], errors="raise").astype(int)
+    ssr["revenue"] = pd.to_numeric(ssr["revenue"], errors="coerce").fillna(0)
+    ssr["quantity"] = pd.to_numeric(ssr["quantity"], errors="coerce").fillna(0)
+    ssr["_firm_key"] = firm_key(ssr["BoardName"])
+    ssr["_atc3_for_exposure"] = ssr["atc3"].astype(str)
+    ssr["_atc2_for_exposure"] = ssr["_atc3_for_exposure"].str[:-1]
+    ssr["cohort_year"] = ssr["year"] + 1
+    ssr = ssr[ssr["cohort_year"].isin(cohort_years)].copy()
+
+    exposures: dict[str, pd.DataFrame] = {}
+    for suffix, market_col in (
+        ("atc3", "_atc3_for_exposure"),
+        ("atc2", "_atc2_for_exposure"),
+    ):
+        exposures[f"firm_share_{suffix}"] = build_firm_share(ssr, market_col, suffix)
+        exposures[f"hhi_{suffix}"] = build_q1_hhi(ssr, market_col, suffix)
+    return exposures
+
+
+def build_firm_share(ssr: pd.DataFrame, market_col: str, suffix: str) -> pd.DataFrame:
+    """Build average previous-year quarterly firm shares within ATC markets."""
+    keys = ["cohort_year", "quarter", market_col, "_firm_key"]
+    firm_sales = (
+        ssr.groupby(keys, as_index=False, dropna=False)
+        .agg(
+            firm_revenue=("revenue", "sum"),
+            firm_quantity=("quantity", "sum"),
+        )
+    )
+    market_totals = (
+        firm_sales.groupby(["cohort_year", "quarter", market_col], as_index=False, dropna=False)
+        .agg(
+            total_revenue=("firm_revenue", "sum"),
+            total_quantity=("firm_quantity", "sum"),
+        )
+    )
+    firm_sales = firm_sales.merge(
+        market_totals,
+        on=["cohort_year", "quarter", market_col],
+        how="left",
+        validate="many_to_one",
+    )
+    firm_sales[f"rival_share_revenue_{suffix}"] = firm_sales["firm_revenue"].div(
+        firm_sales["total_revenue"]
+    )
+    firm_sales[f"rival_share_quantity_{suffix}"] = firm_sales["firm_quantity"].div(
+        firm_sales["total_quantity"]
+    )
+    share_cols = [f"rival_share_quantity_{suffix}", f"rival_share_revenue_{suffix}"]
+    averaged = (
+        firm_sales.groupby(["cohort_year", market_col, "_firm_key"], as_index=False, dropna=False)[
+            share_cols
+        ]
+        .sum()
+        .rename(columns={market_col: f"_{suffix}", "_firm_key": "_partner_key"})
+    )
+    averaged[share_cols] = averaged[share_cols] / 4
+    return averaged[["cohort_year", f"_{suffix}", "_partner_key", *share_cols]]
+
+
+def build_q1_hhi(ssr: pd.DataFrame, market_col: str, suffix: str) -> pd.DataFrame:
+    """Build previous-year-Q1 ATC-market HHI measures."""
+    q1 = ssr[ssr["quarter"].eq(1)].copy()
+    firm_sales = (
+        q1.groupby(["cohort_year", market_col, "_firm_key"], as_index=False, dropna=False)
+        .agg(
+            firm_revenue=("revenue", "sum"),
+            firm_quantity=("quantity", "sum"),
+        )
+    )
+    market_totals = (
+        firm_sales.groupby(["cohort_year", market_col], as_index=False, dropna=False)
+        .agg(
+            total_revenue=("firm_revenue", "sum"),
+            total_quantity=("firm_quantity", "sum"),
+        )
+    )
+    firm_sales = firm_sales.merge(
+        market_totals,
+        on=["cohort_year", market_col],
+        how="left",
+        validate="many_to_one",
+    )
+    firm_sales["revenue_share_sq"] = (
+        firm_sales["firm_revenue"] / firm_sales["total_revenue"]
+    ) ** 2
+    firm_sales["quantity_share_sq"] = (
+        firm_sales["firm_quantity"] / firm_sales["total_quantity"]
+    ) ** 2
+    return (
+        firm_sales.groupby(["cohort_year", market_col], as_index=False, dropna=False)
+        .agg(
+            **{
+                f"hhi_quantity_{suffix}": ("quantity_share_sq", "sum"),
+                f"hhi_revenue_{suffix}": ("revenue_share_sq", "sum"),
+            }
+        )
+        .rename(columns={market_col: f"_{suffix}"})
+    )
+
+
+def add_pre_event_hhi(
+    cohort: pd.DataFrame,
+    cohort_year: int,
+    market_exposures: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Replace row-level HHI columns with cohort-level pre-event HHI values."""
+    result = cohort.drop(columns=[col for col in HHI_COLUMNS if col in cohort.columns])
+    for suffix in ("atc3", "atc2"):
+        hhi = market_exposures[f"hhi_{suffix}"]
+        hhi = hhi[hhi["cohort_year"].eq(cohort_year)].drop(columns=["cohort_year"])
+        result = result.merge(
+            hhi,
+            left_on=f"_atc{suffix[-1]}_for_exposure",
+            right_on=f"_{suffix}",
+            how="left",
+            validate="many_to_one",
+        ).drop(columns=[f"_{suffix}"])
+    return result
+
+
+def add_rival_share_exposure(
+    cohort: pd.DataFrame,
+    partners: pd.DataFrame,
+    event: str,
+    cohort_year: int,
+    event_col: str,
+    market_exposures: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Add cohort-fixed rival share exposure measures to treated products."""
+    result = cohort.drop(columns=[col for col in RIVAL_SHARE_COLUMNS if col in cohort.columns])
+    for col in RIVAL_SHARE_COLUMNS:
+        result[col] = 0.0
+
+    treated = (
+        result[
+            result[event_col].eq(1)
+            & result["year"].eq(cohort_year)
+            & result["quarter"].eq(1)
+        ][["BoardName", "product", "_atc3_for_exposure", "_atc2_for_exposure"]]
+        .drop_duplicates()
+        .copy()
+    )
+    if treated.empty:
+        return result
+
+    treated["_board_key"] = firm_key(treated["BoardName"])
+    valid_partners = (
+        partners[partners["event"].eq(event) & partners["year"].eq(cohort_year)]
+        [["BoardName", "BoardNamePair"]]
+        .drop_duplicates()
+        .copy()
+    )
+    valid_partners["_board_key"] = firm_key(valid_partners["BoardName"])
+    valid_partners["_partner_key"] = firm_key(valid_partners["BoardNamePair"])
+    valid_partners = valid_partners[["_board_key", "_partner_key"]].drop_duplicates()
+    if valid_partners.empty:
+        return result
+
+    partnered = treated.merge(valid_partners, on="_board_key", how="inner")
+    summed_by_suffix = []
+    for suffix in ("atc3", "atc2"):
+        share_cols = [
+            f"rival_share_quantity_{suffix}",
+            f"rival_share_revenue_{suffix}",
+        ]
+        share_lookup = market_exposures[f"firm_share_{suffix}"]
+        share_lookup = share_lookup[share_lookup["cohort_year"].eq(cohort_year)].drop(
+            columns=["cohort_year"]
+        )
+        matched = partnered.merge(
+            share_lookup,
+            left_on=[f"_atc{suffix[-1]}_for_exposure", "_partner_key"],
+            right_on=[f"_{suffix}", "_partner_key"],
+            how="left",
+            validate="many_to_one",
+        )
+        matched[share_cols] = matched[share_cols].fillna(0)
+        summed = (
+            matched.groupby(["BoardName", "product"], as_index=False, dropna=False)[share_cols]
+            .sum()
+        )
+        for col in share_cols:
+            if summed[col].gt(1 + 1e-10).any():
+                examples = summed.loc[summed[col].gt(1 + 1e-10)].head(10)
+                raise AssertionError(
+                    f"{col} exceeds 1 after partner aggregation for {event} {cohort_year}:\n"
+                    f"{examples}"
+                )
+        summed_by_suffix.append(summed)
+
+    exposure = summed_by_suffix[0].merge(
+        summed_by_suffix[1],
+        on=["BoardName", "product"],
+        how="outer",
+        validate="one_to_one",
+    ).fillna(0)
+    result = result.merge(
+        exposure,
+        on=["BoardName", "product"],
+        how="left",
+        suffixes=("", "_exposure"),
+        validate="many_to_one",
+    )
+    for col in RIVAL_SHARE_COLUMNS:
+        exposure_col = f"{col}_exposure"
+        result[col] = result[exposure_col].fillna(result[col]).fillna(0)
+        result = result.drop(columns=[exposure_col])
+    return result
+
+
 def plot_summary(summary: pd.DataFrame, out_png: Path, title: str) -> None:
     """Save a stacked yearly treated sharing diagnostic plot."""
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -172,6 +408,7 @@ def process_one_config(
     atc: str,
     mapping: pd.DataFrame,
     partners: pd.DataFrame,
+    market_exposures: dict[str, pd.DataFrame],
     treatment_group: str,
     include_eventpair: int,
     event_requirement: int,
@@ -214,6 +451,22 @@ def process_one_config(
                 raise KeyError(f"{src_path} is missing required columns: {missing}")
 
             event_col = f"event_{cohort_year}"
+            cohort[event_col] = pd.to_numeric(cohort[event_col], errors="coerce").fillna(0).astype(int)
+            cohort["_atc3_for_exposure"] = cohort["atc3"].astype(str)
+            cohort["_atc2_for_exposure"] = cohort["_atc3_for_exposure"].str[:-1]
+            cohort = add_pre_event_hhi(
+                cohort=cohort,
+                cohort_year=cohort_year,
+                market_exposures=market_exposures,
+            )
+            cohort = add_rival_share_exposure(
+                cohort=cohort,
+                partners=partners,
+                event=event,
+                cohort_year=cohort_year,
+                event_col=event_col,
+                market_exposures=market_exposures,
+            )
             if atc == "atc2":
                 atc2 = cohort["atc3"].astype(str).str[:-1]
                 if "atc2" in cohort.columns:
@@ -227,7 +480,6 @@ def process_one_config(
             work = cohort[["BoardName", "year", "quarter", "product", atc, event_col]].copy()
             work["year"] = pd.to_numeric(work["year"], errors="raise").astype(int)
             work["quarter"] = pd.to_numeric(work["quarter"], errors="raise").astype(int)
-            work[event_col] = pd.to_numeric(work[event_col], errors="coerce").fillna(0).astype(int)
             work[atc] = work[atc].astype(str)
 
             treated = work[
@@ -269,6 +521,7 @@ def process_one_config(
             control_mask = pd.to_numeric(cohort[event_col], errors="coerce").fillna(0).astype(int).ne(1)
             cohort.loc[control_mask, "atc_sharing"] = 0
             cohort = cohort.sort_values("_row_order").drop(columns=["_row_order"])
+            cohort = cohort.drop(columns=["_atc3_for_exposure", "_atc2_for_exposure"])
 
             if len(cohort) != original_rows:
                 raise AssertionError(f"Row count changed for {src_path}")
@@ -332,6 +585,7 @@ def main() -> None:
     movement_suffix = build_large_sample_suffix(int(LARGE_SAMPLE), str(PERSONNEL_DEFINITION))
     movement_candidates_path = EVENT_TABLES_DIR / f"movement_event_candidates{movement_suffix}.csv"
     movement = pd.read_csv(movement_candidates_path)
+    market_exposures = build_market_exposures(COHORT_YEARS)
     for atc in ATCS:
         mapping = load_atc_mapping(atc)
         print(f"Processing {atc}")
@@ -352,6 +606,7 @@ def main() -> None:
                             atc=atc,
                             mapping=mapping,
                             partners=partners,
+                            market_exposures=market_exposures,
                             treatment_group=treatment_group,
                             include_eventpair=int(include_eventpair),
                             event_requirement=int(event_requirement),

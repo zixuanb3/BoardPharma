@@ -105,8 +105,8 @@ RUN_CONFIG = {
     "stay_x_years": 2,
     "balance_window": (-1, 1),
     "treatment_groups": ["B","A"],
-    "large_sample": 0,
-    "personnel_definition": "medium",
+    "large_sample": 1,
+    "personnel_definition": "narrow",
 }
 # ===============================================================
 
@@ -145,7 +145,60 @@ def load_ssr_panel(panel_level: str) -> pd.DataFrame:
     panel["price"] = panel["revenue"] * 1_000_000 / panel["quantity"]
     if panel_level == "quarter":
         panel["quarter"] = panel["quarter"].astype(np.int8)
-    return panel
+    return add_market_hhi(panel, panel_level)
+
+
+def add_market_hhi(panel: pd.DataFrame, panel_level: str) -> pd.DataFrame:
+    """Attach ATC2/ATC3 quantity and revenue HHI columns to the panel."""
+    time_cols = ["year"] + (["quarter"] if panel_level == "quarter" else [])
+    result = panel.copy()
+    result["_atc2_for_hhi"] = result["atc3"].astype(str).str[:-1]
+
+    for market_col, suffix in (("atc3", "atc3"), ("_atc2_for_hhi", "atc2")):
+        market_keys = time_cols + [market_col]
+        firm_sales = (
+            result[market_keys + ["BoardName", "revenue", "quantity"]]
+            .groupby(market_keys + ["BoardName"], as_index=False, dropna=False)
+            .agg(
+                firm_revenue=("revenue", "sum"),
+                firm_quantity=("quantity", "sum"),
+            )
+        )
+        market_totals = (
+            firm_sales.groupby(market_keys, as_index=False, dropna=False)
+            .agg(
+                total_revenue=("firm_revenue", "sum"),
+                total_quantity=("firm_quantity", "sum"),
+            )
+        )
+        firm_sales = firm_sales.merge(
+            market_totals,
+            on=market_keys,
+            how="left",
+            validate="many_to_one",
+        )
+        firm_sales["revenue_share_sq"] = np.where(
+            firm_sales["total_revenue"].gt(0),
+            (firm_sales["firm_revenue"] / firm_sales["total_revenue"]) ** 2,
+            np.nan,
+        )
+        firm_sales["quantity_share_sq"] = np.where(
+            firm_sales["total_quantity"].gt(0),
+            (firm_sales["firm_quantity"] / firm_sales["total_quantity"]) ** 2,
+            np.nan,
+        )
+        hhi = (
+            firm_sales.groupby(market_keys, as_index=False, dropna=False)
+            .agg(
+                **{
+                    f"hhi_revenue_{suffix}": ("revenue_share_sq", "sum"),
+                    f"hhi_quantity_{suffix}": ("quantity_share_sq", "sum"),
+                }
+            )
+        )
+        result = result.merge(hhi, on=market_keys, how="left", validate="many_to_one")
+
+    return result.drop(columns=["_atc2_for_hhi"])
 
 
 @lru_cache(maxsize=None)
