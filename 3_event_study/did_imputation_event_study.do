@@ -9,12 +9,15 @@ set trace off
 //
 // Process:
 // 1. Loop over ATC level, treatment group, event type, requirement level,
-//    control definition, target outcome, transformation, and fixed-effect setup.
+//    control definition, target outcome, transformation, fixed-effect setup,
+//    and did_imputation clustering level.
 // 2. Import balanced cohort CSVs with ATC-sharing labels and stack cohorts.
 // 3. Apply the configured outcome transformation and optional controls.
 // 4. Estimate did_imputation either with hetby(atc_sharing) or with separate
-//    sharing/non-sharing samples.
+//    sharing/non-sharing samples, using the configured cluster() variable.
 // 5. Export coefficient CSVs, logs, and overlaid dynamic-effect figures.
+//    Exported sample-count columns are computed on the autosample-adjusted
+//    e(sample).
 //
 // Input:
 // - data/cohort_data_with_atcsharing_{atc}/quarter-level_{group}/event/req*/.../*.csv
@@ -22,16 +25,16 @@ set trace off
 // - data/kappa/ssr_kappa_firm_level_v5.csv when kappa controls are enabled
 //
 // Output:
-// - figures/did_imputation_event_study_sharingatc_{atc}*/quarter-level_*/.../*.png
-// - csv/did_imputation_event_study_sharingatc_{atc}*/quarter-level_*/.../*.csv
-// - logs/did_imputation_event_study_sharingatc_{atc}*/quarter-level_*/.../*.log
+// - figures/didimp_es_{atc}*/cluster_{cluster}/q_*.../*.png
+// - csv/didimp_es_{atc}*/cluster_{cluster}/q_*.../*.csv
+// - logs/didimp_es_{atc}*/cluster_{cluster}/q_*.../*.log
 // ================================================================
 
 * ================= user config =================
 local atcs atc3 atc2
 * atc3 atc2
 local large_sample 1
-local personnel_definition narrow
+local personnel_definition medium
 * narrow medium broad
 local separate_modes 0
 * 1
@@ -61,7 +64,7 @@ local standardize_types log_transform
 * log_transform standardize normalize
 local event_types event
 * first_event
-local reqs 0 1
+local reqs 0 1 2
 * 0 1 2
 local control_for_other_events other_event
 * none other_event
@@ -76,6 +79,8 @@ local include_eventpair_values 0
 * 1 0
 local fe_levels 1
 * 1 2
+local cluster_levels firm
+* firm
 
 local coef_names pre_3 pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
 local n_total 11
@@ -99,8 +104,10 @@ if `large_sample' == 1 & !inlist("`personnel_definition'", "narrow", "medium", "
     exit 198
 }
 local movement_suffix ""
+local movement_output_suffix ""
 if `large_sample' == 1 {
     local movement_suffix "_large_sample_`personnel_definition'"
+    local movement_output_suffix = "_ls" + substr("`personnel_definition'", 1, 1)
 }
 
 * ================= loop =================
@@ -111,7 +118,7 @@ foreach atc of local atcs {
     }
 
     local data_root "`project_path'/data/cohort_data_with_atcsharing_`atc'"
-    local output_tag_base "did_imputation_event_study_sharingatc_`atc'`movement_suffix'"
+    local output_tag_base "didimp_es_`atc'`movement_output_suffix'"
 
 foreach treatment_group of local treatment_groups {
     local treatment_group = upper("`treatment_group'")
@@ -138,6 +145,11 @@ foreach treatment_group of local treatment_groups {
 
         local group_label "`treatment_group'_`relation'_`counterpart'"
         local panel_group_folder "quarter-level_`group_label'`movement_suffix'"
+        local relation_output_tag "wo"
+        if `include_eventpair' == 1 {
+            local relation_output_tag "w"
+        }
+        local panel_output_folder "q_`treatment_group'`relation_output_tag'`counterpart'`movement_output_suffix'"
         local data_path "`data_root'/`panel_group_folder'"
 
         foreach fe_level of local fe_levels {
@@ -199,15 +211,15 @@ foreach treatment_group of local treatment_groups {
                                         local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
                                     }
                                     else if "`req'" == "2" {
-                                        if "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
-                                            local cohort_list ""
-                                        }
-                                        else if "`treatment_group'" == "A" {
+                                        if "`treatment_group'" == "A" {
                                             if "`event'" == "interlock_dissolution" {
                                                 local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
                                             }
                                             else if "`event'" == "to_B_not_in_A" {
                                                 local cohort_list 2009 2010 2012 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`event'" == "to_B_still_in_A" {
+                                                local cohort_list ""
                                             }
                                         }
                                         else if "`treatment_group'" == "B" {
@@ -230,58 +242,61 @@ foreach treatment_group of local treatment_groups {
                                     else if "`req'" == "1" {
                                         local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
                                         if "`personnel_definition'" == "narrow" & "`event'" == "to_B_not_in_A" {
-                                            local cohort_list 2009 2010 2012 2013 2014 2015 2016 2017 2018
+                                            if "`treatment_group'" == "A" {
+                                                local cohort_list 2009 2010 2012 2013 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`treatment_group'" == "B" {
+                                                local cohort_list 2009 2010 2012 2014 2015 2016 2017 2018
+                                            }
                                         }
                                     }
                                     else if "`req'" == "2" {
-                                        if "`event'" == "interlock_dissolution" {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                            if "`treatment_group'" == "B" & "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
+                                        if "`personnel_definition'" == "medium" {
+                                            if "`treatment_group'" == "A" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2012 2018
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2016 2018
+                                                }
+                                            }
+                                            else if "`treatment_group'" == "B" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2011 2014
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017
+                                                }
                                             }
                                         }
-                                        else if "`treatment_group'" == "A" & "`event'" == "to_B_not_in_A" {
-                                            if "`personnel_definition'" == "broad" {
-                                                local cohort_list 2012 2017
+                                        else if "`personnel_definition'" == "narrow" {
+                                            if "`treatment_group'" == "A" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2012 2013 2014 2015 2016 2018
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2018
+                                                }
                                             }
-                                            else if "`personnel_definition'" == "medium" {
-                                                local cohort_list 2012 2014 2017
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2010 2012 2013 2014 2016 2017
-                                            }
-                                        }
-                                        else if "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
-                                            if "`atc'" == "atc3" {
-                                                local cohort_list ""
-                                            }
-                                            else if "`personnel_definition'" == "broad" {
-                                                local cohort_list 2010 2011 2012 2013 2014 2016 2017 2018
-                                            }
-                                            else if "`personnel_definition'" == "medium" {
-                                                local cohort_list 2009 2010 2011 2012 2013 2014 2016 2017 2018
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017
-                                            }
-                                        }
-                                        else if "`treatment_group'" == "B" & "`event'" == "to_B_not_in_A" {
-                                            if "`personnel_definition'" == "broad" {
-                                                local cohort_list 2010 2016
-                                            }
-                                            else if "`personnel_definition'" == "medium" {
-                                                local cohort_list 2010 2011 2014 2016
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2010 2012 2015 2016
-                                            }
-                                        }
-                                        else if "`treatment_group'" == "B" & "`event'" == "to_B_still_in_A" {
-                                            if inlist("`personnel_definition'", "broad", "medium") {
-                                                local cohort_list 2010 2012 2016 2017 2018
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2010 2012 2015 2016 2017 2018
+                                            else if "`treatment_group'" == "B" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2012 2015 2016 2018
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017
+                                                }
                                             }
                                         }
                                     }
@@ -366,22 +381,36 @@ foreach treatment_group of local treatment_groups {
                                     local control_variation_title "`control_variation'"
                                 }
 
+                                foreach cluster_level of local cluster_levels {
+                                local cluster_var ""
+                                local cluster_folder "cluster_`cluster_level'"
+                                if "`cluster_level'" == "firm" {
+                                    local cluster_var boardname
+                                }
+                                else {
+                                    di as error "cluster_level must be one of: firm"
+                                    exit 198
+                                }
+
                                 * -------- setup paths for this iteration --------
-                                local event_fig_path "`fe_fig_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`target'"
-                                local event_csv_path "`fe_csv_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`target'"
-                                local event_log_path "`fe_log_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`target'"
-                                cap mkdir "`fe_fig_root'/`panel_group_folder'"
-                                cap mkdir "`fe_csv_root'/`panel_group_folder'"
-                                cap mkdir "`fe_log_root'/`panel_group_folder'"
-                                cap mkdir "`fe_fig_root'/`panel_group_folder'/`event'"
-                                cap mkdir "`fe_csv_root'/`panel_group_folder'/`event'"
-                                cap mkdir "`fe_log_root'/`panel_group_folder'/`event'"
-                                cap mkdir "`fe_fig_root'/`panel_group_folder'/`event'/req`req'"
-                                cap mkdir "`fe_csv_root'/`panel_group_folder'/`event'/req`req'"
-                                cap mkdir "`fe_log_root'/`panel_group_folder'/`event'/req`req'"
-                                cap mkdir "`fe_fig_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
-                                cap mkdir "`fe_csv_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
-                                cap mkdir "`fe_log_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
+                                local event_fig_path "`fe_fig_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'/`target'"
+                                local event_csv_path "`fe_csv_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'/`target'"
+                                local event_log_path "`fe_log_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'/`target'"
+                                cap mkdir "`fe_fig_root'/`cluster_folder'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'"
+                                cap mkdir "`fe_fig_root'/`cluster_folder'/`panel_output_folder'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_output_folder'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_output_folder'"
+                                cap mkdir "`fe_fig_root'/`cluster_folder'/`panel_output_folder'/`event'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_output_folder'/`event'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_output_folder'/`event'"
+                                cap mkdir "`fe_fig_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'"
+                                cap mkdir "`fe_fig_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'"
                                 cap mkdir "`event_fig_path'"
                                 cap mkdir "`event_csv_path'"
                                 cap mkdir "`event_log_path'"
@@ -597,38 +626,18 @@ foreach treatment_group of local treatment_groups {
                                 replace event_cohort_did_imputation = . if event_cohort_did_imputation == 0
 								
 
-                                * -------- Compute sample stats --------
-                                count if treated == 0
-                                local obs_control = r(N)
-                                count if treated == 1 & atc_sharing == 0
-                                local obs_treated0 = r(N)
-                                count if treated == 1 & atc_sharing == 1
-                                local obs_treated1 = r(N)
+                                local obs_control = .
+                                local obs_treated0 = .
+                                local obs_treated1 = .
+                                local brd_control = .
+                                local brd_treated0 = .
+                                local brd_treated1 = .
+                                local prd_control = .
+                                local prd_treated0 = .
+                                local prd_treated1 = .
 
-                                tempvar tag_brd_c tag_brd_t0 tag_brd_t1
-                                egen `tag_brd_c' = tag(boardname) if treated == 0
-                                egen `tag_brd_t0' = tag(boardname) if treated == 1 & atc_sharing == 0
-                                egen `tag_brd_t1' = tag(boardname) if treated == 1 & atc_sharing == 1
-
-                                count if `tag_brd_c' == 1
-                                local brd_control = r(N)
-                                count if `tag_brd_t0' == 1
-                                local brd_treated0 = r(N)
-                                count if `tag_brd_t1' == 1
-                                local brd_treated1 = r(N)
-
-                                tempvar tag_prd_c tag_prd_t0 tag_prd_t1
-                                egen `tag_prd_c' = tag(product) if treated == 0
-                                egen `tag_prd_t0' = tag(product) if treated == 1 & atc_sharing == 0
-                                egen `tag_prd_t1' = tag(product) if treated == 1 & atc_sharing == 1
-
-                                count if `tag_prd_c' == 1
-                                local prd_control = r(N)
-                                count if `tag_prd_t0' == 1
-                                local prd_treated0 = r(N)
-                                count if `tag_prd_t1' == 1
-                                local prd_treated1 = r(N)
-                                * --------------------------------------
+                                matrix sample_stats = J(2, 9, .)
+                                matrix colnames sample_stats = obs_control obs_treated0 obs_treated1 brd_control brd_treated0 brd_treated1 prd_control prd_treated0 prd_treated1
 
                                 foreach sval in 0 1 {
                                     matrix did2_b_s`sval' = J(1, `n_total', .)
@@ -646,7 +655,7 @@ foreach treatment_group of local treatment_groups {
                                     gen atc_sharing_het = atc_sharing if treated == 1
                                     replace atc_sharing_het = 0 if treated == 0
 
-                                    capture noisily did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') hetby(atc_sharing_het) autosample tol(0.1) minn(0) `did_controls'
+                                    capture noisily did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') hetby(atc_sharing_het) autosample tol(0.1) minn(0) cluster(`cluster_var') `did_controls'
                                     local did_rc = _rc
                                     if `did_rc' != 0 {
                                         local spec_failed 1
@@ -693,6 +702,50 @@ foreach treatment_group of local treatment_groups {
                                     if `spec_failed' == 1 {
                                         log close
                                         continue
+                                    }
+
+                                    tempvar didimp_esample tag_brd_c tag_brd_t0 tag_brd_t1 tag_prd_c tag_prd_t0 tag_prd_t1
+                                    gen byte `didimp_esample' = e(sample)
+
+                                    count if `didimp_esample' & treated == 0
+                                    local obs_control = r(N)
+                                    count if `didimp_esample' & treated == 1 & atc_sharing == 0
+                                    local obs_treated0 = r(N)
+                                    count if `didimp_esample' & treated == 1 & atc_sharing == 1
+                                    local obs_treated1 = r(N)
+
+                                    egen `tag_brd_c' = tag(boardname) if `didimp_esample' & treated == 0
+                                    egen `tag_brd_t0' = tag(boardname) if `didimp_esample' & treated == 1 & atc_sharing == 0
+                                    egen `tag_brd_t1' = tag(boardname) if `didimp_esample' & treated == 1 & atc_sharing == 1
+
+                                    count if `tag_brd_c' == 1
+                                    local brd_control = r(N)
+                                    count if `tag_brd_t0' == 1
+                                    local brd_treated0 = r(N)
+                                    count if `tag_brd_t1' == 1
+                                    local brd_treated1 = r(N)
+
+                                    egen `tag_prd_c' = tag(product) if `didimp_esample' & treated == 0
+                                    egen `tag_prd_t0' = tag(product) if `didimp_esample' & treated == 1 & atc_sharing == 0
+                                    egen `tag_prd_t1' = tag(product) if `didimp_esample' & treated == 1 & atc_sharing == 1
+
+                                    count if `tag_prd_c' == 1
+                                    local prd_control = r(N)
+                                    count if `tag_prd_t0' == 1
+                                    local prd_treated0 = r(N)
+                                    count if `tag_prd_t1' == 1
+                                    local prd_treated1 = r(N)
+
+                                    forvalues sample_row = 1/2 {
+                                        matrix sample_stats[`sample_row', 1] = `obs_control'
+                                        matrix sample_stats[`sample_row', 2] = `obs_treated0'
+                                        matrix sample_stats[`sample_row', 3] = `obs_treated1'
+                                        matrix sample_stats[`sample_row', 4] = `brd_control'
+                                        matrix sample_stats[`sample_row', 5] = `brd_treated0'
+                                        matrix sample_stats[`sample_row', 6] = `brd_treated1'
+                                        matrix sample_stats[`sample_row', 7] = `prd_control'
+                                        matrix sample_stats[`sample_row', 8] = `prd_treated0'
+                                        matrix sample_stats[`sample_row', 9] = `prd_treated1'
                                     }
 
                                     matrix did2_b_full = e(b)
@@ -818,7 +871,7 @@ foreach treatment_group of local treatment_groups {
                                         preserve
                                         drop if treated == 1 & atc_sharing != `sval'
 
-                                        capture noisily did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') autosample tol(0.1) minn(0) `did_controls'
+                                        capture noisily did_imputation `target' id `timevar' event_cohort_did_imputation, fe(`fe_spec') horizons(`did_horizons') pretrends(`did_pretrend') autosample tol(0.1) minn(0) cluster(`cluster_var') `did_controls'
                                         local did_rc = _rc
                                         if `did_rc' != 0 {
                                             local spec_failed 1
@@ -863,6 +916,49 @@ foreach treatment_group of local treatment_groups {
                                             restore
                                             continue, break
                                         }
+
+                                        tempvar didimp_esample tag_brd_c tag_brd_t0 tag_brd_t1 tag_prd_c tag_prd_t0 tag_prd_t1
+                                        gen byte `didimp_esample' = e(sample)
+
+                                        count if `didimp_esample' & treated == 0
+                                        local obs_control = r(N)
+                                        count if `didimp_esample' & treated == 1 & atc_sharing == 0
+                                        local obs_treated0 = r(N)
+                                        count if `didimp_esample' & treated == 1 & atc_sharing == 1
+                                        local obs_treated1 = r(N)
+
+                                        egen `tag_brd_c' = tag(boardname) if `didimp_esample' & treated == 0
+                                        egen `tag_brd_t0' = tag(boardname) if `didimp_esample' & treated == 1 & atc_sharing == 0
+                                        egen `tag_brd_t1' = tag(boardname) if `didimp_esample' & treated == 1 & atc_sharing == 1
+
+                                        count if `tag_brd_c' == 1
+                                        local brd_control = r(N)
+                                        count if `tag_brd_t0' == 1
+                                        local brd_treated0 = r(N)
+                                        count if `tag_brd_t1' == 1
+                                        local brd_treated1 = r(N)
+
+                                        egen `tag_prd_c' = tag(product) if `didimp_esample' & treated == 0
+                                        egen `tag_prd_t0' = tag(product) if `didimp_esample' & treated == 1 & atc_sharing == 0
+                                        egen `tag_prd_t1' = tag(product) if `didimp_esample' & treated == 1 & atc_sharing == 1
+
+                                        count if `tag_prd_c' == 1
+                                        local prd_control = r(N)
+                                        count if `tag_prd_t0' == 1
+                                        local prd_treated0 = r(N)
+                                        count if `tag_prd_t1' == 1
+                                        local prd_treated1 = r(N)
+
+                                        local sample_row = `sval' + 1
+                                        matrix sample_stats[`sample_row', 1] = `obs_control'
+                                        matrix sample_stats[`sample_row', 2] = `obs_treated0'
+                                        matrix sample_stats[`sample_row', 3] = `obs_treated1'
+                                        matrix sample_stats[`sample_row', 4] = `brd_control'
+                                        matrix sample_stats[`sample_row', 5] = `brd_treated0'
+                                        matrix sample_stats[`sample_row', 6] = `brd_treated1'
+                                        matrix sample_stats[`sample_row', 7] = `prd_control'
+                                        matrix sample_stats[`sample_row', 8] = `prd_treated0'
+                                        matrix sample_stats[`sample_row', 9] = `prd_treated1'
 
 										matrix did2_b_full = e(b)
                                         matrix did2_V_full = e(V)
@@ -966,6 +1062,17 @@ foreach treatment_group of local treatment_groups {
                                 }
 
                                 forvalues sval = 0/1 {
+                                    local sample_row = `sval' + 1
+                                    local obs_control_out = el(sample_stats, `sample_row', 1)
+                                    local obs_treated0_out = el(sample_stats, `sample_row', 2)
+                                    local obs_treated1_out = el(sample_stats, `sample_row', 3)
+                                    local brd_control_out = el(sample_stats, `sample_row', 4)
+                                    local brd_treated0_out = el(sample_stats, `sample_row', 5)
+                                    local brd_treated1_out = el(sample_stats, `sample_row', 6)
+                                    local prd_control_out = el(sample_stats, `sample_row', 7)
+                                    local prd_treated0_out = el(sample_stats, `sample_row', 8)
+                                    local prd_treated1_out = el(sample_stats, `sample_row', 9)
+
                                     forvalues i = 1/`n_total' {
                                         local this_coef : word `i' of `coef_names'
                                         local b = el(did2_b_s`sval', 1, `i')
@@ -1011,15 +1118,15 @@ foreach treatment_group of local treatment_groups {
                                         replace std_error = `se' in `row'
                                         replace ci_lb_95 = `lb' in `row'
                                         replace ci_ub_95 = `ub' in `row'
-                                        replace obs_control = `obs_control' in `row'
-                                        replace obs_treated0 = `obs_treated0' in `row'
-                                        replace obs_treated1 = `obs_treated1' in `row'
-                                        replace brd_control = `brd_control' in `row'
-                                        replace brd_treated0 = `brd_treated0' in `row'
-                                        replace brd_treated1 = `brd_treated1' in `row'
-                                        replace prd_control = `prd_control' in `row'
-                                        replace prd_treated0 = `prd_treated0' in `row'
-                                        replace prd_treated1 = `prd_treated1' in `row'
+                                        replace obs_control = `obs_control_out' in `row'
+                                        replace obs_treated0 = `obs_treated0_out' in `row'
+                                        replace obs_treated1 = `obs_treated1_out' in `row'
+                                        replace brd_control = `brd_control_out' in `row'
+                                        replace brd_treated0 = `brd_treated0_out' in `row'
+                                        replace brd_treated1 = `brd_treated1_out' in `row'
+                                        replace prd_control = `prd_control_out' in `row'
+                                        replace prd_treated0 = `prd_treated0_out' in `row'
+                                        replace prd_treated1 = `prd_treated1_out' in `row'
 
                                         forvalues j = 1/`n_total' {
                                             local cov_coef : word `j' of `coef_names'
@@ -1065,6 +1172,7 @@ foreach treatment_group of local treatment_groups {
                                 graph export "`event_fig_path'/`file_stub'.png", replace width(`graph_width')
 
                                 log close
+                                }
                                 }
                                                 }
                                             }

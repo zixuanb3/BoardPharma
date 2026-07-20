@@ -16,8 +16,9 @@ set trace off
 //   ATC sharing; beta1 is the additional effect for sharing products; and
 //   beta0 + beta1 is the total effect for sharing products.
 // - did_imputation with hetby(atc_sharing_het) provides an alternative
-//   staggered-adoption estimator, where tau_1 - tau_0 summarizes the gap
-//   between sharing and non-sharing treatment effects.
+//   staggered-adoption estimator, using the configured cluster() variable;
+//   tau_1 - tau_0 summarizes the gap between sharing and non-sharing
+//   treatment effects.
 //
 // Sample / Measurement:
 // - The script loops over treatment-side definitions, whether event-pair
@@ -29,9 +30,9 @@ set trace off
 //   from extreme normalized trajectories.
 //
 // Output:
-// - logs/ddd_atcsharing_{atc}*_fe*/
-// - tex/ddd_atcsharing_{atc}*_fe*/
-// - csv/ddd_atcsharing_{atc}*_fe*/
+// - logs/ddd_atcsharing_{atc}*_fe*/cluster_{cluster}/...
+// - tex/ddd_atcsharing_{atc}*_fe*/cluster_{cluster}/...
+// - csv/ddd_atcsharing_{atc}*_fe*/cluster_{cluster}/...
 // ================================================================
 
 * ================= user config =================
@@ -86,6 +87,8 @@ local include_eventpair_values 0
 * 1 0
 local fe_levels 1
 * 1 2
+local cluster_levels firm
+* firm
 
 if !inlist(`large_sample', 0, 1) {
     di as error "large_sample must be 0 or 1"
@@ -151,9 +154,6 @@ foreach panel_level of local panel_levels {
                 cap mkdir "`fe_log_root'"
                 cap mkdir "`fe_tex_root'"
                 cap mkdir "`fe_csv_root'"
-                cap mkdir "`fe_log_root'/`panel_group_folder'"
-                cap mkdir "`fe_tex_root'/`panel_group_folder'"
-                cap mkdir "`fe_csv_root'/`panel_group_folder'"
 
                 foreach event of local events {
                     * Interlock events do not vary with treatment/include parameters.
@@ -161,10 +161,6 @@ foreach panel_level of local panel_levels {
                     if inlist("`event'", "direct_interlock", "indirect_interlock") & ("`treatment_group'" != "B" | `include_eventpair' != 1) {
                         continue
                     }
-
-                    cap mkdir "`fe_log_root'/`panel_group_folder'/`event'"
-                    cap mkdir "`fe_tex_root'/`panel_group_folder'/`event'"
-                    cap mkdir "`fe_csv_root'/`panel_group_folder'/`event'"
 
                     foreach control of local controls {
                         foreach std of local standardize_types {
@@ -197,15 +193,15 @@ foreach panel_level of local panel_levels {
                                         local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
                                     }
                                     else if "`req'" == "2" {
-                                        if "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
-                                            local cohort_list ""
-                                        }
-                                        else if "`treatment_group'" == "A" {
+                                        if "`treatment_group'" == "A" {
                                             if "`event'" == "interlock_dissolution" {
                                                 local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
                                             }
                                             else if "`event'" == "to_B_not_in_A" {
                                                 local cohort_list 2009 2010 2012 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`event'" == "to_B_still_in_A" {
+                                                local cohort_list ""
                                             }
                                         }
                                         else if "`treatment_group'" == "B" {
@@ -228,58 +224,61 @@ foreach panel_level of local panel_levels {
                                     else if "`req'" == "1" {
                                         local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
                                         if "`personnel_definition'" == "narrow" & "`event'" == "to_B_not_in_A" {
-                                            local cohort_list 2009 2010 2012 2013 2014 2015 2016 2017 2018
+                                            if "`treatment_group'" == "A" {
+                                                local cohort_list 2009 2010 2012 2013 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`treatment_group'" == "B" {
+                                                local cohort_list 2009 2010 2012 2014 2015 2016 2017 2018
+                                            }
                                         }
                                     }
                                     else if "`req'" == "2" {
-                                        if "`event'" == "interlock_dissolution" {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                            if "`treatment_group'" == "B" & "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
+                                        if "`personnel_definition'" == "medium" {
+                                            if "`treatment_group'" == "A" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2012 2018
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2016 2018
+                                                }
+                                            }
+                                            else if "`treatment_group'" == "B" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2011 2014
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017
+                                                }
                                             }
                                         }
-                                        else if "`treatment_group'" == "A" & "`event'" == "to_B_not_in_A" {
-                                            if "`personnel_definition'" == "broad" {
-                                                local cohort_list 2012 2017
+                                        else if "`personnel_definition'" == "narrow" {
+                                            if "`treatment_group'" == "A" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2012 2013 2014 2015 2016 2018
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2018
+                                                }
                                             }
-                                            else if "`personnel_definition'" == "medium" {
-                                                local cohort_list 2012 2014 2017
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2010 2012 2013 2014 2016 2017
-                                            }
-                                        }
-                                        else if "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
-                                            if "`atc'" == "atc3" {
-                                                local cohort_list ""
-                                            }
-                                            else if "`personnel_definition'" == "broad" {
-                                                local cohort_list 2010 2011 2012 2013 2014 2016 2017 2018
-                                            }
-                                            else if "`personnel_definition'" == "medium" {
-                                                local cohort_list 2009 2010 2011 2012 2013 2014 2016 2017 2018
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017
-                                            }
-                                        }
-                                        else if "`treatment_group'" == "B" & "`event'" == "to_B_not_in_A" {
-                                            if "`personnel_definition'" == "broad" {
-                                                local cohort_list 2010 2016
-                                            }
-                                            else if "`personnel_definition'" == "medium" {
-                                                local cohort_list 2010 2011 2014 2016
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2010 2012 2015 2016
-                                            }
-                                        }
-                                        else if "`treatment_group'" == "B" & "`event'" == "to_B_still_in_A" {
-                                            if inlist("`personnel_definition'", "broad", "medium") {
-                                                local cohort_list 2010 2012 2016 2017 2018
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2010 2012 2015 2016 2017 2018
+                                            else if "`treatment_group'" == "B" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2012 2015 2016 2018
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017
+                                                }
                                             }
                                         }
                                     }
@@ -358,6 +357,17 @@ foreach panel_level of local panel_levels {
                                     local control_variation_title "`control_variation'"
                                     local control_title "`control', `control_variation'"
                                 }
+
+                                foreach cluster_level of local cluster_levels {
+                                local cluster_var ""
+                                local cluster_folder "cluster_`cluster_level'"
+                                if "`cluster_level'" == "firm" {
+                                    local cluster_var boardname
+                                }
+                                else {
+                                    di as error "cluster_level must be one of: firm"
+                                    exit 198
+                                }
                                 
                                 local control_var_tag ""
                                 if "`c_var'" != "none" {
@@ -370,19 +380,28 @@ foreach panel_level of local panel_levels {
                                 local atc_tag "_atc_`control_atc'"
                                 local file_stub "`event_type'_`control_fname'_`std'`control_var_tag'`kappa_tag'`atc_tag'"
 
-                                cap mkdir "`fe_log_root'/`panel_group_folder'/`event'/req`req'"
-                                cap mkdir "`fe_tex_root'/`panel_group_folder'/`event'/req`req'"
-                                cap mkdir "`fe_csv_root'/`panel_group_folder'/`event'/req`req'"
-                                cap mkdir "`fe_log_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
-                                cap mkdir "`fe_tex_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
-                                cap mkdir "`fe_csv_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'"
+                                cap mkdir "`fe_tex_root'/`cluster_folder'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_group_folder'"
+                                cap mkdir "`fe_tex_root'/`cluster_folder'/`panel_group_folder'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_group_folder'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_group_folder'/`event'"
+                                cap mkdir "`fe_tex_root'/`cluster_folder'/`panel_group_folder'/`event'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_group_folder'/`event'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_group_folder'/`event'/req`req'"
+                                cap mkdir "`fe_tex_root'/`cluster_folder'/`panel_group_folder'/`event'/req`req'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_group_folder'/`event'/req`req'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
+                                cap mkdir "`fe_tex_root'/`cluster_folder'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_group_folder'/`event'/req`req'`control_variation_folder'"
 
                                 cap log close
-                                log using "`fe_log_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.log", text replace
+                                log using "`fe_log_root'/`cluster_folder'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.log", text replace
 
                                 estimates clear
 
-                                local csv_file "`fe_csv_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.csv"
+                                local csv_file "`fe_csv_root'/`cluster_folder'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.csv"
                                 tempfile run_results
                                 tempname posth
 
@@ -709,7 +728,7 @@ foreach panel_level of local panel_levels {
                                     capture noisily did_imputation `target' id q_time event_cohort_did_imputation, ///
                                         fe(`fe_spec') ///
                                         hetby(atc_sharing_het) ///
-                                        autosample tol(0.1) minn(0) `did_controls'
+                                        autosample tol(0.1) minn(0) cluster(`cluster_var') `did_controls'
                                     local did_rc = _rc
 
                                     if `did_rc' != 0 {
@@ -757,7 +776,7 @@ foreach panel_level of local panel_levels {
                                         file write failure_log "control_kappa=`control_kappa'" _n
                                         file write failure_log "control_atc=`control_atc'" _n
                                         file write failure_log "cohort_list=`cohort_list'" _n
-                                        file write failure_log "log_path=`fe_log_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.log" _n
+                                        file write failure_log "log_path=`fe_log_root'/`cluster_folder'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.log" _n
                                         file close failure_log
                                     }
 
@@ -849,7 +868,7 @@ foreach panel_level of local panel_levels {
                                 export delimited using "`csv_file'", replace
                                 restore
 
-                                local tex_file "`fe_tex_root'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.tex"
+                                local tex_file "`fe_tex_root'/`cluster_folder'/`panel_group_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.tex"
                                 tempfile tex_fragment
 
                                 esttab m_price using "`tex_fragment'", ///
@@ -919,6 +938,7 @@ foreach panel_level of local panel_levels {
                                 file close `fhout'
 
                                 log close
+                                }
                                 }
                                 }
                                 }

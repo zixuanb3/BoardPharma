@@ -11,11 +11,15 @@ set trace off
 // - Build stacked cohort-specific samples for each event/control/event_type
 //   combination. If exposure lists are nonempty, run did_imputation with
 //   project(atc_sharing exposure); if both exposure lists are empty, run the
-//   original hetby(atc_sharing) DDD specification.
+//   original hetby(atc_sharing) DDD specification. All did_imputation calls
+//   use the configured cluster() variable.
 // - With exposure, beta1 is tau_cons, the ATT for treated products without ATC
 //   sharing; beta2 is tau_atc_sharing; beta3 is tau_exposure_project.
 // - Without exposure, beta1 is tau_0 and beta2 is tau_1 - tau_0.
-// - beta1 + beta2 is the projected ATT for sharing products at zero exposure.
+// - Exposure is demeaned across unique treated Share ids in the autosample.
+// - beta1 + beta2 is the projected ATT for sharing products at mean exposure.
+// - Exported sample counts, pre-treatment means, and percent effects are
+//   computed on the autosample-adjusted e(sample).
 //
 // Sample / Measurement:
 // - The script loops over treatment-side definitions, whether event-pair
@@ -27,13 +31,13 @@ set trace off
 //   from extreme normalized trajectories.
 //
 // Output:
-// - logs/ddd_atcsharing_did_imputation_{atc}*_fe*/
-// - tex/ddd_atcsharing_did_imputation_{atc}*_fe*/
-// - csv/ddd_atcsharing_did_imputation_{atc}*_fe*/
+// - logs/ddd_atcsh_didimp_{atc}{_ls_definition}_{exposure}_{metric}_{outlier}_fe*/cluster_{cluster}/...
+// - tex/ddd_atcsh_didimp_{atc}{_ls_definition}_{exposure}_{metric}_{outlier}_fe*/cluster_{cluster}/...
+// - csv/ddd_atcsh_didimp_{atc}{_ls_definition}_{exposure}_{metric}_{outlier}_fe*/cluster_{cluster}/...
 // ================================================================
 
 * ================= user config =================
-local atcs atc3 atc2
+local atcs atc3
 * atc3 atc2
 local large_sample 1
 * 0 1
@@ -75,7 +79,7 @@ local standardize_types log_transform
 * log_transform standardize normalize
 local event_types event
 * event first_event
-local reqs 0 1
+local reqs 1
 * 0 1 2
 local control_for_other_events other_event
 * none other_event
@@ -91,9 +95,11 @@ local include_eventpair_values 0
 * 1 0
 local fe_levels 1
 * 1 2 3
-local exposure_types rival_share hhi
-* rival_share hhi
-local exposure_metrics quantity revenue
+local cluster_levels firm
+* firm
+local exposure_types
+* share hhi
+local exposure_metrics
 * quantity revenue
 
 if !inlist(`large_sample', 0, 1) {
@@ -134,8 +140,8 @@ foreach atc of local atcs {
         if "`exposure_type'" == "none" {
             local use_exposure 0
         }
-        if `use_exposure' & !inlist("`exposure_type'", "rival_share", "hhi") {
-            di as error "exposure_type must be one of: rival_share, hhi"
+        if `use_exposure' & !inlist("`exposure_type'", "share", "hhi") {
+            di as error "exposure_type must be one of: share, hhi"
             exit 198
         }
 
@@ -152,8 +158,8 @@ foreach atc of local atcs {
                 local exposure_var "`exposure_type'_`exposure_metric'_`atc'"
                 local exposure_type_tag "`exposure_type'"
                 local exposure_metric_tag "`exposure_metric'"
-                if "`exposure_type'" == "rival_share" {
-                    local exposure_type_tag "rs"
+                if "`exposure_type'" == "share" {
+                    local exposure_type_tag "sh"
                 }
                 if "`exposure_metric'" == "quantity" {
                     local exposure_metric_tag "qty"
@@ -214,9 +220,6 @@ foreach panel_level of local panel_levels {
                 cap mkdir "`fe_log_root'"
                 cap mkdir "`fe_tex_root'"
                 cap mkdir "`fe_csv_root'"
-                cap mkdir "`fe_log_root'/`panel_output_folder'"
-                cap mkdir "`fe_tex_root'/`panel_output_folder'"
-                cap mkdir "`fe_csv_root'/`panel_output_folder'"
 
                 foreach event of local events {
                     * Interlock events do not vary with treatment/include parameters.
@@ -224,10 +227,6 @@ foreach panel_level of local panel_levels {
                     if inlist("`event'", "direct_interlock", "indirect_interlock") & ("`treatment_group'" != "B" | `include_eventpair' != 1) {
                         continue
                     }
-
-                    cap mkdir "`fe_log_root'/`panel_output_folder'/`event'"
-                    cap mkdir "`fe_tex_root'/`panel_output_folder'/`event'"
-                    cap mkdir "`fe_csv_root'/`panel_output_folder'/`event'"
 
                     foreach control of local controls {
                         foreach std of local standardize_types {
@@ -260,15 +259,15 @@ foreach panel_level of local panel_levels {
                                         local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
                                     }
                                     else if "`req'" == "2" {
-                                        if "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
-                                            local cohort_list ""
-                                        }
-                                        else if "`treatment_group'" == "A" {
+                                        if "`treatment_group'" == "A" {
                                             if "`event'" == "interlock_dissolution" {
                                                 local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
                                             }
                                             else if "`event'" == "to_B_not_in_A" {
                                                 local cohort_list 2009 2010 2012 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`event'" == "to_B_still_in_A" {
+                                                local cohort_list ""
                                             }
                                         }
                                         else if "`treatment_group'" == "B" {
@@ -291,58 +290,61 @@ foreach panel_level of local panel_levels {
                                     else if "`req'" == "1" {
                                         local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
                                         if "`personnel_definition'" == "narrow" & "`event'" == "to_B_not_in_A" {
-                                            local cohort_list 2009 2010 2012 2013 2014 2015 2016 2017 2018
+                                            if "`treatment_group'" == "A" {
+                                                local cohort_list 2009 2010 2012 2013 2014 2015 2016 2017 2018
+                                            }
+                                            else if "`treatment_group'" == "B" {
+                                                local cohort_list 2009 2010 2012 2014 2015 2016 2017 2018
+                                            }
                                         }
                                     }
                                     else if "`req'" == "2" {
-                                        if "`event'" == "interlock_dissolution" {
-                                            local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
-                                            if "`treatment_group'" == "B" & "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017 2018
+                                        if "`personnel_definition'" == "medium" {
+                                            if "`treatment_group'" == "A" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2012 2018
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2016 2018
+                                                }
+                                            }
+                                            else if "`treatment_group'" == "B" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2011 2014
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017
+                                                }
                                             }
                                         }
-                                        else if "`treatment_group'" == "A" & "`event'" == "to_B_not_in_A" {
-                                            if "`personnel_definition'" == "broad" {
-                                                local cohort_list 2012 2017
+                                        else if "`personnel_definition'" == "narrow" {
+                                            if "`treatment_group'" == "A" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2012 2013 2014 2015 2016 2018
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2018
+                                                }
                                             }
-                                            else if "`personnel_definition'" == "medium" {
-                                                local cohort_list 2012 2014 2017
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2010 2012 2013 2014 2016 2017
-                                            }
-                                        }
-                                        else if "`treatment_group'" == "A" & "`event'" == "to_B_still_in_A" {
-                                            if "`atc'" == "atc3" {
-                                                local cohort_list ""
-                                            }
-                                            else if "`personnel_definition'" == "broad" {
-                                                local cohort_list 2010 2011 2012 2013 2014 2016 2017 2018
-                                            }
-                                            else if "`personnel_definition'" == "medium" {
-                                                local cohort_list 2009 2010 2011 2012 2013 2014 2016 2017 2018
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017
-                                            }
-                                        }
-                                        else if "`treatment_group'" == "B" & "`event'" == "to_B_not_in_A" {
-                                            if "`personnel_definition'" == "broad" {
-                                                local cohort_list 2010 2016
-                                            }
-                                            else if "`personnel_definition'" == "medium" {
-                                                local cohort_list 2010 2011 2014 2016
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2010 2012 2015 2016
-                                            }
-                                        }
-                                        else if "`treatment_group'" == "B" & "`event'" == "to_B_still_in_A" {
-                                            if inlist("`personnel_definition'", "broad", "medium") {
-                                                local cohort_list 2010 2012 2016 2017 2018
-                                            }
-                                            else if "`personnel_definition'" == "narrow" {
-                                                local cohort_list 2010 2012 2015 2016 2017 2018
+                                            else if "`treatment_group'" == "B" {
+                                                if "`event'" == "interlock_dissolution" {
+                                                    local cohort_list 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+                                                }
+                                                else if "`event'" == "to_B_not_in_A" {
+                                                    local cohort_list 2010 2012 2015 2016 2018
+                                                }
+                                                else if "`event'" == "to_B_still_in_A" {
+                                                    local cohort_list 2009 2010 2011 2012 2014 2015 2016 2017
+                                                }
                                             }
                                         }
                                     }
@@ -421,6 +423,17 @@ foreach panel_level of local panel_levels {
                                     local control_variation_title "`control_variation'"
                                     local control_title "`control', `control_variation'"
                                 }
+
+                                foreach cluster_level of local cluster_levels {
+                                local cluster_var ""
+                                local cluster_folder "cluster_`cluster_level'"
+                                if "`cluster_level'" == "firm" {
+                                    local cluster_var boardname
+                                }
+                                else {
+                                    di as error "cluster_level must be one of: firm"
+                                    exit 198
+                                }
                                 
                                 local control_var_tag ""
                                 if "`c_var'" != "none" {
@@ -433,22 +446,31 @@ foreach panel_level of local panel_levels {
                                 local atc_tag "_atc_`control_atc'"
                                 local file_stub "`event_type'_`control_fname'_`std'`control_var_tag'`kappa_tag'`atc_tag'"
 
-                                cap mkdir "`fe_log_root'/`panel_output_folder'/`event'/req`req'"
-                                cap mkdir "`fe_tex_root'/`panel_output_folder'/`event'/req`req'"
-                                cap mkdir "`fe_csv_root'/`panel_output_folder'/`event'/req`req'"
-                                cap mkdir "`fe_log_root'/`panel_output_folder'/`event'/req`req'`control_variation_folder'"
-                                cap mkdir "`fe_tex_root'/`panel_output_folder'/`event'/req`req'`control_variation_folder'"
-                                cap mkdir "`fe_csv_root'/`panel_output_folder'/`event'/req`req'`control_variation_folder'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'"
+                                cap mkdir "`fe_tex_root'/`cluster_folder'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_output_folder'"
+                                cap mkdir "`fe_tex_root'/`cluster_folder'/`panel_output_folder'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_output_folder'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_output_folder'/`event'"
+                                cap mkdir "`fe_tex_root'/`cluster_folder'/`panel_output_folder'/`event'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_output_folder'/`event'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'"
+                                cap mkdir "`fe_tex_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'"
+                                cap mkdir "`fe_log_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'"
+                                cap mkdir "`fe_tex_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'"
+                                cap mkdir "`fe_csv_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'"
 
-                                local log_file "`fe_log_root'/`panel_output_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.log"
+                                local log_file "`fe_log_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.log"
 
                                 cap log close
                                 log using "`log_file'", text replace
 
                                 estimates clear
 
-                                local csv_file "`fe_csv_root'/`panel_output_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.csv"
-                                local tex_file "`fe_tex_root'/`panel_output_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.tex"
+                                local csv_file "`fe_csv_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.csv"
+                                local tex_file "`fe_tex_root'/`cluster_folder'/`panel_output_folder'/`event'/req`req'`control_variation_folder'/`file_stub'.tex"
                                 tempfile run_results
                                 tempname posth
                                 local skip_specification 0
@@ -469,10 +491,19 @@ foreach panel_level of local panel_levels {
                                     str15 exposure_type ///
                                     str15 exposure_metric ///
                                     str32 exposure_var ///
+                                    double exposure_raw_min exposure_raw_mean exposure_raw_max ///
+                                    double exposure_dm_min exposure_dm_mean exposure_dm_max ///
+                                    double exposure_share_id_n ///
                                     double beta1 beta1_se beta1_p ///
                                     double beta2 beta2_se beta2_p ///
                                     double beta3 beta3_se beta3_p ///
                                     double te_share te_share_se te_share_p ///
+                                    double gap_min gap_min_se gap_min_p ///
+                                    double gap_mean gap_mean_se gap_mean_p ///
+                                    double gap_max gap_max_se gap_max_p ///
+                                    double share_att_min share_att_min_se share_att_min_p ///
+                                    double share_att_mean share_att_mean_se share_att_mean_p ///
+                                    double share_att_max share_att_max_se share_att_max_p ///
                                     double pcteff_notshare pcteff_share ///
                                     double premean_notshare premean_share ///
                                     double N_obs N_control N_notshare N_share ///
@@ -602,60 +633,15 @@ foreach panel_level of local panel_levels {
                                     local premean_share = .
                                     local basesd_notshare = .
                                     local basesd_share = .
-
-                                    if "`std'" == "standardize" {
-                                        quietly summarize target_raw if treat == 1 & atc_sharing == 0 & pre_period == 1
-                                        local premean_notshare = r(mean)
-                                        local basesd_notshare = r(sd)
-
-                                        quietly summarize target_raw if treat == 1 & atc_sharing == 1 & pre_period == 1
-                                        local premean_share = r(mean)
-                                        local basesd_share = r(sd)
-                                    }
-                                    else {
-                                        quietly summarize `target' if treat == 1 & atc_sharing == 0 & pre_period == 1, meanonly
-                                        local premean_notshare = r(mean)
-                                        quietly summarize `target' if treat == 1 & atc_sharing == 1 & pre_period == 1, meanonly
-                                        local premean_share = r(mean)
-                                    }
-
-                                    quietly count if treat == 1 & atc_sharing == 0
-                                    local N_notshare = r(N)
-                                    quietly count if treat == 1 & atc_sharing == 1
-                                    local N_share = r(N)
-                                    quietly count if treat == 0
-                                    local N_control = r(N)
-
-                                    egen tag_id_notshare = tag(id) if treat == 1 & atc_sharing == 0
-                                    quietly count if tag_id_notshare == 1
-                                    local product_notshare = r(N)
-                                    drop tag_id_notshare
-
-                                    egen tag_id_share = tag(id) if treat == 1 & atc_sharing == 1
-                                    quietly count if tag_id_share == 1
-                                    local product_share = r(N)
-                                    drop tag_id_share
-
-                                    egen tag_id_control = tag(id) if treat == 0
-                                    quietly count if tag_id_control == 1
-                                    local product_control = r(N)
-                                    drop tag_id_control
-
-                                    * Also calculate unique boardnames
-                                    egen tag_board_notshare = tag(boardname) if treat == 1 & atc_sharing == 0
-                                    quietly count if tag_board_notshare == 1
-                                    local board_notshare = r(N)
-                                    drop tag_board_notshare
-
-                                    egen tag_board_share = tag(boardname) if treat == 1 & atc_sharing == 1
-                                    quietly count if tag_board_share == 1
-                                    local board_share = r(N)
-                                    drop tag_board_share
-
-                                    egen tag_board_control = tag(boardname) if treat == 0
-                                    quietly count if tag_board_control == 1
-                                    local board_control = r(N)
-                                    drop tag_board_control
+                                    local N_control = .
+                                    local N_notshare = .
+                                    local N_share = .
+                                    local product_control = .
+                                    local product_notshare = .
+                                    local product_share = .
+                                    local board_control = .
+                                    local board_notshare = .
+                                    local board_share = .
 
                                     gen event_cohort_did_imputation = yq(event_cohort, 1) if !missing(event_cohort)
                                     replace atc_sharing = 0 if missing(atc_sharing)
@@ -672,8 +658,6 @@ foreach panel_level of local panel_levels {
                                             di as error "Missing or nonnumeric exposure variable: `exposure_var'"
                                             exit 111
                                         }
-                                        replace `exposure_var' = 0 if missing(`exposure_var')
-                                        gen exposure_project = atc_sharing * `exposure_var'
                                     }
                                     else {
                                         gen atc_sharing_het = atc_sharing if treat == 1
@@ -751,14 +735,30 @@ foreach panel_level of local panel_levels {
                                     local te_share = .
                                     local te_share_se = .
                                     local te_share_p = .
+                                    local exposure_raw_min = .
+                                    local exposure_raw_mean = .
+                                    local exposure_raw_max = .
+                                    local exposure_dm_min = .
+                                    local exposure_dm_mean = .
+                                    local exposure_dm_max = .
+                                    local exposure_share_id_n = .
+                                    foreach point in min mean max {
+                                        local gap_`point' = .
+                                        local gap_`point'_se = .
+                                        local gap_`point'_p = .
+                                        local share_att_`point' = .
+                                        local share_att_`point'_se = .
+                                        local share_att_`point'_p = .
+                                    }
                                     local failure_reason ""
                                     local did_rc = .
+                                    tempvar didimp_esample
 
                                     if `use_exposure' {
-                                        tempvar didimp_sample
+                                        tempvar didimp_sample exposure_id_tag exposure_id_min exposure_id_max
                                         capture noisily did_imputation `target' id q_time event_cohort_did_imputation, ///
                                             fe(`fe_spec') ///
-                                            autosample tol(0.1) minn(0) `did_controls'
+                                            autosample tol(0.1) minn(0) cluster(`cluster_var') `did_controls'
                                         local autosample_rc = _rc
 
                                         if `autosample_rc' != 0 {
@@ -767,18 +767,52 @@ foreach panel_level of local panel_levels {
                                         else {
                                             gen byte `didimp_sample' = e(sample)
 
-                                            capture noisily did_imputation `target' id q_time event_cohort_did_imputation if `didimp_sample', ///
-                                                fe(`fe_spec') ///
-                                                project(atc_sharing exposure_project) ///
-                                                tol(0.1) minn(0) `did_controls'
-                                            local did_rc = _rc
+                                            quietly count if `didimp_sample' & treat == 1 & atc_sharing == 1 & missing(`exposure_var')
+                                            if r(N) > 0 {
+                                                local failure_reason "Exposure is missing for treated Share observations in the autosample"
+                                            }
+                                            else {
+                                                bysort id: egen double `exposure_id_min' = min(cond(`didimp_sample' & treat == 1 & atc_sharing == 1, `exposure_var', .))
+                                                bysort id: egen double `exposure_id_max' = max(cond(`didimp_sample' & treat == 1 & atc_sharing == 1, `exposure_var', .))
+                                                egen byte `exposure_id_tag' = tag(id) if `didimp_sample' & treat == 1 & atc_sharing == 1
+
+                                                quietly count if `exposure_id_tag' == 1
+                                                local exposure_share_id_n = r(N)
+                                                if `exposure_share_id_n' == 0 {
+                                                    local failure_reason "No treated Share ids remain in the autosample"
+                                                }
+                                                else {
+                                                    quietly count if `exposure_id_tag' == 1 & abs(`exposure_id_max' - `exposure_id_min') > 1e-10
+                                                    if r(N) > 0 {
+                                                        local failure_reason "Exposure is not constant within treated Share id"
+                                                    }
+                                                    else {
+                                                        quietly summarize `exposure_var' if `exposure_id_tag' == 1, meanonly
+                                                        local exposure_raw_min = r(min)
+                                                        local exposure_raw_mean = r(mean)
+                                                        local exposure_raw_max = r(max)
+                                                        local exposure_dm_min = `exposure_raw_min' - `exposure_raw_mean'
+                                                        local exposure_dm_mean = 0
+                                                        local exposure_dm_max = `exposure_raw_max' - `exposure_raw_mean'
+
+                                                        gen double exposure_project = 0
+                                                        replace exposure_project = `exposure_var' - `exposure_raw_mean' if atc_sharing == 1
+
+                                                        capture noisily did_imputation `target' id q_time event_cohort_did_imputation if `didimp_sample', ///
+                                                            fe(`fe_spec') ///
+                                                            project(atc_sharing exposure_project) ///
+                                                            tol(0.1) minn(0) cluster(`cluster_var') `did_controls'
+                                                        local did_rc = _rc
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     else {
                                         capture noisily did_imputation `target' id q_time event_cohort_did_imputation, ///
                                             fe(`fe_spec') ///
                                             hetby(atc_sharing_het) ///
-                                            autosample tol(0.1) minn(0) `did_controls'
+                                            autosample tol(0.1) minn(0) cluster(`cluster_var') `did_controls'
                                         local did_rc = _rc
                                     }
 
@@ -786,8 +820,77 @@ foreach panel_level of local panel_levels {
                                         local failure_reason "did_imputation failed in main DDD estimator: r(`did_rc')"
                                     }
                                     else if "`failure_reason'" == "" {
-                                        quietly count if e(sample)
+                                        gen byte `didimp_esample' = e(sample)
+
+                                        if `use_exposure' {
+                                            tempvar final_exposure_tag
+                                            egen byte `final_exposure_tag' = tag(id) if `didimp_esample' & treat == 1 & atc_sharing == 1
+                                            quietly count if `final_exposure_tag' == 1
+                                            if r(N) != `exposure_share_id_n' {
+                                                local failure_reason "Formal estimation sample changed the treated Share id set after demeaning"
+                                            }
+                                            else {
+                                                quietly summarize `exposure_var' if `final_exposure_tag' == 1, meanonly
+                                                if abs(r(min) - `exposure_raw_min') > 1e-10 | ///
+                                                   abs(r(mean) - `exposure_raw_mean') > 1e-10 | ///
+                                                   abs(r(max) - `exposure_raw_max') > 1e-10 {
+                                                    local failure_reason "Formal estimation sample changed the exposure distribution after demeaning"
+                                                }
+                                            }
+                                        }
+
+                                        quietly count if `didimp_esample'
                                         local N_obs_didimp = r(N)
+
+                                        * Table statistics must match the autosample-adjusted estimation sample.
+                                        if "`std'" == "standardize" {
+                                            quietly summarize target_raw if `didimp_esample' & treat == 1 & atc_sharing == 0 & pre_period == 1
+                                            local premean_notshare = r(mean)
+                                            local basesd_notshare = r(sd)
+
+                                            quietly summarize target_raw if `didimp_esample' & treat == 1 & atc_sharing == 1 & pre_period == 1
+                                            local premean_share = r(mean)
+                                            local basesd_share = r(sd)
+                                        }
+                                        else {
+                                            quietly summarize `target' if `didimp_esample' & treat == 1 & atc_sharing == 0 & pre_period == 1, meanonly
+                                            local premean_notshare = r(mean)
+                                            quietly summarize `target' if `didimp_esample' & treat == 1 & atc_sharing == 1 & pre_period == 1, meanonly
+                                            local premean_share = r(mean)
+                                        }
+
+                                        quietly count if `didimp_esample' & treat == 1 & atc_sharing == 0
+                                        local N_notshare = r(N)
+                                        quietly count if `didimp_esample' & treat == 1 & atc_sharing == 1
+                                        local N_share = r(N)
+                                        quietly count if `didimp_esample' & treat == 0
+                                        local N_control = r(N)
+
+                                        tempvar tag_id_notshare tag_id_share tag_id_control
+                                        egen `tag_id_notshare' = tag(id) if `didimp_esample' & treat == 1 & atc_sharing == 0
+                                        quietly count if `tag_id_notshare' == 1
+                                        local product_notshare = r(N)
+
+                                        egen `tag_id_share' = tag(id) if `didimp_esample' & treat == 1 & atc_sharing == 1
+                                        quietly count if `tag_id_share' == 1
+                                        local product_share = r(N)
+
+                                        egen `tag_id_control' = tag(id) if `didimp_esample' & treat == 0
+                                        quietly count if `tag_id_control' == 1
+                                        local product_control = r(N)
+
+                                        tempvar tag_board_notshare tag_board_share tag_board_control
+                                        egen `tag_board_notshare' = tag(boardname) if `didimp_esample' & treat == 1 & atc_sharing == 0
+                                        quietly count if `tag_board_notshare' == 1
+                                        local board_notshare = r(N)
+
+                                        egen `tag_board_share' = tag(boardname) if `didimp_esample' & treat == 1 & atc_sharing == 1
+                                        quietly count if `tag_board_share' == 1
+                                        local board_share = r(N)
+
+                                        egen `tag_board_control' = tag(boardname) if `didimp_esample' & treat == 0
+                                        quietly count if `tag_board_control' == 1
+                                        local board_control = r(N)
 
                                         local beta0_expr "tau_0"
                                         local beta1_expr "tau_1 - tau_0"
@@ -843,6 +946,41 @@ foreach panel_level of local panel_levels {
                                             local te_share = r(estimate)
                                             local te_share_se = r(se)
                                             local te_share_p = r(p)
+                                        }
+
+                                        if `use_exposure' & "`failure_reason'" == "" {
+                                            foreach point in min mean max {
+                                                local d_value = .
+                                                if "`point'" == "min" {
+                                                    local d_value = `exposure_dm_min'
+                                                }
+                                                else if "`point'" == "mean" {
+                                                    local d_value = `exposure_dm_mean'
+                                                }
+                                                else if "`point'" == "max" {
+                                                    local d_value = `exposure_dm_max'
+                                                }
+
+                                                capture noisily lincom tau_atc_sharing + (`d_value') * tau_exposure_project
+                                                local lincom_gap_rc = _rc
+                                                if `lincom_gap_rc' != 0 {
+                                                    local failure_reason "lincom Share-minus-Not-Share gap at exposure `point' failed: r(`lincom_gap_rc')"
+                                                    continue, break
+                                                }
+                                                local gap_`point' = r(estimate)
+                                                local gap_`point'_se = r(se)
+                                                local gap_`point'_p = r(p)
+
+                                                capture noisily lincom tau_cons + tau_atc_sharing + (`d_value') * tau_exposure_project
+                                                local lincom_share_att_rc = _rc
+                                                if `lincom_share_att_rc' != 0 {
+                                                    local failure_reason "lincom Share ATT at exposure `point' failed: r(`lincom_share_att_rc')"
+                                                    continue, break
+                                                }
+                                                local share_att_`point' = r(estimate)
+                                                local share_att_`point'_se = r(se)
+                                                local share_att_`point'_p = r(p)
+                                            }
                                         }
                                     }
 
@@ -941,10 +1079,19 @@ foreach panel_level of local panel_levels {
                                         ("`exposure_type'") ///
                                         ("`exposure_metric'") ///
                                         ("`exposure_var'") ///
+                                        (`exposure_raw_min') (`exposure_raw_mean') (`exposure_raw_max') ///
+                                        (`exposure_dm_min') (`exposure_dm_mean') (`exposure_dm_max') ///
+                                        (`exposure_share_id_n') ///
                                         (`beta0') (`beta0_se') (`beta0_p') ///
                                         (`beta1') (`beta1_se') (`beta1_p') ///
                                         (`beta2') (`beta2_se') (`beta2_p') ///
                                         (`te_share') (`te_share_se') (`te_share_p') ///
+                                        (`gap_min') (`gap_min_se') (`gap_min_p') ///
+                                        (`gap_mean') (`gap_mean_se') (`gap_mean_p') ///
+                                        (`gap_max') (`gap_max_se') (`gap_max_p') ///
+                                        (`share_att_min') (`share_att_min_se') (`share_att_min_p') ///
+                                        (`share_att_mean') (`share_att_mean_se') (`share_att_mean_p') ///
+                                        (`share_att_max') (`share_att_max_se') (`share_att_max_p') ///
                                         (`pcteff_notshare') (`pcteff_share') ///
                                         (`premean_notshare') (`premean_share') ///
                                         (`N_obs_didimp') (`N_control') (`N_notshare') (`N_share') ///
@@ -965,6 +1112,21 @@ foreach panel_level of local panel_levels {
                                     estadd scalar board_control = `board_control'
                                     estadd scalar board_notshare = `board_notshare'
                                     estadd scalar board_share = `board_share'
+                                    estadd scalar exposure_raw_min = `exposure_raw_min'
+                                    estadd scalar exposure_raw_mean = `exposure_raw_mean'
+                                    estadd scalar exposure_raw_max = `exposure_raw_max'
+                                    estadd scalar exposure_dm_min = `exposure_dm_min'
+                                    estadd scalar exposure_dm_mean = `exposure_dm_mean'
+                                    estadd scalar exposure_dm_max = `exposure_dm_max'
+                                    estadd scalar exposure_share_id_n = `exposure_share_id_n'
+                                    foreach point in min mean max {
+                                        estadd scalar gap_`point' = `gap_`point''
+                                        estadd scalar gap_`point'_se = `gap_`point'_se'
+                                        estadd scalar gap_`point'_p = `gap_`point'_p'
+                                        estadd scalar share_att_`point' = `share_att_`point''
+                                        estadd scalar share_att_`point'_se = `share_att_`point'_se'
+                                        estadd scalar share_att_`point'_p = `share_att_`point'_p'
+                                    }
                                 }
 
                                 if `skip_specification' {
@@ -983,7 +1145,7 @@ foreach panel_level of local panel_levels {
 
                                 tempfile tex_fragment
                                 local esttab_keep "beta1 beta2 beta3"
-                                local beta2_label "beta2: ATT gap (Share - Not Share, exposure=0)"
+                                local beta2_label "beta2: ATT gap (Share - Not Share, exposure=mean)"
                                 local beta3_label "beta3: Shared-class exposure gradient"
                                 if !`use_exposure' {
                                     local esttab_keep "beta1 beta2"
@@ -1005,6 +1167,19 @@ foreach panel_level of local panel_levels {
                                         premean_share ///
                                         pcteff_notshare ///
                                         pcteff_share ///
+                                        exposure_raw_min ///
+                                        exposure_raw_mean ///
+                                        exposure_raw_max ///
+                                        exposure_dm_min ///
+                                        exposure_dm_mean ///
+                                        exposure_dm_max ///
+                                        exposure_share_id_n ///
+                                        gap_min gap_min_se gap_min_p ///
+                                        gap_mean gap_mean_se gap_mean_p ///
+                                        gap_max gap_max_se gap_max_p ///
+                                        share_att_min share_att_min_se share_att_min_p ///
+                                        share_att_mean share_att_mean_se share_att_mean_p ///
+                                        share_att_max share_att_max_se share_att_max_p ///
                                         N ///
                                         N_control ///
                                         N_share ///
@@ -1015,12 +1190,43 @@ foreach panel_level of local panel_levels {
                                         product_control ///
                                         product_share ///
                                         product_notshare, ///
-                                        fmt(3 3 2 2 0 0 0 0 0 0 0 0 0 0) ///
+                                        fmt( ///
+                                            3 3 2 2 ///
+                                            3 3 3 3 3 3 0 ///
+                                            3 3 3 3 3 3 3 3 3 ///
+                                            3 3 3 3 3 3 3 3 3 ///
+                                            0 0 0 0 0 0 0 0 0 0 ///
+                                        ) ///
                                         labels( ///
                                             "Pre-treatment mean Y (Not Share)" ///
                                             "Pre-treatment mean Y (Share)" ///
                                             "Percent effect (Not Share)" ///
-                                            "Percent effect (Share)" ///
+                                            "Percent effect (Share, mean exposure)" ///
+                                            "Exposure raw min (Share IDs)" ///
+                                            "Exposure raw mean (Share IDs)" ///
+                                            "Exposure raw max (Share IDs)" ///
+                                            "Exposure demeaned min" ///
+                                            "Exposure demeaned mean" ///
+                                            "Exposure demeaned max" ///
+                                            "Unique Share IDs for exposure" ///
+                                            "Share - Not Share gap at min" ///
+                                            "SE: gap at min" ///
+                                            "p-value: gap at min" ///
+                                            "Share - Not Share gap at mean" ///
+                                            "SE: gap at mean" ///
+                                            "p-value: gap at mean" ///
+                                            "Share - Not Share gap at max" ///
+                                            "SE: gap at max" ///
+                                            "p-value: gap at max" ///
+                                            "Share ATT at min" ///
+                                            "SE: Share ATT at min" ///
+                                            "p-value: Share ATT at min" ///
+                                            "Share ATT at mean" ///
+                                            "SE: Share ATT at mean" ///
+                                            "p-value: Share ATT at mean" ///
+                                            "Share ATT at max" ///
+                                            "SE: Share ATT at max" ///
+                                            "p-value: Share ATT at max" ///
                                             "Observations Total" ///
                                             "Observations (Control)" ///
                                             "Observations (Share, Treated)" ///
@@ -1053,6 +1259,7 @@ foreach panel_level of local panel_levels {
                                 file close `fhout'
 
                                 log close
+                                }
                                 }
                                 }
                                 }

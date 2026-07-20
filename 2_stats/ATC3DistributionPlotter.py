@@ -7,7 +7,7 @@ Process:
 2. Read ATC2/ATC3 product-firm mapping files.
 3. Read balanced quarter-level movement cohort files from CohortPanelMaker.
 4. Label treated BoardName-product rows with atc_sharing indicators.
-5. Add pre-event rival-share and HHI exposure measures.
+5. Add pre-event own-plus-rival share and HHI exposure measures.
 6. Save enriched cohorts and Pure Control yearly sharing summaries.
 
 Input:
@@ -44,15 +44,15 @@ HHI_COLUMNS = [
     "hhi_quantity_atc2",
     "hhi_revenue_atc2",
 ]
-RIVAL_SHARE_COLUMNS = [
-    "rival_share_quantity_atc3",
-    "rival_share_revenue_atc3",
-    "rival_share_quantity_atc2",
-    "rival_share_revenue_atc2",
+SHARE_COLUMNS = [
+    "share_quantity_atc3",
+    "share_revenue_atc3",
+    "share_quantity_atc2",
+    "share_revenue_atc2",
 ]
 
 # ========================== USER CONFIG ==========================
-ATCS = ["atc3","atc2"]
+ATCS = ["atc3"]
 MOVEMENT_EVENTS = [
     "to_B_not_in_A",
     "to_B_still_in_A",
@@ -214,13 +214,13 @@ def build_firm_share(ssr: pd.DataFrame, market_col: str, suffix: str) -> pd.Data
         how="left",
         validate="many_to_one",
     )
-    firm_sales[f"rival_share_revenue_{suffix}"] = firm_sales["firm_revenue"].div(
+    firm_sales[f"share_revenue_{suffix}"] = firm_sales["firm_revenue"].div(
         firm_sales["total_revenue"]
     )
-    firm_sales[f"rival_share_quantity_{suffix}"] = firm_sales["firm_quantity"].div(
+    firm_sales[f"share_quantity_{suffix}"] = firm_sales["firm_quantity"].div(
         firm_sales["total_quantity"]
     )
-    share_cols = [f"rival_share_quantity_{suffix}", f"rival_share_revenue_{suffix}"]
+    share_cols = [f"share_quantity_{suffix}", f"share_revenue_{suffix}"]
     averaged = (
         firm_sales.groupby(["cohort_year", market_col, "_firm_key"], as_index=False, dropna=False)[
             share_cols
@@ -293,7 +293,7 @@ def add_pre_event_hhi(
     return result
 
 
-def add_rival_share_exposure(
+def add_share_exposure(
     cohort: pd.DataFrame,
     partners: pd.DataFrame,
     event: str,
@@ -301,9 +301,9 @@ def add_rival_share_exposure(
     event_col: str,
     market_exposures: dict[str, pd.DataFrame],
 ) -> pd.DataFrame:
-    """Add cohort-fixed rival share exposure measures to treated products."""
-    result = cohort.drop(columns=[col for col in RIVAL_SHARE_COLUMNS if col in cohort.columns])
-    for col in RIVAL_SHARE_COLUMNS:
+    """Add cohort-fixed own-plus-rival share exposures to treated products."""
+    result = cohort.drop(columns=[col for col in SHARE_COLUMNS if col in cohort.columns])
+    for col in SHARE_COLUMNS:
         result[col] = 0.0
 
     treated = (
@@ -328,37 +328,61 @@ def add_rival_share_exposure(
     valid_partners["_board_key"] = firm_key(valid_partners["BoardName"])
     valid_partners["_partner_key"] = firm_key(valid_partners["BoardNamePair"])
     valid_partners = valid_partners[["_board_key", "_partner_key"]].drop_duplicates()
-    if valid_partners.empty:
-        return result
-
+    if valid_partners["_board_key"].eq(valid_partners["_partner_key"]).any():
+        raise AssertionError(f"Self-pair found for {event} {cohort_year}")
     partnered = treated.merge(valid_partners, on="_board_key", how="inner")
     summed_by_suffix = []
     for suffix in ("atc3", "atc2"):
         share_cols = [
-            f"rival_share_quantity_{suffix}",
-            f"rival_share_revenue_{suffix}",
+            f"share_quantity_{suffix}",
+            f"share_revenue_{suffix}",
         ]
         share_lookup = market_exposures[f"firm_share_{suffix}"]
         share_lookup = share_lookup[share_lookup["cohort_year"].eq(cohort_year)].drop(
             columns=["cohort_year"]
         )
-        matched = partnered.merge(
+        rival_matched = partnered.merge(
             share_lookup,
             left_on=[f"_atc{suffix[-1]}_for_exposure", "_partner_key"],
             right_on=[f"_{suffix}", "_partner_key"],
             how="left",
             validate="many_to_one",
         )
-        matched[share_cols] = matched[share_cols].fillna(0)
-        summed = (
-            matched.groupby(["BoardName", "product"], as_index=False, dropna=False)[share_cols]
+        rival_matched[share_cols] = rival_matched[share_cols].fillna(0)
+        rival_summed = (
+            rival_matched.groupby(["BoardName", "product"], as_index=False, dropna=False)[share_cols]
             .sum()
         )
+
+        own = treated.copy()
+        own["_partner_key"] = own["_board_key"]
+        own_matched = own.merge(
+            share_lookup,
+            left_on=[f"_atc{suffix[-1]}_for_exposure", "_partner_key"],
+            right_on=[f"_{suffix}", "_partner_key"],
+            how="left",
+            validate="many_to_one",
+        )
+        own_matched[share_cols] = own_matched[share_cols].fillna(0)
+        own_share = own_matched[["BoardName", "product", *share_cols]].copy()
+
+        summed = own_share.merge(
+            rival_summed,
+            on=["BoardName", "product"],
+            how="left",
+            suffixes=("_own", "_rival"),
+            validate="one_to_one",
+        )
         for col in share_cols:
-            if summed[col].gt(1 + 1e-10).any():
-                examples = summed.loc[summed[col].gt(1 + 1e-10)].head(10)
+            summed[col] = summed[f"{col}_own"] + summed[f"{col}_rival"].fillna(0)
+        summed = summed[["BoardName", "product", *share_cols]]
+        for col in share_cols:
+            invalid = ~summed[col].between(-1e-10, 1 + 1e-10)
+            if invalid.any():
+                examples = summed.loc[invalid].head(10)
                 raise AssertionError(
-                    f"{col} exceeds 1 after partner aggregation for {event} {cohort_year}:\n"
+                    f"{col} falls outside [0, 1] after own-plus-rival aggregation for "
+                    f"{event} {cohort_year}:\n"
                     f"{examples}"
                 )
         summed_by_suffix.append(summed)
@@ -376,7 +400,7 @@ def add_rival_share_exposure(
         suffixes=("", "_exposure"),
         validate="many_to_one",
     )
-    for col in RIVAL_SHARE_COLUMNS:
+    for col in SHARE_COLUMNS:
         exposure_col = f"{col}_exposure"
         result[col] = result[exposure_col].fillna(result[col]).fillna(0)
         result = result.drop(columns=[exposure_col])
@@ -459,7 +483,7 @@ def process_one_config(
                 cohort_year=cohort_year,
                 market_exposures=market_exposures,
             )
-            cohort = add_rival_share_exposure(
+            cohort = add_share_exposure(
                 cohort=cohort,
                 partners=partners,
                 event=event,
