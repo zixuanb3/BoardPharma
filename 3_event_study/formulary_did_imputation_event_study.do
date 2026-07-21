@@ -27,9 +27,12 @@ set trace off
 // ================================================================
 
 * ================= user config =================
-local events interlock_dissolution to_B_still_in_A to_B_not_in_A
-local treatment_groups A B
-local targets included_count included_share mean_tiera mean_tier_raw
+local events to_B_not_in_A
+* interlock_dissolution to_B_still_in_A
+local treatment_groups B
+* A
+local targets mean_tier_raw
+* included_count included_share mean_tiera
 local outlier_treatment winsorize
 local outlier_percentile p95
 local req 1
@@ -63,8 +66,8 @@ if "`outlier_treatment'" != "winsorize" | "`outlier_percentile'" != "p95" {
     di as error "This do-file is fixed at upper-tail p95 winsorization."
     exit 198
 }
-if `fe_level' != 1 | "`cluster_level'" != "firm" | "`atc'" != "atc3" {
-    di as error "This do-file requires FE1, firm clustering, and ATC3 sharing."
+if !inlist(`fe_level', 1, 2) | "`cluster_level'" != "firm" | "`atc'" != "atc3" {
+    di as error "This do-file requires FE1 or FE2, firm clustering, and ATC3 sharing."
     exit 198
 }
 
@@ -112,10 +115,7 @@ postfile `sample_post' ///
 
 * ================= estimation loop =================
 foreach event of local events {
-    local cohort_list "2020 2021 2022"
-    if "`event'" == "interlock_dissolution" {
-        local cohort_list "2020 2021 2022 2023 2024"
-    }
+    local cohort_list "2020 2021 2022 2023 2024"
 
     foreach treatment_group of local treatment_groups {
         local side = lower("`treatment_group'")
@@ -142,7 +142,7 @@ foreach event of local events {
         }
 
         foreach target of local targets {
-            local file_stub "`event'_`treatment_group'_`target'_req1_not_wsp95_fe1_clusterfirm"
+            local file_stub "`event'_`treatment_group'_`target'_req1_not_wsp95_fe`fe_level'_clusterfirm"
             capture erase "`figure_root'/`file_stub'.png"
             capture log close
             log using "`log_root'/`file_stub'.log", replace text
@@ -218,9 +218,20 @@ foreach event of local events {
             local p95_value = r(p95)
             replace `target' = `p95_value' if `target' > `p95_value' & !missing(`target')
 
-            egen long id = group(ndc boardname data_cohort)
             gen int q_time = yq(year, quarter)
             format q_time %tq
+            assert inrange(quarter, 1, 4)
+            gen int lag_formulary_year = year + (quarter == 4)
+            local time_fe_var "q_time"
+            if `fe_level' == 2 {
+                local time_fe_var "lag_formulary_year"
+            }
+            assert !missing(ndc) & !missing(boardname)
+            bysort ndc data_cohort boardname: gen byte board_tag = _n == 1
+            bysort ndc data_cohort: egen int board_count = total(board_tag)
+            assert board_count == 1
+            drop board_tag board_count
+            egen long id = group(ndc data_cohort)
             isid id q_time
 
             gen byte treated = treated_in_stack
@@ -250,7 +261,7 @@ foreach event of local events {
                 }
             }
 
-            local fe_spec "id q_time `other_history_list'"
+            local fe_spec "id `time_fe_var' `other_history_list'"
             gen byte atc_sharing_het = atc_sharing if treated == 1
             replace atc_sharing_het = 0 if treated == 0
 

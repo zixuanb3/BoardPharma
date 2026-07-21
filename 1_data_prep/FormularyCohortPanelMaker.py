@@ -10,11 +10,13 @@ Process:
    mean_tier_raw; retain ATC3 plus req1 event and ATC3-sharing indicators.
 3. Reproduce SSR Not controls from pure movement events, and reproduce
    include_eventpair=0 from req1 candidate firm pairs separately for A and B.
-4. Save one combined A/B cohort file per event-year with direction-specific
-   treated, sample, and sharing flags.
+4. Restrict cohort drug-firm ids to NDCs first included by the cohort year's
+   Q1, then save one combined A/B cohort file per event-year with
+   direction-specific treated, sample, and sharing flags.
 
 Input:
 - data/formulary_panel_by_time/formulary_panel_YYYYQX.csv
+- data/formulary_metadata/ndc_first_seen.csv
 - data/event_tables/movement_table_formulary_large_sample_narrow.csv
 - data/event_tables/movement_event_candidates_formulary_large_sample_narrow.csv
 
@@ -42,6 +44,7 @@ QUARTER_INPUT_DIR = DATA_ROOT / "formulary_panel_by_time"
 DRUG_QUARTER_OUTPUT_DIR = DATA_ROOT / "formulary_drug_panel_by_time"
 COHORT_OUTPUT_DIR = DATA_ROOT / "formulary_cohort_data" / "event" / "req1" / "Not"
 EVENT_TABLE_DIR = DATA_ROOT / "event_tables"
+FIRST_SEEN_PATH = DATA_ROOT / "formulary_metadata" / "ndc_first_seen.csv"
 
 MOVEMENT_TABLE_PATH = (
     EVENT_TABLE_DIR / "movement_table_formulary_large_sample_narrow.csv"
@@ -58,8 +61,8 @@ EVENT_TYPES = (
 )
 TREATMENT_GROUPS = ("A", "B")
 COHORT_YEARS = {
-    "to_B_not_in_A": (2020, 2021, 2022),
-    "to_B_still_in_A": (2020, 2021, 2022),
+    "to_B_not_in_A": (2020, 2021, 2022, 2023, 2024),
+    "to_B_still_in_A": (2020, 2021, 2022, 2023, 2024),
     "interlock_dissolution": (2020, 2021, 2022, 2023, 2024),
 }
 
@@ -78,7 +81,7 @@ STAY_COLUMN_PATTERN = re.compile(r"^stay_\d+_years$")
 # overwrite_*:
 # - Keep at 0 to prevent mixing stale and newly generated panels.
 RUN_CONFIG = {
-    "chunksize": 1_000_000,
+    "chunksize": 500_000,
     "window_pre": 1,
     "window_post": 1,
     "req": 1,
@@ -486,6 +489,30 @@ def build_drug_quarter_panels(
 # ========================== EVENT SOURCE TABLES ==========================
 
 
+def load_first_seen_lookup() -> dict[str, int]:
+    """Load the earliest included quarter for every expanded NDC."""
+    if not FIRST_SEEN_PATH.exists():
+        raise FileNotFoundError(f"NDC first-seen lookup not found: {FIRST_SEEN_PATH}")
+    first_seen = pd.read_csv(FIRST_SEEN_PATH, dtype={"NDC": "string"})
+    required = {"NDC", "first_seen_qtime"}
+    missing = sorted(required - set(first_seen.columns))
+    if missing:
+        raise KeyError(f"{FIRST_SEEN_PATH.name} is missing columns: {missing}")
+
+    first_seen["NDC"] = normalize_string(first_seen["NDC"])
+    if first_seen["NDC"].isna().any() or first_seen["NDC"].duplicated().any():
+        raise ValueError(f"{FIRST_SEEN_PATH.name} must contain one nonmissing row per NDC.")
+    first_seen["first_seen_qtime"] = pd.to_numeric(
+        first_seen["first_seen_qtime"], errors="raise"
+    ).astype("int32")
+    return dict(
+        zip(
+            first_seen["NDC"].astype(str),
+            first_seen["first_seen_qtime"].astype(int),
+        )
+    )
+
+
 def load_event_sources() -> tuple[pd.DataFrame, pd.DataFrame, str]:
     """Load the small canonical firm-year table and candidate-pair table."""
     movement = pd.read_csv(MOVEMENT_TABLE_PATH, dtype="string")
@@ -603,6 +630,19 @@ def keep_complete_drug_ids(cohort: pd.DataFrame, expected_quarters: int) -> pd.D
     return cohort.loc[id_index.isin(complete_ids)].copy()
 
 
+def keep_available_ndcs(
+    cohort: pd.DataFrame,
+    first_seen_qtime: dict[str, int],
+    cohort_year: int,
+) -> pd.DataFrame:
+    """Keep NDCs first included by the cohort year's Q1 entry quarter."""
+    first_seen = cohort["ndc"].map(first_seen_qtime)
+    if first_seen.isna().any():
+        examples = cohort.loc[first_seen.isna(), "ndc"].drop_duplicates().head(10).tolist()
+        raise KeyError(f"Cohort NDCs are missing from the first-seen lookup: {examples}")
+    return cohort.loc[first_seen.le(cohort_year * 4 + 1)].copy()
+
+
 def validate_panel_treatment_flags(
     cohort: pd.DataFrame,
     event_type: str,
@@ -717,6 +757,7 @@ def cohort_output_columns() -> list[str]:
 def build_one_cohort(
     drug_quarter_paths: dict[str, Path],
     quarter_tags: list[str],
+    first_seen_qtime: dict[str, int],
     movement: pd.DataFrame,
     candidate: pd.DataFrame,
     stay_column: str,
@@ -726,6 +767,7 @@ def build_one_cohort(
     """Build one combined-direction, balanced drug-firm cohort."""
     cohort = read_cohort_window(drug_quarter_paths, quarter_tags)
     cohort = keep_complete_drug_ids(cohort, expected_quarters=len(quarter_tags))
+    cohort = keep_available_ndcs(cohort, first_seen_qtime, cohort_year)
     cohort["data_cohort"] = np.int16(cohort_year)
     cohort = add_direction_flags(
         cohort,
@@ -746,6 +788,7 @@ def build_one_cohort(
 def build_cohort_outputs(
     drug_quarter_paths: dict[str, Path],
     cohort_windows: dict[int, list[str]],
+    first_seen_qtime: dict[str, int],
     movement: pd.DataFrame,
     candidate: pd.DataFrame,
     stay_column: str,
@@ -765,6 +808,7 @@ def build_cohort_outputs(
         cohort = build_one_cohort(
             drug_quarter_paths,
             cohort_windows[cohort_year],
+            first_seen_qtime,
             movement,
             candidate,
             stay_column,
@@ -795,6 +839,7 @@ def main() -> None:
         window_pre,
         window_post,
     )
+    first_seen_qtime = load_first_seen_lookup()
     movement, candidate, stay_column = load_event_sources()
     drug_quarter_paths = build_drug_quarter_panels(
         quarter_tags,
@@ -805,6 +850,7 @@ def main() -> None:
     build_cohort_outputs(
         drug_quarter_paths,
         cohort_windows,
+        first_seen_qtime,
         movement,
         candidate,
         stay_column,

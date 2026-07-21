@@ -11,12 +11,14 @@ Process:
    retain only that FORMULARY_ID-year-Q1's rows, and stop opening new blocks
    once every target year has one selected formulary.
 3. Count unique event BoardName values and unique event NDC values split by
-   ATC1--ATC4 sharing status for all six event-direction indicators.
+   ATC1--ATC4 sharing status for all six event-direction indicators. Event NDC
+   counts include only products first included by the event year's Q1.
 4. Save the selection manifest, CSV summaries, and bar charts under concise
    project-level csv and figures folders.
 
 Input:
 - data/formulary_panel/formulary_panel_1.csv through formulary_panel_30.csv
+- data/formulary_metadata/ndc_first_seen.csv
 
 Output:
 - csv/formulary_panel_event_stats/{selection,firm,ndc_share}/*.csv
@@ -41,6 +43,7 @@ from tqdm.auto import tqdm
 CURRENT_PATH = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_PATH.parent.parent
 PANEL_DIR = PROJECT_ROOT / "data" / "formulary_panel"
+FIRST_SEEN_PATH = PROJECT_ROOT / "data" / "formulary_metadata" / "ndc_first_seen.csv"
 CSV_ROOT = PROJECT_ROOT / "csv" / "formulary_panel_event_stats"
 FIGURE_ROOT = PROJECT_ROOT / "figures" / "formulary_panel_event_stats"
 
@@ -136,6 +139,32 @@ def validate_schema(path: Path, columns: list[str]) -> None:
         raise KeyError(f"{path.name} is missing required columns: {missing}")
 
 
+def load_first_seen_lookup() -> dict[str, int]:
+    """Load one earliest included quarter for every expanded NDC."""
+    if not FIRST_SEEN_PATH.exists():
+        raise FileNotFoundError(f"NDC first-seen lookup not found: {FIRST_SEEN_PATH}")
+    first_seen = pd.read_csv(FIRST_SEEN_PATH, dtype={"NDC": "string"})
+    required = {"NDC", "first_seen_qtime"}
+    missing = sorted(required - set(first_seen.columns))
+    if missing:
+        raise KeyError(f"{FIRST_SEEN_PATH.name} is missing columns: {missing}")
+
+    first_seen["NDC"] = first_seen["NDC"].astype("string").str.strip()
+    if first_seen["NDC"].isna().any() or first_seen["NDC"].eq("").any():
+        raise ValueError(f"{FIRST_SEEN_PATH.name} contains a missing NDC.")
+    if first_seen["NDC"].duplicated().any():
+        raise ValueError(f"{FIRST_SEEN_PATH.name} contains duplicate NDC values.")
+    first_seen["first_seen_qtime"] = pd.to_numeric(
+        first_seen["first_seen_qtime"], errors="raise"
+    ).astype("int32")
+    return dict(
+        zip(
+            first_seen["NDC"].astype(str),
+            first_seen["first_seen_qtime"].astype(int),
+        )
+    )
+
+
 def normalize_data(data: pd.DataFrame, path: Path) -> pd.DataFrame:
     """Normalize identifiers and parse YEAR_Q into integer year and quarter fields."""
     for column in ("FORMULARY_ID", "BoardName", "NDC"):
@@ -152,6 +181,19 @@ def normalize_data(data: pd.DataFrame, path: Path) -> pd.DataFrame:
     data["_year"] = parsed[0].astype("int16")
     data["_quarter"] = parsed[1].astype("int8")
     return data
+
+
+def available_by_event_q1(
+    data: pd.DataFrame,
+    first_seen_qtime: dict[str, int],
+    path: Path,
+) -> pd.Series:
+    """Return whether each NDC was first included by its row year's Q1."""
+    first_seen = data["NDC"].map(first_seen_qtime)
+    if first_seen.isna().any():
+        examples = data.loc[first_seen.isna(), "NDC"].drop_duplicates().head(10).tolist()
+        raise KeyError(f"{path.name} has NDCs missing from the first-seen lookup: {examples}")
+    return first_seen.le(data["_year"].astype("int32") * 4 + 1)
 
 
 def binary_indicator(data: pd.DataFrame, column: str, path: Path) -> pd.Series:
@@ -203,28 +245,32 @@ def accumulate_selected_rows(
     data: pd.DataFrame,
     events: tuple[EventSpec, ...],
     path: Path,
+    first_seen_qtime: dict[str, int],
     firm_sets: dict[int, dict[str, set[str]]],
     ndc_sharing: dict[int, dict[tuple[str, int], dict[str, int]]],
 ) -> None:
     """Accumulate unique event firms and NDC share status from selected rows."""
     for year, quarter_data in data.groupby("_year", sort=False):
+        available_mask = available_by_event_q1(quarter_data, first_seen_qtime, path)
         for event in events:
-            event_mask = binary_indicator(quarter_data, event.event_column, path).eq(1)
-            if not event_mask.any():
+            raw_event_mask = binary_indicator(quarter_data, event.event_column, path).eq(1)
+            if not raw_event_mask.any():
                 continue
-            if quarter_data.loc[event_mask, "_quarter"].ne(1).any():
+            if quarter_data.loc[raw_event_mask, "_quarter"].ne(1).any():
                 raise ValueError(f"{path.name}.{event.event_column} contains an event outside Q1.")
 
-            event_data = quarter_data.loc[event_mask, ["BoardName", "NDC", *[event.share_column(level) for level in ATC_LEVELS]]]
-            firm_sets[int(year)][event.slug].update(event_data["BoardName"].astype(str))
+            firm_sets[int(year)][event.slug].update(
+                quarter_data.loc[raw_event_mask, "BoardName"].astype(str)
+            )
+            event_mask = raw_event_mask & available_mask
             for level in ATC_LEVELS:
                 share_column = event.share_column(level)
                 share = binary_indicator(quarter_data, share_column, path)
-                if share.loc[~event_mask].eq(1).any():
+                if share.loc[~raw_event_mask].eq(1).any():
                     raise ValueError(f"{path.name}.{share_column} equals 1 outside matching event rows.")
                 event_share = pd.DataFrame(
                     {
-                        "NDC": event_data["NDC"].astype(str),
+                        "NDC": quarter_data.loc[event_mask, "NDC"].astype(str),
                         "share": share.loc[event_mask].to_numpy(),
                     }
                 ).groupby("NDC", as_index=False)["share"].max()
@@ -366,6 +412,7 @@ def main() -> None:
     events = configured_events()
     years = target_years()
     columns = required_columns(events)
+    first_seen_qtime = load_first_seen_lookup()
     selected: dict[int, tuple[str, int]] = {}
     opened_blocks: list[int] = []
     firm_sets, ndc_sharing = initialize_accumulators(years, events)
@@ -382,7 +429,14 @@ def main() -> None:
             add_new_selections(data, years, selected, block_number)
             retained = selected_rows(data, selected)
             if not retained.empty:
-                accumulate_selected_rows(retained, events, path, firm_sets, ndc_sharing)
+                accumulate_selected_rows(
+                    retained,
+                    events,
+                    path,
+                    first_seen_qtime,
+                    firm_sets,
+                    ndc_sharing,
+                )
             del data, retained
 
     if len(selected) != len(years):

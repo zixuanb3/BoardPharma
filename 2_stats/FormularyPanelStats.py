@@ -5,14 +5,15 @@ memory. Produce coverage, event-incidence, and event-by-ATC-sharing diagnostics.
 
 Process:
 1. Stream the required columns from each formulary_panel block in small chunks.
-2. Deduplicate FORMULARY_ID-quarter and treated FORMULARY_ID-NDC observations
-   within each complete-formulary block, then accumulate compact counts.
+2. Deduplicate FORMULARY_ID-quarter and treated FORMULARY_ID-NDC observations,
+   restricting event NDCs to those first included by the event year's Q1.
 3. Validate that each ATC sharing split exhausts its corresponding event count.
 4. Save concise CSV summaries and bar charts under the project-level csv and
    figures directories.
 
 Input:
 - data/formulary_panel/formulary_panel_1.csv through formulary_panel_30.csv
+- data/formulary_metadata/ndc_first_seen.csv
 
 Output:
 - csv/formulary_panel_stats/{coverage,event,share}/*.csv
@@ -37,6 +38,7 @@ from tqdm.auto import tqdm
 CURRENT_PATH = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_PATH.parent.parent
 PANEL_DIR = PROJECT_ROOT / "data" / "formulary_panel"
+FIRST_SEEN_PATH = PROJECT_ROOT / "data" / "formulary_metadata" / "ndc_first_seen.csv"
 CSV_ROOT = PROJECT_ROOT / "csv" / "formulary_panel_stats"
 FIGURE_ROOT = PROJECT_ROOT / "figures" / "formulary_panel_stats"
 
@@ -115,6 +117,32 @@ def validate_schema(paths: list[Path], columns: list[str]) -> None:
             raise KeyError(f"{path.name} is missing required columns: {missing}")
 
 
+def load_first_seen_lookup() -> dict[str, int]:
+    """Load one earliest included quarter for every expanded NDC."""
+    if not FIRST_SEEN_PATH.exists():
+        raise FileNotFoundError(f"NDC first-seen lookup not found: {FIRST_SEEN_PATH}")
+    first_seen = pd.read_csv(FIRST_SEEN_PATH, dtype={"NDC": "string"})
+    required = {"NDC", "first_seen_qtime"}
+    missing = sorted(required - set(first_seen.columns))
+    if missing:
+        raise KeyError(f"{FIRST_SEEN_PATH.name} is missing columns: {missing}")
+
+    first_seen["NDC"] = first_seen["NDC"].astype("string").str.strip()
+    if first_seen["NDC"].isna().any() or first_seen["NDC"].eq("").any():
+        raise ValueError(f"{FIRST_SEEN_PATH.name} contains a missing NDC.")
+    if first_seen["NDC"].duplicated().any():
+        raise ValueError(f"{FIRST_SEEN_PATH.name} contains duplicate NDC values.")
+    first_seen["first_seen_qtime"] = pd.to_numeric(
+        first_seen["first_seen_qtime"], errors="raise"
+    ).astype("int32")
+    return dict(
+        zip(
+            first_seen["NDC"].astype(str),
+            first_seen["first_seen_qtime"].astype(int),
+        )
+    )
+
+
 def parse_year_quarter(data: pd.DataFrame, path: Path) -> pd.DataFrame:
     """Add integer year and quarter fields from YEAR_Q values such as 2020Q1."""
     parsed = data["YEAR_Q"].astype("string").str.extract(r"^\s*(\d{4})\s*Q([1-4])\s*$")
@@ -148,6 +176,19 @@ def normalize_identifiers(data: pd.DataFrame, path: Path) -> pd.DataFrame:
     return data
 
 
+def available_by_event_q1(
+    data: pd.DataFrame,
+    first_seen_qtime: dict[str, int],
+    path: Path,
+) -> pd.Series:
+    """Return whether each NDC was first included by its row year's Q1."""
+    first_seen = data["NDC"].map(first_seen_qtime)
+    if first_seen.isna().any():
+        examples = data.loc[first_seen.isna(), "NDC"].drop_duplicates().head(10).tolist()
+        raise KeyError(f"{path.name} has NDCs missing from the first-seen lookup: {examples}")
+    return first_seen.le(data["_year"].astype("int32") * 4 + 1)
+
+
 def add_block_coverage(
     pairs: set[tuple[str, str]],
     quarter_counts: Counter[str],
@@ -163,6 +204,7 @@ def accumulate_block(
     path: Path,
     events: tuple[EventSpec, ...],
     columns: list[str],
+    first_seen_qtime: dict[str, int],
     quarter_counts: Counter[str],
     span_counts: Counter[int],
     event_counts: dict[str, Counter[int]],
@@ -178,17 +220,19 @@ def accumulate_block(
     reader = pd.read_csv(path, usecols=columns, dtype="string", chunksize=CHUNKSIZE)
     for data in tqdm(reader, desc=f"Reading {path.stem}", unit="chunk", leave=False):
         data = parse_year_quarter(normalize_identifiers(data, path), path)
+        available_mask = available_by_event_q1(data, first_seen_qtime, path)
         coverage_pairs.update(
             zip(data["FORMULARY_ID"].astype(str), data["_year_quarter"].astype(str), strict=True)
         )
 
         for event in events:
-            event_mask = binary_indicator(data, event.event_column, path).eq(1)
-            if not event_mask.any():
+            raw_event_mask = binary_indicator(data, event.event_column, path).eq(1)
+            if not raw_event_mask.any():
                 continue
-            if data.loc[event_mask, "_quarter"].ne(1).any():
+            if data.loc[raw_event_mask, "_quarter"].ne(1).any():
                 raise ValueError(f"{path.name}.{event.event_column} contains event rows outside Q1.")
 
+            event_mask = raw_event_mask & available_mask
             event_rows = data.loc[event_mask, ["_year", "FORMULARY_ID", "NDC"]]
             event_id_rows = list(
                 zip(
@@ -203,7 +247,7 @@ def accumulate_block(
             for level in ATC_LEVELS:
                 share_column = event.share_column(level)
                 share = binary_indicator(data, share_column, path)
-                if share.loc[~event_mask].eq(1).any():
+                if share.loc[~raw_event_mask].eq(1).any():
                     raise ValueError(
                         f"{path.name}.{share_column} equals 1 outside {event.event_column} rows."
                     )
@@ -405,6 +449,7 @@ def main() -> None:
     paths = panel_paths()
     columns = required_columns(events)
     validate_schema(paths, columns)
+    first_seen_qtime = load_first_seen_lookup()
 
     quarter_counts: Counter[str] = Counter()
     span_counts: Counter[int] = Counter()
@@ -418,6 +463,7 @@ def main() -> None:
             path,
             events,
             columns,
+            first_seen_qtime,
             quarter_counts,
             span_counts,
             event_counts,

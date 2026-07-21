@@ -8,8 +8,11 @@ direction-specific ATC1--ATC4 sharing indicators are stored in one panel.
 Process:
 1. Read FORMULARY_ID only, split complete formularies into fixed blocks, then
    route the raw CSV into disk-backed staging blocks in one additional pass.
+   During that routing pass, record each NDC's first quarter with included=1.
 2. Process one complete formulary block at a time: add annual event flags in
    Q1, event-specific balanced-window flags, tierA, and ATC sharing outcomes.
+   ATC sharing requires the treated NDC to have appeared by the event year's
+   Q1 and a matching counterpart NDC to have appeared by that year's end.
 3. Write one final CSV per block and immediately delete its staging file so
    the full raw panel and all configured blocks are never held in memory
    together.
@@ -22,6 +25,7 @@ Input:
 Output:
 - data/formulary_panel/formulary_panel_1.csv through
   formulary_panel_{n_formulary_blocks}.csv
+- data/formulary_metadata/ndc_first_seen.csv
 - D:/task1_expanded_brand_panel/formulary_panel_staging/ temporary block files
   while the script is running; each staging file is deleted after its final
   output has been written successfully.
@@ -43,6 +47,7 @@ from tqdm.auto import tqdm
 CURRENT_PATH = Path(__file__).parent.resolve()
 PROJECT_ROOT = CURRENT_PATH.parent.parent
 OUTPUT_BASE_PATH = PROJECT_ROOT / "data" / "formulary_panel"
+FIRST_SEEN_PATH = PROJECT_ROOT / "data" / "formulary_metadata" / "ndc_first_seen.csv"
 EVENT_TABLE_DIR = PROJECT_ROOT / "data" / "event_tables"
 
 RAW_FORMULARY_PATH = Path(r"D:\task1_expanded_brand_panel\task1_expanded_brand_panel.csv")
@@ -56,6 +61,7 @@ MOVEMENT_EVENTS = {
 }
 TREATMENT_GROUPS = {"A", "B"}
 ATC_LEVELS = (1, 2, 3, 4)
+FIRST_SEEN_QTIME_COLUMN = "_first_seen_qtime"
 
 
 # ========================== USER CONFIG ==========================
@@ -105,7 +111,7 @@ RUN_CONFIG = {
     "atc": [1, 2, 3, 4],
     "req": 1,
     "n_formulary_blocks": 30,
-    "chunksize": 1_000_000,
+    "chunksize": 500_000,
 }
 # ===============================================================
 
@@ -418,13 +424,71 @@ def stage_paths(stage_dir: Path, n_blocks: int) -> dict[int, Path]:
     return {block: stage_dir / f"formulary_stage_{block}.csv" for block in range(1, n_blocks + 1)}
 
 
+def update_first_seen_lookup(
+    chunk: pd.DataFrame,
+    first_seen_qtime: dict[str, int],
+    observed_ndcs: set[str],
+) -> None:
+    """Update the earliest included quarter for every NDC in one raw chunk."""
+    chunk["NDC"] = clean_string(chunk["NDC"])
+    if chunk["NDC"].isna().any():
+        raise ValueError("Raw formulary data contain missing NDC values.")
+    observed_ndcs.update(chunk["NDC"].astype(str).unique().tolist())
+
+    included = pd.to_numeric(chunk["included"], errors="coerce")
+    invalid = included.isna() | ~included.isin([0, 1])
+    if invalid.any():
+        examples = chunk.loc[invalid, ["included"]].drop_duplicates().head(10)
+        raise ValueError(f"Raw formulary data contain invalid included values. Examples:\n{examples}")
+
+    actual = chunk.loc[included.eq(1), ["YEAR_Q", "NDC"]].copy()
+    if actual.empty:
+        return
+    actual = parse_year_quarter(actual, RAW_FORMULARY_PATH.name)
+    actual["qtime"] = actual["year"].astype("int32") * 4 + actual["quarter"].astype("int32")
+    chunk_minimums = actual.groupby("NDC")["qtime"].min()
+    for ndc, qtime in chunk_minimums.items():
+        key = str(ndc)
+        first_seen_qtime[key] = min(first_seen_qtime.get(key, int(qtime)), int(qtime))
+
+
+def first_seen_frame(first_seen_qtime: dict[str, int]) -> pd.DataFrame:
+    """Return a readable, chronologically encoded NDC first-seen table."""
+    result = pd.DataFrame(
+        sorted(first_seen_qtime.items()),
+        columns=["NDC", "first_seen_qtime"],
+    )
+    result["first_seen_year"] = ((result["first_seen_qtime"] - 1) // 4).astype("int16")
+    result["first_seen_quarter"] = (
+        result["first_seen_qtime"] - result["first_seen_year"].astype("int32") * 4
+    ).astype("int8")
+    result["first_seen_YEAR_Q"] = (
+        result["first_seen_year"].astype("string")
+        + " Q"
+        + result["first_seen_quarter"].astype("string")
+    )
+    return result[
+        ["NDC", "first_seen_YEAR_Q", "first_seen_year", "first_seen_quarter", "first_seen_qtime"]
+    ]
+
+
+def save_first_seen_lookup(first_seen_qtime: dict[str, int]) -> None:
+    """Save the compact NDC first-seen lookup without overwriting prior output."""
+    if FIRST_SEEN_PATH.exists():
+        raise FileExistsError(
+            f"Refusing to overwrite existing first-seen lookup: {FIRST_SEEN_PATH}"
+        )
+    FIRST_SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    first_seen_frame(first_seen_qtime).to_csv(FIRST_SEEN_PATH, index=False)
+
+
 def create_staging_blocks(
     block_lookup: dict[str, int],
     n_blocks: int,
     chunksize: int,
     stage_dir: Path,
-) -> dict[int, Path]:
-    """Route the raw CSV to complete-formulary staging files in one full pass."""
+) -> tuple[dict[int, Path], dict[str, int]]:
+    """Route raw rows to staging files and collect NDC first-seen quarters."""
     stage_dir.mkdir(parents=True, exist_ok=True)
     paths = stage_paths(stage_dir, n_blocks)
     existing = [path for path in paths.values() if path.exists()]
@@ -435,6 +499,8 @@ def create_staging_blocks(
         )
 
     headers_written = {block: False for block in paths}
+    first_seen_qtime: dict[str, int] = {}
+    observed_ndcs: set[str] = set()
     reader = pd.read_csv(RAW_FORMULARY_PATH, dtype="string", chunksize=chunksize)
     with ExitStack() as stack:
         handles = {
@@ -442,6 +508,7 @@ def create_staging_blocks(
             for block, path in paths.items()
         }
         for chunk in tqdm(reader, desc="Pass 2/2: routing formulary chunks", unit="chunk"):
+            update_first_seen_lookup(chunk, first_seen_qtime, observed_ndcs)
             chunk["FORMULARY_ID"] = clean_string(chunk["FORMULARY_ID"])
             block_id = chunk["FORMULARY_ID"].map(block_lookup)
             if block_id.isna().any():
@@ -464,7 +531,15 @@ def create_staging_blocks(
     missing_blocks = [block for block, wrote_header in headers_written.items() if not wrote_header]
     if missing_blocks:
         raise RuntimeError(f"No raw rows were routed to blocks: {missing_blocks}")
-    return paths
+    missing_first_seen = sorted(observed_ndcs - set(first_seen_qtime))
+    if missing_first_seen:
+        raise ValueError(
+            "Some expanded NDCs never have included=1, so first-seen timing is undefined. "
+            f"Examples: {missing_first_seen[:10]}"
+        )
+    if not first_seen_qtime:
+        raise ValueError("No included NDC rows were found while building the first-seen lookup.")
+    return paths, first_seen_qtime
 
 
 # ========================== PANEL CONSTRUCTION ==========================
@@ -544,11 +619,36 @@ def explode_atc_codes(data: pd.DataFrame, value_column: str, id_columns: list[st
     return work.dropna(subset=["atc_code"]).drop_duplicates().reset_index(drop=True)
 
 
-def partner_atc_codes(data: pd.DataFrame, partner_scope: pd.DataFrame, atc_column: str) -> pd.DataFrame:
-    """Return atomic year-partner-ATC codes needed by every sharing comparison."""
+def available_by_event_q1(data: pd.DataFrame) -> pd.Series:
+    """Return whether each NDC had appeared by the Q1 anchor of its row year."""
+    event_qtime = data["year"].astype("int32") * 4 + 1
+    return data[FIRST_SEEN_QTIME_COLUMN].le(event_qtime)
+
+
+def available_by_event_year_end(data: pd.DataFrame) -> pd.Series:
+    """Return whether each NDC had appeared by the end of its row year."""
+    event_year_end_qtime = data["year"].astype("int32") * 4 + 4
+    return data[FIRST_SEEN_QTIME_COLUMN].le(event_year_end_qtime)
+
+
+def partner_atc_codes(
+    data: pd.DataFrame,
+    partner_scope: pd.DataFrame,
+    atc_column: str,
+    partner_available_mask: pd.Series,
+) -> pd.DataFrame:
+    """Return available atomic year-partner-ATC codes for sharing comparisons."""
     if partner_scope.empty:
         return pd.DataFrame(columns=["year", "BoardNamePair", "atc_code"])
-    scoped = data.merge(partner_scope, on=["year", "BoardName"], how="inner", validate="many_to_one")
+    scoped = data.loc[
+        partner_available_mask,
+        ["year", "BoardName", atc_column],
+    ].merge(
+        partner_scope,
+        on=["year", "BoardName"],
+        how="inner",
+        validate="many_to_one",
+    )
     atoms = explode_atc_codes(scoped, atc_column, ["year", "BoardName"])
     return atoms.rename(columns={"BoardName": "BoardNamePair"}).drop_duplicates()
 
@@ -567,10 +667,17 @@ def add_sharing_flags(
     partner_scope = all_pairs[["year", "BoardNamePair"]].drop_duplicates().rename(
         columns={"BoardNamePair": "BoardName"}
     )
+    treated_available_mask = available_by_event_q1(data)
+    partner_available_mask = available_by_event_year_end(data)
 
     for atc_level in atc_levels:
         atc_column = f"ATC{atc_level}"
-        partners = partner_atc_codes(data, partner_scope, atc_column)
+        partners = partner_atc_codes(
+            data,
+            partner_scope,
+            atc_column,
+            partner_available_mask,
+        )
         if progress is not None:
             progress.set_postfix_str(f"ATC{atc_level}: preparing partner products")
             progress.update(1)
@@ -581,7 +688,7 @@ def add_sharing_flags(
                 data[share_col] = np.int8(0)
                 pairs = candidate_pairs[event_col]
                 event_rows = data.loc[
-                    data[event_col].eq(1),
+                    data[event_col].eq(1) & treated_available_mask,
                     ["_row_id", "year", "BoardName", atc_column],
                 ]
                 if not event_rows.empty and not pairs.empty and not partners.empty:
@@ -645,6 +752,7 @@ def process_block(
     balance_window: tuple[int, int],
     atc_levels: tuple[int, ...],
     candidate_pairs: dict[str, pd.DataFrame],
+    first_seen_qtime: dict[str, int],
 ) -> None:
     """Build and save one complete-formulary block, then leave no large object in memory."""
     n_event_columns = len(event_types) * len(treatment_groups)
@@ -661,6 +769,13 @@ def process_block(
         if data[["FORMULARY_ID", "BoardName", "NDC"]].isna().any().any():
             raise ValueError(f"{stage_path.name} contains missing FORMULARY_ID, BoardName, or NDC values.")
         data = parse_year_quarter(data, stage_path.name)
+        data[FIRST_SEEN_QTIME_COLUMN] = data["NDC"].map(first_seen_qtime)
+        if data[FIRST_SEEN_QTIME_COLUMN].isna().any():
+            examples = data.loc[
+                data[FIRST_SEEN_QTIME_COLUMN].isna(), ["NDC"]
+            ].drop_duplicates().head(10)
+            raise KeyError(f"NDC values are missing from the first-seen lookup. Examples:\n{examples}")
+        data[FIRST_SEEN_QTIME_COLUMN] = data[FIRST_SEEN_QTIME_COLUMN].astype("int32")
         progress.update(1)
 
         progress.set_postfix_str("merging event indicators")
@@ -685,6 +800,7 @@ def process_block(
             candidate_pairs,
             progress,
         )
+        data.drop(columns=FIRST_SEEN_QTIME_COLUMN, inplace=True)
 
         progress.set_postfix_str("constructing tierA")
         data = add_tier_a(data)
@@ -735,7 +851,8 @@ def main() -> None:
     )
     block_lookup = build_formulary_blocks(n_blocks, chunksize)
     stage_dir = staging_directory(personnel_definition, req)
-    paths = create_staging_blocks(block_lookup, n_blocks, chunksize, stage_dir)
+    paths, first_seen_qtime = create_staging_blocks(block_lookup, n_blocks, chunksize, stage_dir)
+    save_first_seen_lookup(first_seen_qtime)
 
     OUTPUT_BASE_PATH.mkdir(parents=True, exist_ok=True)
     for block_number in tqdm(range(1, n_blocks + 1), desc="Processing formulary blocks", unit="block"):
@@ -756,6 +873,7 @@ def main() -> None:
             balance_window=balance_window,
             atc_levels=atc_levels,
             candidate_pairs=candidate_pairs,
+            first_seen_qtime=first_seen_qtime,
         )
         stage_path.unlink()
         gc.collect()
@@ -765,6 +883,7 @@ def main() -> None:
     except OSError:
         pass
     print(f"Saved {n_blocks} formulary panel blocks to: {OUTPUT_BASE_PATH}")
+    print(f"Saved NDC first-seen lookup to: {FIRST_SEEN_PATH}")
 
 
 if __name__ == "__main__":

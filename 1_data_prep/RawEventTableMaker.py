@@ -69,7 +69,7 @@ RUN_CONFIG = {
     "requirement2_window": (-1, 1),
     "large_sample": 1,
     "formulary": 1,
-    "personnel_definition": "medium",
+    "personnel_definition": "narrow",
 }
 # ===============================================================
 
@@ -156,7 +156,8 @@ class MovementEventBuilder:
         memberships = memberships.drop_duplicates(subset=["DirectorID", "year", "BoardName"])
 
         # 2) Collapse each director-year to a sorted board list, then complete
-        #    each director's timeline from min_year - 1 through max_year + 1.
+        #    each timeline from min_year - 1 through one year after its
+        #    max_year, capped at the sample's final observed year.
         board_lists = (
             memberships.groupby(["DirectorID", "year"], as_index=False)
             .agg(board_list=("BoardName", lambda values: sorted(pd.unique(values.dropna()).tolist())))
@@ -166,6 +167,7 @@ class MovementEventBuilder:
         if board_lists.empty:
             complete_history = pd.DataFrame(columns=["DirectorID", "year", "board_list"])
         else:
+            sample_max_year = int(board_lists["year"].max())
             year_bounds = board_lists.groupby("DirectorID", as_index=False)["year"].agg(
                 min_year="min",
                 max_year="max",
@@ -175,7 +177,10 @@ class MovementEventBuilder:
                     pd.DataFrame(
                         {
                             "DirectorID": director_id,
-                            "year": range(int(min_year) - 1, int(max_year) + 2),
+                            "year": range(
+                                int(min_year) - 1,
+                                min(int(max_year) + 1, sample_max_year) + 1,
+                            ),
                         }
                     )
                     for director_id, min_year, max_year in year_bounds.itertuples(index=False, name=None)

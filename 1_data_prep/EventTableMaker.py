@@ -65,7 +65,7 @@ INTERLOCK_REQUIRED_COLUMNS = {
 RUN_CONFIG = {
     "large_sample": 1,
     "formulary": 1,
-    "personnel_definition": "medium",
+    "personnel_definition": "narrow",
 }
 
 
