@@ -78,8 +78,12 @@ STAY_COLUMN_PATTERN = re.compile(r"^stay_\d+_years$")
 # - A cohort c uses every available quarter in years c-window_pre through
 #   c+window_post.  The only intentionally absent period is 2025Q4.
 #
-# overwrite_*:
-# - Keep at 0 to prevent mixing stale and newly generated panels.
+# formulary_time_shift_quarters:
+# - Must match FormularyPanelMaker.py and ReorganizeFormularyData.py.
+#
+# first_seen_year_offset/first_seen_quarter:
+# - Controls the NDC first-seen cutoff relative to the cohort year.  The
+#   default (0, 1) keeps NDCs first included by cohort-year Q1.
 RUN_CONFIG = {
     "chunksize": 500_000,
     "window_pre": 1,
@@ -87,8 +91,9 @@ RUN_CONFIG = {
     "req": 1,
     "include_eventpair": 0,
     "atc_level": 3,
-    "overwrite_drug_quarter_outputs": 0,
-    "overwrite_cohort_outputs": 0,
+    "formulary_time_shift_quarters": 1,
+    "first_seen_year_offset": -1,
+    "first_seen_quarter": 1,
 }
 # ===============================================================
 
@@ -170,7 +175,46 @@ def normalize_string(values: pd.Series, uppercase: bool = False) -> pd.Series:
     return result
 
 
-def validate_config(config: dict) -> tuple[int, int, int, bool, bool]:
+def shift_label(shift_quarters: int) -> str:
+    """Return the folder/file label for a formulary quarter shift."""
+    return f"shift_q{shift_quarters:+d}".replace("+", "")
+
+
+def first_seen_spec_label(year_offset: int, quarter: int) -> str:
+    """Return the folder label for one NDC first-seen cutoff."""
+    return f"seen_y{year_offset:+d}_q{quarter}"
+
+
+def sample_spec_label(shift_quarters: int, year_offset: int, quarter: int) -> str:
+    """Return the non-baseline sample folder label."""
+    return f"{shift_label(shift_quarters)}_{first_seen_spec_label(year_offset, quarter)}"
+
+
+def quarter_input_dir(shift_quarters: int) -> Path:
+    """Return the quarter-organized formulary input directory."""
+    return QUARTER_INPUT_DIR if shift_quarters == 0 else QUARTER_INPUT_DIR / shift_label(shift_quarters)
+
+
+def drug_quarter_output_dir(shift_quarters: int) -> Path:
+    """Return the slim drug-quarter output directory."""
+    return DRUG_QUARTER_OUTPUT_DIR if shift_quarters == 0 else DRUG_QUARTER_OUTPUT_DIR / shift_label(shift_quarters)
+
+
+def first_seen_path(shift_quarters: int) -> Path:
+    """Return the NDC first-seen lookup path for one timing specification."""
+    if shift_quarters == 0:
+        return FIRST_SEEN_PATH
+    return FIRST_SEEN_PATH.with_name(f"{FIRST_SEEN_PATH.stem}_{shift_label(shift_quarters)}.csv")
+
+
+def cohort_output_dir(shift_quarters: int, year_offset: int, quarter: int) -> Path:
+    """Return the cohort output directory, preserving the baseline path."""
+    if shift_quarters == 0 and year_offset == 0 and quarter == 1:
+        return COHORT_OUTPUT_DIR
+    return COHORT_OUTPUT_DIR / sample_spec_label(shift_quarters, year_offset, quarter)
+
+
+def validate_config(config: dict) -> tuple[int, int, int, int, int, int]:
     """Validate the fixed req1, Not-control formulary cohort specification."""
     chunksize = int(config["chunksize"])
     window_pre = int(config["window_pre"])
@@ -178,8 +222,9 @@ def validate_config(config: dict) -> tuple[int, int, int, bool, bool]:
     req = int(config["req"])
     include_eventpair = int(config["include_eventpair"])
     atc_level = int(config["atc_level"])
-    overwrite_drug = int(config["overwrite_drug_quarter_outputs"])
-    overwrite_cohort = int(config["overwrite_cohort_outputs"])
+    time_shift = int(config["formulary_time_shift_quarters"])
+    first_seen_year_offset = int(config["first_seen_year_offset"])
+    first_seen_quarter = int(config["first_seen_quarter"])
 
     if chunksize < 1:
         raise ValueError("chunksize must be at least 1.")
@@ -191,14 +236,15 @@ def validate_config(config: dict) -> tuple[int, int, int, bool, bool]:
         raise ValueError("This formulary design is fixed at include_eventpair=0.")
     if atc_level != 3:
         raise ValueError("This formulary design is fixed at ATC3 sharing.")
-    if overwrite_drug not in {0, 1} or overwrite_cohort not in {0, 1}:
-        raise ValueError("overwrite options must be 0 or 1.")
+    if first_seen_quarter not in {1, 2, 3, 4}:
+        raise ValueError("first_seen_quarter must be 1, 2, 3, or 4.")
     return (
         chunksize,
         window_pre,
         window_post,
-        bool(overwrite_drug),
-        bool(overwrite_cohort),
+        time_shift,
+        first_seen_year_offset,
+        first_seen_quarter,
     )
 
 
@@ -218,16 +264,21 @@ def parse_quarter_filename(path: Path) -> tuple[str, int, int]:
     return tag, year, quarter
 
 
-def available_quarter_paths() -> dict[str, Path]:
+def quarter_sort_key(tag: str) -> tuple[int, int]:
+    """Return chronological sort key for a compact YYYYQX tag."""
+    return int(tag[:4]), int(tag[-1])
+
+
+def available_quarter_paths(source_dir: Path) -> dict[str, Path]:
     """Inventory the quarter-organized full formulary files."""
     paths: dict[str, Path] = {}
-    for path in QUARTER_INPUT_DIR.glob("formulary_panel_????Q?.csv"):
+    for path in source_dir.glob("formulary_panel_????Q?.csv"):
         tag, _year, _quarter = parse_quarter_filename(path)
         if tag in paths:
             raise ValueError(f"Duplicate quarter input for {tag}: {paths[tag]} and {path}")
         paths[tag] = path
     if not paths:
-        raise FileNotFoundError(f"No quarter-organized panels found in {QUARTER_INPUT_DIR}")
+        raise FileNotFoundError(f"No quarter-organized panels found in {source_dir}")
     return paths
 
 
@@ -245,41 +296,40 @@ def required_quarters(
     window_pre: int,
     window_post: int,
 ) -> tuple[list[str], dict[int, list[str]]]:
-    """Validate all cohort windows while allowing only the known missing 2025Q4."""
+    """Validate cohort windows while allowing missing quarters only at data edges."""
     windows: dict[int, list[str]] = {}
     all_required: set[str] = set()
+    available_keys = {tag: quarter_sort_key(tag) for tag in available}
+    min_available = min(available_keys.values())
+    max_available = max(available_keys.values())
     for cohort_year in sorted(set().union(*COHORT_YEARS.values())):
         nominal = expected_cohort_quarters(cohort_year, window_pre, window_post)
         missing = [tag for tag in nominal if tag not in available]
-        unexpected_missing = [tag for tag in missing if tag != "2025Q4"]
+        unexpected_missing = [
+            tag
+            for tag in missing
+            if min_available <= quarter_sort_key(tag) <= max_available
+        ]
         if unexpected_missing:
             raise FileNotFoundError(
                 f"Cohort {cohort_year} is missing required quarter files: {unexpected_missing}"
             )
         actual = [tag for tag in nominal if tag in available]
-        if cohort_year == 2024 and len(actual) != 11:
+        expected_count = len(nominal) - len(missing)
+        if len(actual) != expected_count:
             raise ValueError(
-                f"The 2024 cohort must contain 11 available quarters through 2025Q3; found {len(actual)}."
-            )
-        if cohort_year != 2024 and len(actual) != 12:
-            raise ValueError(
-                f"Cohort {cohort_year} must contain 12 quarters; found {len(actual)}."
+                f"Cohort {cohort_year} must contain {expected_count} available quarters; found {len(actual)}."
             )
         windows[cohort_year] = actual
         all_required.update(actual)
-    return sorted(all_required, key=lambda tag: (int(tag[:4]), int(tag[-1]))), windows
+    return sorted(all_required, key=quarter_sort_key), windows
 
 
 def prepare_output_path(path: Path, overwrite: bool) -> None:
-    """Create a parent directory and enforce the configured overwrite policy."""
+    """Create a parent directory and replace prior output."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        return
-    if not overwrite:
-        raise FileExistsError(
-            f"Refusing to overwrite existing output: {path}. Move/delete it or enable overwrite."
-        )
-    path.unlink()
+    if path.exists():
+        path.unlink()
 
 
 # ========================== DRUG-QUARTER AGGREGATION ==========================
@@ -471,37 +521,37 @@ def aggregate_one_quarter(
 def build_drug_quarter_panels(
     quarter_tags: list[str],
     sources: dict[str, Path],
+    destination_dir: Path,
     chunksize: int,
-    overwrite: bool,
 ) -> dict[str, Path]:
     """Build every required slim drug-quarter file once."""
     outputs = {
-        tag: DRUG_QUARTER_OUTPUT_DIR / f"formulary_drug_panel_{tag}.csv"
+        tag: destination_dir / f"formulary_drug_panel_{tag}.csv"
         for tag in quarter_tags
     }
     progress = tqdm(quarter_tags, desc="Building drug-quarter panels", unit="quarter")
     for tag in progress:
         progress.set_postfix_str(tag)
-        aggregate_one_quarter(sources[tag], outputs[tag], chunksize, overwrite)
+        aggregate_one_quarter(sources[tag], outputs[tag], chunksize, overwrite=True)
     return outputs
 
 
 # ========================== EVENT SOURCE TABLES ==========================
 
 
-def load_first_seen_lookup() -> dict[str, int]:
+def load_first_seen_lookup(path: Path) -> dict[str, int]:
     """Load the earliest included quarter for every expanded NDC."""
-    if not FIRST_SEEN_PATH.exists():
-        raise FileNotFoundError(f"NDC first-seen lookup not found: {FIRST_SEEN_PATH}")
-    first_seen = pd.read_csv(FIRST_SEEN_PATH, dtype={"NDC": "string"})
+    if not path.exists():
+        raise FileNotFoundError(f"NDC first-seen lookup not found: {path}")
+    first_seen = pd.read_csv(path, dtype={"NDC": "string"})
     required = {"NDC", "first_seen_qtime"}
     missing = sorted(required - set(first_seen.columns))
     if missing:
-        raise KeyError(f"{FIRST_SEEN_PATH.name} is missing columns: {missing}")
+        raise KeyError(f"{path.name} is missing columns: {missing}")
 
     first_seen["NDC"] = normalize_string(first_seen["NDC"])
     if first_seen["NDC"].isna().any() or first_seen["NDC"].duplicated().any():
-        raise ValueError(f"{FIRST_SEEN_PATH.name} must contain one nonmissing row per NDC.")
+        raise ValueError(f"{path.name} must contain one nonmissing row per NDC.")
     first_seen["first_seen_qtime"] = pd.to_numeric(
         first_seen["first_seen_qtime"], errors="raise"
     ).astype("int32")
@@ -634,13 +684,16 @@ def keep_available_ndcs(
     cohort: pd.DataFrame,
     first_seen_qtime: dict[str, int],
     cohort_year: int,
+    first_seen_year_offset: int,
+    first_seen_quarter: int,
 ) -> pd.DataFrame:
-    """Keep NDCs first included by the cohort year's Q1 entry quarter."""
+    """Keep NDCs first included by the configured cohort-relative cutoff."""
     first_seen = cohort["ndc"].map(first_seen_qtime)
     if first_seen.isna().any():
         examples = cohort.loc[first_seen.isna(), "ndc"].drop_duplicates().head(10).tolist()
         raise KeyError(f"Cohort NDCs are missing from the first-seen lookup: {examples}")
-    return cohort.loc[first_seen.le(cohort_year * 4 + 1)].copy()
+    cutoff_qtime = (cohort_year + first_seen_year_offset) * 4 + first_seen_quarter
+    return cohort.loc[first_seen.le(cutoff_qtime)].copy()
 
 
 def validate_panel_treatment_flags(
@@ -758,6 +811,8 @@ def build_one_cohort(
     drug_quarter_paths: dict[str, Path],
     quarter_tags: list[str],
     first_seen_qtime: dict[str, int],
+    first_seen_year_offset: int,
+    first_seen_quarter: int,
     movement: pd.DataFrame,
     candidate: pd.DataFrame,
     stay_column: str,
@@ -767,7 +822,13 @@ def build_one_cohort(
     """Build one combined-direction, balanced drug-firm cohort."""
     cohort = read_cohort_window(drug_quarter_paths, quarter_tags)
     cohort = keep_complete_drug_ids(cohort, expected_quarters=len(quarter_tags))
-    cohort = keep_available_ndcs(cohort, first_seen_qtime, cohort_year)
+    cohort = keep_available_ndcs(
+        cohort,
+        first_seen_qtime,
+        cohort_year,
+        first_seen_year_offset,
+        first_seen_quarter,
+    )
     cohort["data_cohort"] = np.int16(cohort_year)
     cohort = add_direction_flags(
         cohort,
@@ -789,10 +850,12 @@ def build_cohort_outputs(
     drug_quarter_paths: dict[str, Path],
     cohort_windows: dict[int, list[str]],
     first_seen_qtime: dict[str, int],
+    first_seen_year_offset: int,
+    first_seen_quarter: int,
     movement: pd.DataFrame,
     candidate: pd.DataFrame,
     stay_column: str,
-    overwrite: bool,
+    destination_dir: Path,
 ) -> None:
     """Write the configured event-year cohorts with visible progress."""
     specifications = [
@@ -803,12 +866,14 @@ def build_cohort_outputs(
     progress = tqdm(specifications, desc="Building formulary cohorts", unit="cohort")
     for event_type, cohort_year in progress:
         progress.set_postfix_str(f"{event_type}/{cohort_year}")
-        output_path = COHORT_OUTPUT_DIR / f"{event_type}_quarter_cohort_{cohort_year}.csv"
-        prepare_output_path(output_path, overwrite)
+        output_path = destination_dir / f"{event_type}_quarter_cohort_{cohort_year}.csv"
+        prepare_output_path(output_path, overwrite=True)
         cohort = build_one_cohort(
             drug_quarter_paths,
             cohort_windows[cohort_year],
             first_seen_qtime,
+            first_seen_year_offset,
+            first_seen_quarter,
             movement,
             candidate,
             stay_column,
@@ -830,34 +895,44 @@ def main() -> None:
         chunksize,
         window_pre,
         window_post,
-        overwrite_drug,
-        overwrite_cohort,
+        time_shift,
+        first_seen_year_offset,
+        first_seen_quarter,
     ) = validate_config(RUN_CONFIG)
-    sources = available_quarter_paths()
+    source_dir = quarter_input_dir(time_shift)
+    drug_output_dir = drug_quarter_output_dir(time_shift)
+    cohort_destination_dir = cohort_output_dir(
+        time_shift,
+        first_seen_year_offset,
+        first_seen_quarter,
+    )
+    sources = available_quarter_paths(source_dir)
     quarter_tags, cohort_windows = required_quarters(
         sources,
         window_pre,
         window_post,
     )
-    first_seen_qtime = load_first_seen_lookup()
+    first_seen_qtime = load_first_seen_lookup(first_seen_path(time_shift))
     movement, candidate, stay_column = load_event_sources()
     drug_quarter_paths = build_drug_quarter_panels(
         quarter_tags,
         sources,
+        drug_output_dir,
         chunksize,
-        overwrite_drug,
     )
     build_cohort_outputs(
         drug_quarter_paths,
         cohort_windows,
         first_seen_qtime,
+        first_seen_year_offset,
+        first_seen_quarter,
         movement,
         candidate,
         stay_column,
-        overwrite_cohort,
+        cohort_destination_dir,
     )
-    print(f"Saved drug-quarter panels to: {DRUG_QUARTER_OUTPUT_DIR}")
-    print(f"Saved combined-direction cohorts to: {COHORT_OUTPUT_DIR}")
+    print(f"Saved drug-quarter panels to: {drug_output_dir}")
+    print(f"Saved combined-direction cohorts to: {cohort_destination_dir}")
 
 
 if __name__ == "__main__":

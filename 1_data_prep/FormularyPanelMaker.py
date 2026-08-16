@@ -11,8 +11,8 @@ Process:
    During that routing pass, record each NDC's first quarter with included=1.
 2. Process one complete formulary block at a time: add annual event flags in
    Q1, event-specific balanced-window flags, tierA, and ATC sharing outcomes.
-   ATC sharing requires the treated NDC to have appeared by the event year's
-   Q1 and a matching counterpart NDC to have appeared by that year's end.
+   ATC sharing evaluates every treated-Board NDC in the event Q1 rows against
+   matching counterpart NDCs that have appeared by that year's end.
 3. Write one final CSV per block and immediately delete its staging file so
    the full raw panel and all configured blocks are never held in memory
    together.
@@ -96,6 +96,10 @@ FIRST_SEEN_QTIME_COLUMN = "_first_seen_qtime"
 # n_formulary_blocks/chunksize:
 # - The raw file is routed into n_formulary_blocks complete-formulary staging
 #   files.  chunksize controls only CSV streaming memory, not output grouping.
+#
+# formulary_time_shift_quarters:
+# - Shift raw formulary quarters before event flags are merged.  The default
+#   0 preserves the current timing; 1 maps 2019Q4 formulary values to 2020Q1.
 RUN_CONFIG = {
     "event_types": [
         "to_B_not_in_A",
@@ -110,6 +114,7 @@ RUN_CONFIG = {
     "personnel_definition": "narrow",
     "atc": [1, 2, 3, 4],
     "req": 1,
+    "formulary_time_shift_quarters": 1,
     "n_formulary_blocks": 30,
     "chunksize": 500_000,
 }
@@ -145,6 +150,26 @@ def parse_year_quarter(data: pd.DataFrame, source_name: str) -> pd.DataFrame:
     return data
 
 
+def apply_quarter_shift(data: pd.DataFrame, shift_quarters: int, source_name: str) -> pd.DataFrame:
+    """Shift YEAR_Q labels by a fixed number of quarters in place."""
+    if shift_quarters == 0:
+        return data
+    data = parse_year_quarter(data, source_name)
+    qtime = data["year"].astype("int32") * 4 + data["quarter"].astype("int32") + shift_quarters
+    if qtime.le(0).any():
+        examples = data.loc[qtime.le(0), ["YEAR_Q"]].drop_duplicates().head(10)
+        raise ValueError(
+            f"{source_name}.YEAR_Q cannot be shifted by {shift_quarters} quarters. "
+            f"Examples:\n{examples}"
+        )
+    shifted_year = ((qtime - 1) // 4).astype("int16")
+    shifted_quarter = (qtime - shifted_year.astype("int32") * 4).astype("int8")
+    data["year"] = shifted_year
+    data["quarter"] = shifted_quarter
+    data["YEAR_Q"] = shifted_year.astype("string") + " Q" + shifted_quarter.astype("string")
+    return data
+
+
 def event_column(event_type: str, treatment_group: str) -> str:
     """Return the combined-panel event column name for one event direction."""
     return f"event_{event_type}_{treatment_group}"
@@ -169,8 +194,25 @@ def movement_suffix(large_sample: int, personnel_definition: str) -> str:
     return f"_formulary_large_sample_{personnel_definition}"
 
 
+def shift_label(shift_quarters: int) -> str:
+    """Return the folder/file label for a formulary quarter shift."""
+    return f"shift_q{shift_quarters:+d}".replace("+", "")
+
+
+def output_base_path(shift_quarters: int) -> Path:
+    """Return the panel output directory for one timing specification."""
+    return OUTPUT_BASE_PATH if shift_quarters == 0 else OUTPUT_BASE_PATH / shift_label(shift_quarters)
+
+
+def first_seen_path(shift_quarters: int) -> Path:
+    """Return the NDC first-seen path for one timing specification."""
+    if shift_quarters == 0:
+        return FIRST_SEEN_PATH
+    return FIRST_SEEN_PATH.with_name(f"{FIRST_SEEN_PATH.stem}_{shift_label(shift_quarters)}.csv")
+
+
 def validate_config(config: dict[str, object]) -> tuple[
-    list[str], list[str], int, tuple[int, int], int, str, tuple[int, ...], int, int
+    list[str], list[str], int, tuple[int, int], int, str, tuple[int, ...], int, int, int
 ]:
     """Validate RUN_CONFIG and return normalized values used by the builder."""
     event_types = [str(value) for value in ensure_list(config["event_types"])]
@@ -198,6 +240,8 @@ def validate_config(config: dict[str, object]) -> tuple[
     if req not in {0, 1, 2}:
         raise ValueError("req must be 0, 1, or 2.")
 
+    time_shift = int(config["formulary_time_shift_quarters"])
+
     n_blocks = int(config["n_formulary_blocks"])
     if n_blocks < 1:
         raise ValueError("n_formulary_blocks must be at least 1.")
@@ -221,6 +265,7 @@ def validate_config(config: dict[str, object]) -> tuple[
         personnel_definition,
         atc_levels,
         req,
+        time_shift,
         n_blocks,
     )
 
@@ -414,9 +459,12 @@ def build_formulary_blocks(n_blocks: int, chunksize: int) -> dict[str, int]:
     return block_lookup
 
 
-def staging_directory(personnel_definition: str, req: int) -> Path:
+def staging_directory(personnel_definition: str, req: int, shift_quarters: int) -> Path:
     """Return a run-specific disk staging directory beside the large raw input."""
-    return STAGING_BASE_PATH / f"{personnel_definition}_req{req}"
+    suffix = f"{personnel_definition}_req{req}"
+    if shift_quarters != 0:
+        suffix = f"{suffix}_{shift_label(shift_quarters)}"
+    return STAGING_BASE_PATH / suffix
 
 
 def stage_paths(stage_dir: Path, n_blocks: int) -> dict[int, Path]:
@@ -472,14 +520,12 @@ def first_seen_frame(first_seen_qtime: dict[str, int]) -> pd.DataFrame:
     ]
 
 
-def save_first_seen_lookup(first_seen_qtime: dict[str, int]) -> None:
-    """Save the compact NDC first-seen lookup without overwriting prior output."""
-    if FIRST_SEEN_PATH.exists():
-        raise FileExistsError(
-            f"Refusing to overwrite existing first-seen lookup: {FIRST_SEEN_PATH}"
-        )
-    FIRST_SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    first_seen_frame(first_seen_qtime).to_csv(FIRST_SEEN_PATH, index=False)
+def save_first_seen_lookup(first_seen_qtime: dict[str, int], output_path: Path) -> None:
+    """Save the compact NDC first-seen lookup, replacing prior output."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
+    first_seen_frame(first_seen_qtime).to_csv(output_path, index=False)
 
 
 def create_staging_blocks(
@@ -487,16 +533,14 @@ def create_staging_blocks(
     n_blocks: int,
     chunksize: int,
     stage_dir: Path,
+    shift_quarters: int,
 ) -> tuple[dict[int, Path], dict[str, int]]:
     """Route raw rows to staging files and collect NDC first-seen quarters."""
     stage_dir.mkdir(parents=True, exist_ok=True)
     paths = stage_paths(stage_dir, n_blocks)
-    existing = [path for path in paths.values() if path.exists()]
-    if existing:
-        raise FileExistsError(
-            f"Staging files already exist in {stage_dir}. Remove or move them before rerunning: "
-            f"{existing[:3]}"
-        )
+    for path in paths.values():
+        if path.exists():
+            path.unlink()
 
     headers_written = {block: False for block in paths}
     first_seen_qtime: dict[str, int] = {}
@@ -508,6 +552,7 @@ def create_staging_blocks(
             for block, path in paths.items()
         }
         for chunk in tqdm(reader, desc="Pass 2/2: routing formulary chunks", unit="chunk"):
+            chunk = apply_quarter_shift(chunk, shift_quarters, RAW_FORMULARY_PATH.name)
             update_first_seen_lookup(chunk, first_seen_qtime, observed_ndcs)
             chunk["FORMULARY_ID"] = clean_string(chunk["FORMULARY_ID"])
             block_id = chunk["FORMULARY_ID"].map(block_lookup)
@@ -619,12 +664,6 @@ def explode_atc_codes(data: pd.DataFrame, value_column: str, id_columns: list[st
     return work.dropna(subset=["atc_code"]).drop_duplicates().reset_index(drop=True)
 
 
-def available_by_event_q1(data: pd.DataFrame) -> pd.Series:
-    """Return whether each NDC had appeared by the Q1 anchor of its row year."""
-    event_qtime = data["year"].astype("int32") * 4 + 1
-    return data[FIRST_SEEN_QTIME_COLUMN].le(event_qtime)
-
-
 def available_by_event_year_end(data: pd.DataFrame) -> pd.Series:
     """Return whether each NDC had appeared by the end of its row year."""
     event_year_end_qtime = data["year"].astype("int32") * 4 + 4
@@ -667,7 +706,6 @@ def add_sharing_flags(
     partner_scope = all_pairs[["year", "BoardNamePair"]].drop_duplicates().rename(
         columns={"BoardNamePair": "BoardName"}
     )
-    treated_available_mask = available_by_event_q1(data)
     partner_available_mask = available_by_event_year_end(data)
 
     for atc_level in atc_levels:
@@ -688,7 +726,7 @@ def add_sharing_flags(
                 data[share_col] = np.int8(0)
                 pairs = candidate_pairs[event_col]
                 event_rows = data.loc[
-                    data[event_col].eq(1) & treated_available_mask,
+                    data[event_col].eq(1),
                     ["_row_id", "year", "BoardName", atc_column],
                 ]
                 if not event_rows.empty and not pairs.empty and not partners.empty:
@@ -828,6 +866,7 @@ def main() -> None:
         personnel_definition,
         atc_levels,
         req,
+        time_shift,
         n_blocks,
     ) = validate_config(RUN_CONFIG)
     chunksize = int(RUN_CONFIG["chunksize"])
@@ -846,22 +885,28 @@ def main() -> None:
 
     print(
         "Building formulary panels: "
-        f"definition={personnel_definition}, req{req}, blocks={n_blocks}, "
+        f"definition={personnel_definition}, req{req}, {shift_label(time_shift)}, blocks={n_blocks}, "
         f"balance_window=t{balance_window[0]:+d}..t{balance_window[1]:+d}"
     )
     block_lookup = build_formulary_blocks(n_blocks, chunksize)
-    stage_dir = staging_directory(personnel_definition, req)
-    paths, first_seen_qtime = create_staging_blocks(block_lookup, n_blocks, chunksize, stage_dir)
-    save_first_seen_lookup(first_seen_qtime)
+    stage_dir = staging_directory(personnel_definition, req, time_shift)
+    paths, first_seen_qtime = create_staging_blocks(
+        block_lookup,
+        n_blocks,
+        chunksize,
+        stage_dir,
+        time_shift,
+    )
+    first_seen_output_path = first_seen_path(time_shift)
+    save_first_seen_lookup(first_seen_qtime, first_seen_output_path)
 
-    OUTPUT_BASE_PATH.mkdir(parents=True, exist_ok=True)
+    panel_output_dir = output_base_path(time_shift)
+    panel_output_dir.mkdir(parents=True, exist_ok=True)
     for block_number in tqdm(range(1, n_blocks + 1), desc="Processing formulary blocks", unit="block"):
         stage_path = paths[block_number]
-        output_path = OUTPUT_BASE_PATH / f"formulary_panel_{block_number}.csv"
+        output_path = panel_output_dir / f"formulary_panel_{block_number}.csv"
         if output_path.exists():
-            raise FileExistsError(
-                f"Refusing to overwrite existing output: {output_path}. Move or delete it before rerunning."
-            )
+            output_path.unlink()
         process_block(
             stage_path=stage_path,
             output_path=output_path,
@@ -882,8 +927,8 @@ def main() -> None:
         stage_dir.rmdir()
     except OSError:
         pass
-    print(f"Saved {n_blocks} formulary panel blocks to: {OUTPUT_BASE_PATH}")
-    print(f"Saved NDC first-seen lookup to: {FIRST_SEEN_PATH}")
+    print(f"Saved {n_blocks} formulary panel blocks to: {panel_output_dir}")
+    print(f"Saved NDC first-seen lookup to: {first_seen_output_path}")
 
 
 if __name__ == "__main__":

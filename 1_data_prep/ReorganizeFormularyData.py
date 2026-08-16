@@ -46,13 +46,13 @@ QUARTER_PATTERN = re.compile(r"^(\d{4})\s*Q([1-4])$")
 # chunksize:
 # - Controls only streaming memory.  No chunk is treated as a complete panel.
 #
-# overwrite_outputs:
-# - Keep at 0 for a safe first run.  Set to 1 only when intentionally replacing
-#   every existing quarter file in OUTPUT_DIR.
+# formulary_time_shift_quarters:
+# - Must match FormularyPanelMaker.py.  The default 0 preserves existing paths;
+#   nonzero shifts read/write shift-specific subdirectories.
 RUN_CONFIG = {
     "n_input_blocks": 30,
     "chunksize": 1_000_000,
-    "overwrite_outputs": 0,
+    "formulary_time_shift_quarters": 1,
 }
 # ===============================================================
 
@@ -85,23 +85,36 @@ def quarter_file_tag(year_q: str) -> str:
     return year_q.replace(" ", "")
 
 
-def validate_config(config: dict) -> tuple[int, int, bool]:
+def shift_label(shift_quarters: int) -> str:
+    """Return the folder label for a formulary quarter shift."""
+    return f"shift_q{shift_quarters:+d}".replace("+", "")
+
+
+def input_dir(shift_quarters: int) -> Path:
+    """Return the source panel directory for one timing specification."""
+    return INPUT_DIR if shift_quarters == 0 else INPUT_DIR / shift_label(shift_quarters)
+
+
+def output_dir(shift_quarters: int) -> Path:
+    """Return the quarter-organized output directory for one timing specification."""
+    return OUTPUT_DIR if shift_quarters == 0 else OUTPUT_DIR / shift_label(shift_quarters)
+
+
+def validate_config(config: dict) -> tuple[int, int, int]:
     """Validate and normalize the small run configuration."""
     n_blocks = int(config["n_input_blocks"])
     chunksize = int(config["chunksize"])
-    overwrite = int(config["overwrite_outputs"])
+    time_shift = int(config["formulary_time_shift_quarters"])
     if n_blocks < 1:
         raise ValueError("n_input_blocks must be at least 1.")
     if chunksize < 1:
         raise ValueError("chunksize must be at least 1.")
-    if overwrite not in {0, 1}:
-        raise ValueError("overwrite_outputs must be 0 or 1.")
-    return n_blocks, chunksize, bool(overwrite)
+    return n_blocks, chunksize, time_shift
 
 
-def input_paths(n_blocks: int) -> list[Path]:
+def input_paths(source_dir: Path, n_blocks: int) -> list[Path]:
     """Return and validate the ordered complete-formulary source paths."""
-    paths = [INPUT_DIR / f"formulary_panel_{block}.csv" for block in range(1, n_blocks + 1)]
+    paths = [source_dir / f"formulary_panel_{block}.csv" for block in range(1, n_blocks + 1)]
     missing = [path for path in paths if not path.exists()]
     if missing:
         raise FileNotFoundError(f"Missing formulary panel blocks: {missing[:10]}")
@@ -153,25 +166,19 @@ def all_discovered_quarters(inventory: dict[Path, set[str]]) -> list[str]:
 # ========================== QUARTER ROUTING ==========================
 
 
-def output_paths(quarters: list[str]) -> dict[str, Path]:
+def output_paths(destination_dir: Path, quarters: list[str]) -> dict[str, Path]:
     """Map canonical YEAR_Q labels to their quarter-organized output paths."""
     return {
-        year_q: OUTPUT_DIR / f"formulary_panel_{quarter_file_tag(year_q)}.csv"
+        year_q: destination_dir / f"formulary_panel_{quarter_file_tag(year_q)}.csv"
         for year_q in quarters
     }
 
 
-def prepare_output_directory(paths: dict[str, Path], overwrite: bool) -> None:
-    """Create the output directory and enforce the configured overwrite policy."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    existing = [path for path in paths.values() if path.exists()]
-    if existing and not overwrite:
-        raise FileExistsError(
-            "Quarter outputs already exist. Move/delete them or set overwrite_outputs=1. "
-            f"Examples: {existing[:5]}"
-        )
-    if overwrite:
-        for path in existing:
+def prepare_output_directory(destination_dir: Path, paths: dict[str, Path]) -> None:
+    """Create the output directory and replace prior quarter outputs."""
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    for path in paths.values():
+        if path.exists():
             path.unlink()
 
 
@@ -238,15 +245,17 @@ def route_blocks_by_quarter(
 
 def main() -> None:
     """Run both streaming passes and write one complete file per quarter."""
-    n_blocks, chunksize, overwrite = validate_config(RUN_CONFIG)
-    sources = input_paths(n_blocks)
+    n_blocks, chunksize, time_shift = validate_config(RUN_CONFIG)
+    source_dir = input_dir(time_shift)
+    destination_dir = output_dir(time_shift)
+    sources = input_paths(source_dir, n_blocks)
     inventory = scan_quarter_inventory(sources, chunksize)
     quarters = all_discovered_quarters(inventory)
-    targets = output_paths(quarters)
-    prepare_output_directory(targets, overwrite)
+    targets = output_paths(destination_dir, quarters)
+    prepare_output_directory(destination_dir, targets)
     row_counts = route_blocks_by_quarter(inventory, targets, chunksize)
 
-    print(f"Saved {len(quarters)} quarter files to: {OUTPUT_DIR}")
+    print(f"Saved {len(quarters)} quarter files to: {destination_dir}")
     for year_q in quarters:
         print(f"  {quarter_file_tag(year_q)}: {row_counts[year_q]:,} rows")
 
