@@ -4,35 +4,35 @@ set trace off
 
 // ================================================================
 // Purpose:
-// Estimate stacked DDD specifications that compare post-event outcome
-// changes for treated products with and without ATC sharing, and report
-// the corresponding did_imputation heterogeneity contrast as a check.
+// Estimate stacked DDD models of post-event outcome changes for treated
+// products with and without ATC sharing, with did_imputation heterogeneity
+// estimates reported as a staggered-adoption robustness check.
 //
-// Design:
-// - Build stacked cohort-specific samples for each event/control/event_type
-//   combination, then estimate Y = beta0 * (Treat x Post)
-//                        + beta1 * (Treat x Post x ATC-sharing) + FE.
-// - beta0 is the post-event treatment effect for treated products without
-//   ATC sharing; beta1 is the additional effect for sharing products; and
-//   beta0 + beta1 is the total effect for sharing products.
-// - did_imputation with hetby(atc_sharing_het) provides an alternative
-//   staggered-adoption estimator, using the configured cluster() variable;
-//   tau_1 - tau_0 summarizes the gap between sharing and non-sharing
-//   treatment effects.
+// Process:
+// - Loop over ATC levels, treatment-side definitions, event-pair restrictions,
+//   events, controls, cohort requirements, outcome transformations, fixed
+//   effects, and clustering levels.
+// - Build cohort-specific stacks, retain event quarters -4 through +7, merge
+//   firm-quarter kappa controls, apply the configured outlier treatment and
+//   outcome transformation, and construct stack-specific panel identifiers.
+// - Estimate reghdfe models with Treat x Post and Treat x Post x ATC-sharing;
+//   beta0 is the Not-Share effect, beta1 is the Share increment, and their sum
+//   is the Share effect. Run did_imputation with hetby(atc_sharing_het) as a check.
+// - Calculate group-specific pre-treatment means, percentage effects, sample
+//   counts, and unique product and board counts for reporting.
 //
-// Sample / Measurement:
-// - The script loops over treatment-side definitions, whether event-pair
-//   restrictions are imposed, control-group definitions, and two outcome
-//   scaling choices: within-product standardization or cohort-entry
-//   normalization.
-// - Under normalization, the top 5% of (boardname, product, data_cohort)
-//   groups by within-group max-min range are dropped to reduce leverage
-//   from extreme normalized trajectories.
+// Input:
+// - data/cohort_data_with_atcsharing_{atc}/{panel group}/{event_type}/req*/
+//   {control}/{event}_{panel}_cohort_{year}*_balanced*_{atc}.csv
+// - data/kappa/ssr_kappa_firm_level_v5.csv for firm-quarter kappa controls.
+// - Required fields include boardname, product, year, quarter, outcome and
+//   event/control indicators, atc_sharing, and the configured ATC variable.
 //
 // Output:
 // - logs/ddd_atcsharing_{atc}*_fe*/cluster_{cluster}/...
 // - tex/ddd_atcsharing_{atc}*_fe*/cluster_{cluster}/...
 // - csv/ddd_atcsharing_{atc}*_fe*/cluster_{cluster}/...
+// - logs/ddd_atcsharing_failure.log for failed did_imputation checks.
 // ================================================================
 
 * ================= user config =================

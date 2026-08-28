@@ -201,10 +201,8 @@ def drug_quarter_output_dir(shift_quarters: int) -> Path:
 
 
 def first_seen_path(shift_quarters: int) -> Path:
-    """Return the NDC first-seen lookup path for one timing specification."""
-    if shift_quarters == 0:
-        return FIRST_SEEN_PATH
-    return FIRST_SEEN_PATH.with_name(f"{FIRST_SEEN_PATH.stem}_{shift_label(shift_quarters)}.csv")
+    """Return original-time NDC first-seen metadata for every panel shift."""
+    return FIRST_SEEN_PATH
 
 
 def cohort_output_dir(shift_quarters: int, year_offset: int, quarter: int) -> Path:

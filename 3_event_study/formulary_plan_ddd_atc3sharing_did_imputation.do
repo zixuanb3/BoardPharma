@@ -10,7 +10,7 @@ set trace off
 // level, using balanced and reproducibly sampled plan cohort panels.
 //
 // Process:
-// 1. Read each event's five plan cohort CSVs once, merge the shift-specific
+// 1. Read each event's five plan cohort CSVs once, merge the original-time
 //    NDC first-seen metadata, and apply the selected cohort-relative cutoff.
 // 2. Select A or B through its sample flag and freeze event-specific ATC3
 //    sharing at cohort-year Q1 for the full stacked unit history.
@@ -25,8 +25,7 @@ set trace off
 // - data/formulary_plan_cohort_data/event/req1/Not/
 //   shift_q{0|1}/{plan|state|county}/
 //   {event}_plan_quarter_cohort_{year}.csv
-// - data/formulary_metadata/ndc_first_seen.csv or
-//   data/formulary_metadata/ndc_first_seen_shift_q1.csv
+// - data/formulary_metadata/ndc_first_seen.csv
 //
 // Output:
 // - csv/formulary_plan/ddd/{sample}/{spec}/{event}/{side}/{target}/result.csv
@@ -162,13 +161,9 @@ if _rc {
     exit 199
 }
 
-* Load the shift-consistent global NDC first-seen metadata once.  The cohort
+* Load the original-time global NDC first-seen metadata once.  The cohort
 * cutoff is applied to the NDC as a whole, so eligible NDCs retain all rows.
 local first_seen_file "`project_path'/data/formulary_metadata/ndc_first_seen.csv"
-if `formulary_time_shift_quarters' == 1 {
-    local first_seen_file ///
-        "`project_path'/data/formulary_metadata/ndc_first_seen_shift_q1.csv"
-}
 capture confirm file "`first_seen_file'"
 if _rc {
     di as error "Missing first-seen metadata: `first_seen_file'"

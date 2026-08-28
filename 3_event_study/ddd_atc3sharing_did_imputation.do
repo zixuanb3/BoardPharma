@@ -4,36 +4,37 @@ set trace off
 
 // ================================================================
 // Purpose:
-// Estimate stacked did_imputation specifications that compare post-event
-// outcome changes for treated products with and without ATC sharing.
+// Estimate stacked did_imputation models of post-event outcome changes for
+// treated products, comparing products with and without ATC sharing and,
+// when configured, allowing the ATT to vary with ATC exposure.
 //
-// Design:
-// - Build stacked cohort-specific samples for each event/control/event_type
-//   combination. If exposure lists are nonempty, run did_imputation with
-//   project(atc_sharing exposure); if both exposure lists are empty, run the
-//   original hetby(atc_sharing) DDD specification. All did_imputation calls
-//   use the configured cluster() variable.
-// - With exposure, beta1 is tau_cons, the ATT for treated products without ATC
-//   sharing; beta2 is tau_atc_sharing; beta3 is tau_exposure_project.
-// - Without exposure, beta1 is tau_0 and beta2 is tau_1 - tau_0.
-// - Exposure is demeaned across unique treated Share ids in the autosample.
-// - beta1 + beta2 is the projected ATT for sharing products at mean exposure.
-// - Exported sample counts, pre-treatment means, and percent effects are
-//   computed on the autosample-adjusted e(sample).
+// Process:
+// - Loop over ATC levels, treatment-side definitions, event-pair restrictions,
+//   events, controls, cohort requirements, outcome transformations, fixed
+//   effects, clustering levels, and optional exposure definitions.
+// - Build cohort-specific stacks, retain event quarters -4 through +7, merge
+//   firm-quarter kappa controls, apply the configured outlier treatment and
+//   outcome transformation, and construct stack-specific panel identifiers.
+// - Run did_imputation with hetby(atc_sharing_het) when exposure is disabled,
+//   or project(atc_sharing exposure_project) after demeaning exposure across
+//   treated Share ids in the autosample when exposure is enabled.
+// - Report the Not-Share ATT, the Share-minus-Not-Share ATT gap, the Share ATT,
+//   exposure gradients where applicable, and statistics calculated from the
+//   final autosample-adjusted estimation sample.
 //
-// Sample / Measurement:
-// - The script loops over treatment-side definitions, whether event-pair
-//   restrictions are imposed, control-group definitions, and two outcome
-//   scaling choices: within-product standardization or cohort-entry
-//   normalization.
-// - Under normalization, the top 5% of (boardname, product, data_cohort)
-//   groups by within-group max-min range are dropped to reduce leverage
-//   from extreme normalized trajectories.
+// Input:
+// - data/cohort_data_with_atcsharing_{atc}/{panel group}/{event_type}/req*/
+//   {control}/{event}_{panel}_cohort_{year}*_balanced*_{atc}.csv
+// - data/kappa/ssr_kappa_firm_level_v5.csv for firm-quarter kappa controls.
+// - Required fields include boardname, product, year, quarter, outcome and
+//   event/control indicators, atc_sharing, the configured ATC variable, and
+//   the configured exposure variable when exposure estimation is enabled.
 //
 // Output:
 // - logs/ddd_atcsh_didimp_{atc}{_ls_definition}_{exposure}_{metric}_{outlier}_fe*/cluster_{cluster}/...
 // - tex/ddd_atcsh_didimp_{atc}{_ls_definition}_{exposure}_{metric}_{outlier}_fe*/cluster_{cluster}/...
 // - csv/ddd_atcsh_didimp_{atc}{_ls_definition}_{exposure}_{metric}_{outlier}_fe*/cluster_{cluster}/...
+// - logs/ddd_atcsharing_did_imputation_failure.log for failed specifications.
 // ================================================================
 
 * ================= user config =================
