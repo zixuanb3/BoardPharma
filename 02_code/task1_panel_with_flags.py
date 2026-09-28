@@ -5,7 +5,7 @@
 Input:
     D:\\pharma\\merged_basic_drugs_formulary.csv
     D:\\pharma\\full_list_of_ndc_codes\\fda_ndc_product.csv
-    Quarterly Beneficiary Cost and Plan Information files under COST_ROOT
+    D:\\pharma\\merged_beneficiary_cost.csv
     D:\\pharma\\labeler_company_mapping_standardized.csv
 
 Output:
@@ -27,7 +27,7 @@ FDA_PROD = r"D:\pharma\full_list_of_ndc_codes\fda_ndc_product.csv"
 MAPPING = r"D:\pharma\labeler_company_mapping_standardized.csv"
 BOARDEX_ORG = r"D:\Dropbox\BoardPharma\RawData\boardex\boardex_na\organization_composition.csv"
 BOARDEX_COMPANY = r"D:\Dropbox\BoardPharma\RawData\boardex\boardex_na\company_details.csv"
-COST_ROOT = r"D:\pharma\批量下载-formulary等142个文件\formulary"
+COST_FILE = r"D:\pharma\merged_beneficiary_cost.csv"
 OUTPUT = r"D:\pharma\task1_final_panel.csv"
 SPECIALTY_AUDIT_OUTPUT = r"D:\pharma\specialty_tier_plan_consistency_audit.csv"
 FORMULARY_COLUMNS = [
@@ -208,70 +208,86 @@ def get_boardex(labeler):
 
 
 # ══════════════════════════════════════════════════════════════
-# STEP 3: Specialty-tier map from Beneficiary Cost + Plan Info
+# STEP 3: Specialty-tier map from the merged Beneficiary Cost file
 # ══════════════════════════════════════════════════════════════
 print("\n[3] Building specialty-tier mapping...")
-spec_map_parts = []
-specialty_consistency_parts = []
-for qdir in sorted(os.listdir(COST_ROOT)):
-    dpath = os.path.join(COST_ROOT, qdir)
-    if not os.path.isdir(dpath): continue
-    m = re.match(r'(\d{4})_Q(\d)', qdir)
-    if not m: continue
-    yq = f"{m.group(1)} Q{m.group(2)}"
-    files = os.listdir(dpath)
-    pi_file = next((os.path.join(dpath, f) for f in files
-                    if f.lower().startswith('plan information') and f.endswith('.txt')), None)
-    bc_file = next((os.path.join(dpath, f) for f in files
-                    if 'beneficiary cost' in f.lower() and f.endswith('.txt')), None)
-    if pi_file and bc_file:
-        pi = pd.read_csv(pi_file, sep='|', dtype=str, encoding='latin-1',
-                         usecols=['CONTRACT_ID', 'PLAN_ID', 'SEGMENT_ID', 'FORMULARY_ID'])
-        pi = pi.drop_duplicates()
-        bc = pd.read_csv(bc_file, sep='|', dtype=str, encoding='latin-1',
-                         usecols=['CONTRACT_ID', 'PLAN_ID', 'SEGMENT_ID', 'TIER',
-                                  'TIER_SPECIALTY_YN', 'COVERAGE_LEVEL'])
-        bc = bc[bc['COVERAGE_LEVEL'].eq('1')].copy()
-        bc['TIER'] = pd.to_numeric(bc['TIER'], errors='coerce')
-        bc['is_specialty'] = bc['TIER_SPECIALTY_YN'].fillna('N').str.upper().eq('Y').astype('int8')
-        quarter_map = bc.merge(
-            pi, on=['CONTRACT_ID', 'PLAN_ID', 'SEGMENT_ID'], how='inner',
-        )
-        quarter_map = quarter_map.dropna(subset=['FORMULARY_ID', 'TIER'])
-        quarter_map['YEAR_Q'] = yq
-        plan_tier_map = quarter_map.groupby(
-            ['YEAR_Q', 'FORMULARY_ID', 'TIER', 'CONTRACT_ID', 'PLAN_ID', 'SEGMENT_ID'],
-            as_index=False,
-        ).agg(is_specialty=('is_specialty', 'max'))
-        consistency = plan_tier_map.groupby(
-            ['YEAR_Q', 'FORMULARY_ID', 'TIER'], as_index=False,
-        ).agg(
-            n_matched_plans=('is_specialty', 'size'),
-            n_specialty_plans=('is_specialty', 'sum'),
-            n_flag_values=('is_specialty', 'nunique'),
-        )
-        consistency['n_non_specialty_plans'] = (
-            consistency['n_matched_plans'] - consistency['n_specialty_plans']
-        )
-        specialty_consistency_parts.append(consistency)
-        spec_map_parts.append(
-            plan_tier_map[['YEAR_Q', 'FORMULARY_ID', 'TIER', 'is_specialty']]
-        )
+if not os.path.isfile(COST_FILE):
+    raise FileNotFoundError(f"Merged Beneficiary Cost file not found: {COST_FILE}")
 
-if not spec_map_parts:
-    raise FileNotFoundError(
-        f"No matching plan information and beneficiary cost files were found under {COST_ROOT}"
+# Read only the fields needed for specialty classification. Chunking avoids
+# loading the 1+ GB merged cost file into memory all at once.
+plan_tier_parts = []
+cost_chunk_size = 500_000
+specialty_key_cols = [
+    'YEAR_Q', 'FORMULARY_ID', 'TIER', 'CONTRACT_ID', 'PLAN_ID', 'SEGMENT_ID',
+]
+cost_usecols = specialty_key_cols + [
+    'TIER_SPECIALTY_YN', 'COVERAGE_LEVEL',
+]
+for cost_chunk in pd.read_csv(
+    COST_FILE,
+    usecols=cost_usecols,
+    dtype=str,
+    chunksize=cost_chunk_size,
+    low_memory=False,
+    on_bad_lines='error',
+):
+    cost_chunk = cost_chunk[cost_chunk['COVERAGE_LEVEL'].str.strip().eq('1')].copy()
+    if cost_chunk.empty:
+        continue
+
+    for col in specialty_key_cols:
+        if col != 'TIER':
+            cost_chunk[col] = cost_chunk[col].fillna('').str.strip()
+    cost_chunk['TIER'] = pd.to_numeric(cost_chunk['TIER'], errors='coerce')
+    cost_chunk = cost_chunk.dropna(subset=['TIER'])
+    cost_chunk = cost_chunk[
+        cost_chunk[['YEAR_Q', 'FORMULARY_ID', 'CONTRACT_ID', 'PLAN_ID', 'SEGMENT_ID']]
+        .ne('').all(axis=1)
+    ]
+    if cost_chunk.empty:
+        continue
+
+    cost_chunk['is_specialty'] = (
+        cost_chunk['TIER_SPECIALTY_YN'].fillna('N').str.upper().str.strip()
+        .eq('Y').astype('int8')
+    )
+    plan_tier_parts.append(
+        cost_chunk.groupby(specialty_key_cols, as_index=False, sort=False)
+        .agg(is_specialty=('is_specialty', 'max'))
     )
 
-spec_map = pd.concat(spec_map_parts, ignore_index=True).rename(columns={'TIER': 'tier_raw'})
-# Resolve plan-level disagreements before merging to prevent row multiplication.
-spec_map = spec_map.groupby(
-    ['YEAR_Q', 'FORMULARY_ID', 'tier_raw'], as_index=False
+if not plan_tier_parts:
+    raise ValueError(f"No usable plan-tier rows found in {COST_FILE}")
+
+# A plan-tier key may appear in multiple input chunks, so aggregate once more
+# after concatenation before computing cross-plan specialty consistency.
+plan_tier_map = pd.concat(plan_tier_parts, ignore_index=True).groupby(
+    specialty_key_cols, as_index=False, sort=False,
 ).agg(is_specialty=('is_specialty', 'max'))
+del plan_tier_parts
+
+specialty_consistency = plan_tier_map.groupby(
+    ['YEAR_Q', 'FORMULARY_ID', 'TIER'], as_index=False, sort=False,
+).agg(
+    n_matched_plans=('is_specialty', 'size'),
+    n_specialty_plans=('is_specialty', 'sum'),
+    n_flag_values=('is_specialty', 'nunique'),
+)
+specialty_consistency['n_non_specialty_plans'] = (
+    specialty_consistency['n_matched_plans'] - specialty_consistency['n_specialty_plans']
+)
+
+# If any plan for the same quarter/Formulary/tier is Specialty, the merged
+# Formulary-tier flag is 1. This aggregation also prevents row multiplication.
+spec_map = plan_tier_map.groupby(
+    ['YEAR_Q', 'FORMULARY_ID', 'TIER'], as_index=False, sort=False,
+).agg(is_specialty=('is_specialty', 'max')).rename(columns={'TIER': 'tier_raw'})
 print(f"  Specialty-tier map: {len(spec_map):,} entries, {(spec_map['is_specialty'] == 1).sum():,} specialty tiers")
 
-specialty_audit = pd.concat(specialty_consistency_parts, ignore_index=True)
-specialty_audit = specialty_audit[specialty_audit['n_flag_values'].gt(1)].copy()
+specialty_audit = specialty_consistency[
+    specialty_consistency['n_flag_values'].gt(1)
+].copy()
 specialty_audit.to_csv(SPECIALTY_AUDIT_OUTPUT, index=False)
 print(
     f"  Plan disagreements: {len(specialty_audit):,} formulary-quarter-tier keys; "
