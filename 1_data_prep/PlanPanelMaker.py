@@ -1,9 +1,9 @@
 r"""
 Purpose:
-Build 15 regression-ready cohort panels directly from plan information and
-quarterly formulary panels.  The legacy mode uses sampled contract-plan-segment
-units; path-weighted mode collapses complete CPS formulary histories before the
-NDC merge.
+Build regression-ready cohort panels directly from plan information and
+quarterly formulary panels. The annual mode retains the original event-year
+cohorts; quarterly mode uses actual event quarters. Path-weighted mode collapses
+complete CPS formulary histories within each cohort before the NDC merge.
 
 Process:
 1. Read merged plan information, normalize its identifiers, apply the common
@@ -19,9 +19,10 @@ Process:
 Input:
 - InterimData/merged_plan_information.csv
 - D:/task1_expanded_brand_panel/task1_expanded_brand_panel.csv
-- InterimData/copay_avg_by_plan_tier.csv
+- InterimData/aggregated_copay_by_tier.csv
 - InterimData/copay_avg_with_prefer.csv
 - data/formulary_panel_by_time[/shift_q1]/formulary_panel_YYYYQX.csv
+- data/formulary_panel_quarter_by_time[/shift_q1]/formulary_panel_YYYYQX.csv
 - data/directory/Monthly_Report_By_Contract_YYYY_MM.csv
 - data/formulary_metadata/ndc_first_seen[_shift_q1].csv
 
@@ -30,6 +31,8 @@ Output:
   {event}_plan_quarter_cohort_{year}.csv
  - D:/BoardPharma/data/formulary_path_cohort_data/event/req1/Not/{shift}/{level}/
   {event}_path_quarter_cohort_{year}.csv
+- data/formulary_path_cohort_data_quarter/event/req1/Not/{shift}/{level}/
+  {event}_path_quarter_cohort_{year}Q{quarter}.csv
 """
 
 from __future__ import annotations
@@ -61,7 +64,7 @@ PLAN_INFO_PATH = PROJECT_ROOT / "InterimData" / "merged_plan_information.csv"
 EXPANDED_FORMULARY_PATH = Path(
     r"D:\task1_expanded_brand_panel\task1_expanded_brand_panel.csv"
 )
-COPAY_PATH = PROJECT_ROOT / "InterimData" / "copay_avg_by_plan_tier.csv"
+COPAY_PATH = PROJECT_ROOT / "InterimData" / "aggregated_copay_by_tier.csv"
 PREFER_PATH = PROJECT_ROOT / "InterimData" / "copay_avg_with_prefer.csv"
 FORMULARY_PANEL_ROOT = DATA_ROOT / "formulary_panel_by_time"
 DIRECTORY_ROOT = DATA_ROOT / "directory"
@@ -71,6 +74,9 @@ COHORT_ROOT = DATA_ROOT / "formulary_plan_cohort_data" / "event" / "req1" / "Not
 PATH_WEIGHTED_DATA_ROOT = Path(r"D:\BoardPharma\data")
 PATH_WEIGHTED_COHORT_ROOT = (
     PATH_WEIGHTED_DATA_ROOT / "formulary_path_cohort_data" / "event" / "req1" / "Not"
+)
+QUARTER_PATH_WEIGHTED_COHORT_ROOT = (
+    DATA_ROOT / "formulary_path_cohort_data_quarter" / "event" / "req1" / "Not"
 )
 
 YEAR_Q_PATTERN = re.compile(r"^([12][0-9]{3})Q([1-4])$")
@@ -90,6 +96,10 @@ COHORT_YEARS = (2020, 2021, 2022, 2023, 2024)
 
 
 # ========================== USER CONFIG ==========================
+# quarter:
+# - 0 preserves the annual event cohorts and their original output location.
+# - 1 constructs event-quarter path cohorts with relative quarters -4 through +7.
+#   This mode requires path_weighted_mode=1 and uses a separate output directory.
 # level:
 # - "plan" keeps no geographic columns in the analysis unit.
 # - "state" keeps STATE as the geography component of the analysis unit.
@@ -114,12 +124,15 @@ COHORT_YEARS = (2020, 2021, 2022, 2023, 2024)
 # - 0 preserves the legacy sampled CPS-by-NDC pipeline exactly.
 # - 1 keeps every balanced CPS, collapses identical full formulary histories,
 #   and writes history-by-NDC panels with path counts as regression weights.
+# copay: 1 reads and matches plan-tier copay; 0 leaves copay values missing.
 RUN_CONFIG = {
+    "quarter": 1,
     "level": "state",
     "formulary_time_shift_quarters": 1,
     "sample_fraction": 0.01,
     "random_seed": 20250810,
     "path_weighted_mode": 1,
+    "copay": 0,
     "chunksize": 1_000_000,
     "max_expanded_rows_per_batch": 1_000_000,
 }
@@ -323,6 +336,13 @@ def quarter_time(values: pd.Series) -> pd.Series:
     return year * 4 + quarter
 
 
+def cohort_year_quarter(cohort_key: int, quarter: int) -> tuple[int, int]:
+    """Decode a quarterly cohort key; annual keys remain calendar years."""
+    if not quarter:
+        return cohort_key, 1
+    return (cohort_key - 1) // 4, (cohort_key - 1) % 4 + 1
+
+
 def shift_year_q(year_q: str, shift_quarters: int) -> str:
     """Shift one compact quarter tag by the configured number of quarters."""
     year, quarter = quarter_key(year_q)
@@ -373,13 +393,16 @@ def write_path_checkpoint(
     output_rows: dict[tuple[str, int], int],
     spec: AnalysisSpec,
     time_shift: int,
+    quarter: int = 0,
+    copay_mode: int = 1,
 ) -> None:
     """Atomically record the last fully committed quarter and output sizes."""
     payload = {
         "version": 1,
         "level": spec.level,
         "time_shift": time_shift,
-        "schema": path_panel_columns(),
+        "copay": copay_mode,
+        "schema": quarterly_path_panel_columns() if quarter else path_panel_columns(),
         "ordered_quarters": ordered_quarters,
         "completed_quarters": completed_quarters,
         "file_sizes": {
@@ -405,6 +428,8 @@ def initialize_path_outputs(
     output_paths: dict[tuple[str, int], Path],
     spec: AnalysisSpec,
     time_shift: int,
+    quarter: int = 0,
+    copay_mode: int = 1,
 ) -> tuple[list[str], dict[tuple[str, int], bool], dict[tuple[str, int], int]]:
     """Start fresh or roll partial output back to the last completed quarter."""
     if not checkpoint_path.exists():
@@ -421,10 +446,14 @@ def initialize_path_outputs(
         "version": 1,
         "level": spec.level,
         "time_shift": time_shift,
-        "schema": path_panel_columns(),
+        "copay": copay_mode,
+        "schema": quarterly_path_panel_columns() if quarter else path_panel_columns(),
         "ordered_quarters": ordered_quarters,
     }
-    mismatched = [key for key, value in expected.items() if checkpoint.get(key) != value]
+    mismatched = [
+        key for key, value in expected.items()
+        if checkpoint.get(key, 1 if key == "copay" else None) != value
+    ]
     if mismatched:
         raise ValueError(
             "Path checkpoint is incompatible with the current build: "
@@ -500,9 +529,10 @@ def validate_config(
 # ========================== INPUT INVENTORY ==========================
 
 
-def formulary_input_dir(time_shift: int) -> Path:
+def formulary_input_dir(time_shift: int, quarter: int = 0) -> Path:
     """Return the raw formulary quarter directory for one timing specification."""
-    return FORMULARY_PANEL_ROOT if time_shift == 0 else FORMULARY_PANEL_ROOT / shift_label(time_shift)
+    root = FORMULARY_PANEL_ROOT.with_name("formulary_panel_quarter_by_time") if quarter else FORMULARY_PANEL_ROOT
+    return root if time_shift == 0 else root / shift_label(time_shift)
 
 
 def quarter_panel_paths(source_dir: Path) -> dict[str, Path]:
@@ -749,13 +779,9 @@ def build_path_cohorts(
     balanced_units: dict[int, pd.MultiIndex],
     cohort_windows: dict[int, tuple[str, ...]],
     spec: AnalysisSpec,
+    quarter: int = 0,
 ) -> dict[int, PathCohort]:
-    """Collapse complete CPS formulary histories within every cohort.
-
-    A history is defined exclusively by its formulary sequence in the cohort
-    window.  The balanced-CPS screen and path grouping therefore use exactly
-    the same 11/12 cohort quarters.
-    """
+    """Collapse complete CPS formulary sequences within each cohort window."""
     cohorts: dict[int, PathCohort] = {}
     unit_columns = spec.plan_unit_columns
     for cohort_year, quarters in cohort_windows.items():
@@ -780,8 +806,10 @@ def build_path_cohorts(
         )
         history_map = formulary_sequence.rename("history_signature").reset_index()
         history_code = pd.factorize(history_map["history_signature"], sort=True)[0] + 1
+        year, event_quarter = cohort_year_quarter(cohort_year, quarter)
+        cohort_tag = f"{year}Q{event_quarter}" if quarter else str(year)
         history_map["history_id"] = (
-            f"H{cohort_year}_" + pd.Series(history_code, index=history_map.index).astype(str)
+            f"H{cohort_tag}_" + pd.Series(history_code, index=history_map.index).astype(str)
         )
         history_map["n_path"] = history_map.groupby("history_id", dropna=False)[
             "history_id"
@@ -824,12 +852,15 @@ def build_path_cohorts(
     return cohorts
 
 
-def build_samples(cohort_windows: dict[int, tuple[str, ...]]) -> dict[tuple[str, int], CohortSample]:
+def build_samples(
+    cohort_windows: dict[int, tuple[str, ...]], quarter: int = 0,
+) -> dict[tuple[str, int], CohortSample]:
     """Build req1/Not treated and excluded-control firm sets."""
-    movement, candidate, stay_column = formulary_cohort.load_event_sources()
+    movement, candidate, stay_column = formulary_cohort.load_event_sources(quarter)
     samples: dict[tuple[str, int], CohortSample] = {}
-    for cohort_year, quarters in cohort_windows.items():
-        window_years = {quarter_key(year_q)[0] for year_q in quarters}
+    for cohort_key, quarters in cohort_windows.items():
+        cohort_year, cohort_quarter = cohort_year_quarter(cohort_key, quarter)
+        window_periods = list(quarters) if quarter else {quarter_key(tag)[0] for tag in quarters}
         for event_type in EVENT_TYPES:
             treated: dict[str, set[str]] = {}
             excluded: dict[str, set[str]] = {}
@@ -839,12 +870,14 @@ def build_samples(cohort_windows: dict[int, tuple[str, ...]]) -> dict[tuple[str,
                     event_type,
                     side,
                     cohort_year,
+                    cohort_quarter if quarter else None,
                 )
                 pure_event = formulary_cohort.pure_event_firms_in_window(
                     movement,
                     event_type,
                     side,
-                    window_years,
+                    window_periods,
+                    quarter,
                 )
                 counterpart_only = formulary_cohort.counterpart_only_firms(
                     candidate,
@@ -852,11 +885,12 @@ def build_samples(cohort_windows: dict[int, tuple[str, ...]]) -> dict[tuple[str,
                     event_type,
                     side,
                     cohort_year,
+                    cohort_quarter if quarter else None,
                 )
                 excluded[side] = pure_event | counterpart_only
-            samples[(event_type, cohort_year)] = CohortSample(
+            samples[(event_type, cohort_key)] = CohortSample(
                 event_type=event_type,
-                cohort_year=cohort_year,
+                cohort_year=cohort_key,
                 required_quarters=quarters,
                 treated_a=frozenset(treated["A"]),
                 treated_b=frozenset(treated["B"]),
@@ -884,12 +918,12 @@ def normalize_plan_feature_keys(data: pd.DataFrame, source_name: str, time_shift
 def load_copay_lookup(time_shift: int) -> pd.DataFrame:
     """Load the unique plan-segment-tier average copay feature."""
     data = pd.read_csv(COPAY_PATH, dtype="string", keep_default_na=False)
-    required = {"YEAR_Q", "CONTRACT_ID", "PLAN_ID", "SEGMENT_ID", "TIER", "AVG_COPAY_AMT"}
+    required = {"YEAR_Q", "CONTRACT_ID", "PLAN_ID", "SEGMENT_ID", "TIER", "avg_cost"}
     missing = sorted(required - set(data.columns))
     if missing:
         raise KeyError(f"{COPAY_PATH.name} is missing columns: {missing}")
     result = normalize_plan_feature_keys(data, COPAY_PATH.name, time_shift)
-    result["avg_copay_amt"] = pd.to_numeric(result["AVG_COPAY_AMT"], errors="coerce")
+    result["avg_copay_amt"] = pd.to_numeric(result["avg_cost"], errors="coerce")
     keys = ["year_q", "contract_id", "plan_id", "segment_id", "tier"]
     if result.duplicated(keys).any():
         raise ValueError(f"{COPAY_PATH.name} is not unique by plan tier.")
@@ -911,8 +945,14 @@ def load_prefer_lookup(time_shift: int) -> pd.DataFrame:
     return result[[*keys, "prefer"]]
 
 
-def combine_plan_tier_features(copay: pd.DataFrame, prefer: pd.DataFrame) -> pd.DataFrame:
-    """Combine copay and preferred-tier values into one expanded-row merge."""
+def combine_plan_tier_features(
+    copay: pd.DataFrame | None, prefer: pd.DataFrame
+) -> pd.DataFrame:
+    """Combine preferred-tier values with copay when enabled."""
+    if copay is None:
+        return prefer.assign(
+            avg_copay_amt=pd.Series(pd.NA, index=prefer.index, dtype="Float64")
+        )
     keys = ["year_q", "contract_id", "plan_id", "segment_id", "tier"]
     return copay.merge(prefer, on=keys, how="outer", validate="one_to_one")
 
@@ -1403,9 +1443,19 @@ def path_panel_columns() -> list[str]:
     ]
 
 
-def path_cohort_output_dir(spec: AnalysisSpec, time_shift: int) -> Path:
+def quarterly_path_panel_columns() -> list[str]:
+    """Expose the actual event quarter without changing annual output schemas."""
+    columns = path_panel_columns()
+    columns[columns.index("data_cohort") : columns.index("data_cohort") + 1] = [
+        "data_cohort_year", "data_cohort_quarter", "data_cohort_qtime"
+    ]
+    return columns
+
+
+def path_cohort_output_dir(spec: AnalysisSpec, time_shift: int, quarter: int = 0) -> Path:
     """Return the path-weighted cohort output directory."""
-    return PATH_WEIGHTED_COHORT_ROOT / shift_label(time_shift) / spec.level
+    root = QUARTER_PATH_WEIGHTED_COHORT_ROOT if quarter else PATH_WEIGHTED_COHORT_ROOT
+    return root / shift_label(time_shift) / spec.level
 
 
 def path_cohort_output_path(
@@ -1413,14 +1463,19 @@ def path_cohort_output_path(
     time_shift: int,
     event_type: str,
     cohort_year: int,
+    quarter: int = 0,
 ) -> Path:
     """Return one event-year path-weighted cohort CSV path."""
-    return path_cohort_output_dir(spec, time_shift) / (
-        f"{event_type}_path_quarter_cohort_{cohort_year}.csv"
+    year, event_quarter = cohort_year_quarter(cohort_year, quarter)
+    cohort_tag = f"{year}Q{event_quarter}" if quarter else str(year)
+    return path_cohort_output_dir(spec, time_shift, quarter) / (
+        f"{event_type}_path_quarter_cohort_{cohort_tag}.csv"
     )
 
 
-def add_sample_columns(data: pd.DataFrame, sample: CohortSample) -> pd.DataFrame:
+def add_sample_columns(
+    data: pd.DataFrame, sample: CohortSample, quarter: int = 0,
+) -> pd.DataFrame:
     """Apply one event cohort's A/B treated-control rules and retain its sample."""
     boardname = data["boardname"]
     treated_a = boardname.isin(sample.treated_a).astype("int8")
@@ -1438,6 +1493,11 @@ def add_sample_columns(data: pd.DataFrame, sample: CohortSample) -> pd.DataFrame
     result["sample_a"] = sample_a.loc[keep]
     result["sample_b"] = sample_b.loc[keep]
     result["data_cohort"] = np.int16(sample.cohort_year)
+    if quarter:
+        cohort_year, cohort_quarter = cohort_year_quarter(sample.cohort_year, quarter)
+        result["data_cohort_year"] = np.int16(cohort_year)
+        result["data_cohort_quarter"] = np.int8(cohort_quarter)
+        result["data_cohort_qtime"] = np.int32(sample.cohort_year)
     result["year"] = pd.to_numeric(
         result["year_q"].str.slice(0, 4),
         errors="raise",
@@ -1591,6 +1651,7 @@ def build_quarter_path_panel(
     output_paths: dict[tuple[str, int], Path],
     headers_written: dict[tuple[str, int], bool],
     output_rows: dict[tuple[str, int], int],
+    quarter: int = 0,
 ) -> tuple[int, pd.DataFrame]:
     """Write one raw formulary quarter directly at history-by-NDC level."""
     year_q = source_path.stem.removeprefix("formulary_panel_")
@@ -1669,10 +1730,12 @@ def build_quarter_path_panel(
             cohort_data = expanded.loc[expanded["data_cohort"].eq(cohort_year)]
             for event_type in EVENT_TYPES:
                 key = (event_type, int(cohort_year))
-                selected = add_sample_columns(cohort_data, samples[key])
+                if key not in output_paths:
+                    continue
+                selected = add_sample_columns(cohort_data, samples[key], quarter)
                 if selected.empty:
                     continue
-                selected[path_panel_columns()].to_csv(
+                selected[quarterly_path_panel_columns() if quarter else path_panel_columns()].to_csv(
                     output_paths[key],
                     mode="a",
                     index=False,
@@ -1748,6 +1811,8 @@ def build_path_weighted_panels(
     chunksize: int,
     plan_tier: pd.DataFrame,
     samples: dict[tuple[str, int], CohortSample],
+    quarter: int = 0,
+    copay_mode: int = 1,
 ) -> None:
     """Build all event cohort panels from full CPS formulary paths."""
     print("[path] Building complete CPS formulary histories...", flush=True)
@@ -1756,6 +1821,7 @@ def build_path_weighted_panels(
         balanced_units,
         cohort_windows,
         spec,
+        quarter,
     )
     for cohort_year, path_cohort in sorted(path_cohorts.items()):
         history_count = path_cohort.history_quarters["history_id"].nunique()
@@ -1788,9 +1854,10 @@ def build_path_weighted_panels(
             time_shift,
             event_type,
             cohort_year,
+            quarter,
         )
-        for event_type in EVENT_TYPES
-        for cohort_year in COHORT_YEARS
+        for event_type, cohort_year in samples
+        if not quarter or samples[(event_type, cohort_year)].treated_a or samples[(event_type, cohort_year)].treated_b
     }
     ordered_quarters = sorted(source_paths, key=quarter_key)
     output_dir = next(iter(output_paths.values())).parent
@@ -1803,6 +1870,8 @@ def build_path_weighted_panels(
         output_paths,
         spec,
         time_shift,
+        quarter,
+        copay_mode,
     )
     if not checkpoint_path.exists():
         write_path_checkpoint(
@@ -1813,6 +1882,8 @@ def build_path_weighted_panels(
             output_rows,
             spec,
             time_shift,
+            quarter,
+            copay_mode,
         )
         append_path_build_log(build_log_path, "START fresh path-weighted build")
     if completed_quarters:
@@ -1867,6 +1938,7 @@ def build_path_weighted_panels(
                 output_paths,
                 headers_written,
                 output_rows,
+                quarter,
             )
         except BaseException:
             append_path_build_log(
@@ -1890,6 +1962,8 @@ def build_path_weighted_panels(
             output_rows,
             spec,
             time_shift,
+            quarter,
+            copay_mode,
         )
         print(
             f"[path] COMMITTED quarter {quarter_position}/{len(ordered_quarters)}: {year_q}",
@@ -1923,19 +1997,41 @@ def main() -> None:
         chunksize,
         max_expanded_rows,
     ) = validate_config(RUN_CONFIG)
+    quarter = int(RUN_CONFIG.get("quarter", 0))
+    copay_mode = int(RUN_CONFIG["copay"])
+    if quarter not in (0, 1):
+        raise ValueError("quarter must be 0 or 1")
+    if copay_mode not in (0, 1):
+        raise ValueError("copay must be 0 or 1")
+    if quarter and path_weighted_mode != 1:
+        raise ValueError("Quarterly event cohorts require path_weighted_mode=1")
     if path_weighted_mode == 1:
         print("[path] Inventorying quarterly formulary inputs...", flush=True)
-    source_paths = quarter_panel_paths(formulary_input_dir(time_shift))
+    source_paths = quarter_panel_paths(formulary_input_dir(time_shift, quarter))
+    if quarter:
+        movement, _, _ = formulary_cohort.load_event_sources(quarter=1)
+        specifications = formulary_cohort.cohort_specifications(movement, quarter=1)
+        if not specifications:
+            raise ValueError("No quarterly req1 event cohorts were found")
+        required, windows = formulary_cohort.required_quarters(
+            source_paths, 1, 1, specifications, 1, 4, 8
+        )
+        cohort_windows = {
+            year * 4 + event_quarter: tuple(windows[(year, event_quarter)])
+            for _, year, event_quarter in specifications
+        }
+        source_paths = {tag: source_paths[tag] for tag in required}
+    else:
+        cohort_windows = {
+            cohort_year: tuple(cohort_quarters(cohort_year, set(source_paths), time_shift))
+            for cohort_year in COHORT_YEARS
+        }
     target_quarters = set(source_paths)
     source_quarters = {shift_year_q(year_q, -time_shift) for year_q in target_quarters}
 
     if path_weighted_mode == 1:
         print("[path] Loading complete CPS-quarter-formulary crosswalk...", flush=True)
     crosswalks = build_plan_crosswalks(spec, time_shift, target_quarters)
-    cohort_windows = {
-        cohort_year: tuple(cohort_quarters(cohort_year, target_quarters, time_shift))
-        for cohort_year in COHORT_YEARS
-    }
     print(
         "[balance] Loading formulary-quarter availability from expanded source...",
         flush=True,
@@ -1956,8 +2052,8 @@ def main() -> None:
         spec,
         formulary_availability=formulary_availability,
     )
-    samples = build_samples(cohort_windows)
-    copay = load_copay_lookup(time_shift)
+    samples = build_samples(cohort_windows, quarter)
+    copay = load_copay_lookup(time_shift) if copay_mode else None
     prefer = load_prefer_lookup(time_shift)
     plan_tier = combine_plan_tier_features(copay, prefer)
     if path_weighted_mode == 1:
@@ -1971,6 +2067,8 @@ def main() -> None:
             chunksize,
             plan_tier,
             samples,
+            quarter,
+            copay_mode,
         )
         return
 

@@ -1,7 +1,8 @@
 r"""
 Purpose:
 Reorganize complete-formulary panel blocks into calendar-quarter files without
-loading any full input block or the combined panel into memory.
+loading any full input block or the combined panel into memory. quarter=0 uses
+annual-event panels; quarter=1 uses quarterly-event panels.
 
 Process:
 1. Stream only YEAR_Q from every configured formulary block to inventory the
@@ -10,13 +11,20 @@ Process:
    matching formulary_panel_YYYYQX.csv output.
 3. Validate that every discovered quarter receives rows and print a concise
    output inventory.  Both passes expose file-level and chunk-level progress.
+   The configured formulary time shift selects matching input/output folders;
+   YEAR_Q is not shifted again here.
 
 Input:
-- data/formulary_panel/formulary_panel_1.csv through
-  data/formulary_panel/formulary_panel_{n_input_blocks}.csv
+- quarter=0, shift_q1: data/formulary_panel/shift_q1/formulary_panel_1.csv
+  through formulary_panel_{n_input_blocks}.csv
+- quarter=1, shift_q1: data/formulary_panel_quarter/shift_q1/formulary_panel_1.csv
+  through formulary_panel_{n_input_blocks}.csv
 
 Output:
-- data/formulary_panel_by_time/formulary_panel_YYYYQX.csv
+- quarter=0, shift_q1:
+  data/formulary_panel_by_time/shift_q1/formulary_panel_YYYYQX.csv
+- quarter=1, shift_q1:
+  data/formulary_panel_quarter_by_time/shift_q1/formulary_panel_YYYYQX.csv
 """
 
 from __future__ import annotations
@@ -40,6 +48,9 @@ QUARTER_PATTERN = re.compile(r"^(\d{4})\s*Q([1-4])$")
 
 
 # ========================== USER CONFIG ==========================
+# quarter:
+# - 0: reorganize annual-event panels; 1: reorganize quarterly-event panels.
+#
 # n_input_blocks:
 # - Must match the number of blocks produced by FormularyPanelMaker.py.
 #
@@ -50,8 +61,9 @@ QUARTER_PATTERN = re.compile(r"^(\d{4})\s*Q([1-4])$")
 # - Must match FormularyPanelMaker.py.  The default 0 preserves existing paths;
 #   nonzero shifts read/write shift-specific subdirectories.
 RUN_CONFIG = {
+    "quarter": 1,
     "n_input_blocks": 30,
-    "chunksize": 1_000_000,
+    "chunksize": 2_000_000,
     "formulary_time_shift_quarters": 1,
 }
 # ===============================================================
@@ -90,26 +102,31 @@ def shift_label(shift_quarters: int) -> str:
     return f"shift_q{shift_quarters:+d}".replace("+", "")
 
 
-def input_dir(shift_quarters: int) -> Path:
+def input_dir(shift_quarters: int, quarter: int = 0) -> Path:
     """Return the source panel directory for one timing specification."""
-    return INPUT_DIR if shift_quarters == 0 else INPUT_DIR / shift_label(shift_quarters)
+    base = INPUT_DIR.with_name("formulary_panel_quarter") if quarter else INPUT_DIR
+    return base if shift_quarters == 0 else base / shift_label(shift_quarters)
 
 
-def output_dir(shift_quarters: int) -> Path:
+def output_dir(shift_quarters: int, quarter: int = 0) -> Path:
     """Return the quarter-organized output directory for one timing specification."""
-    return OUTPUT_DIR if shift_quarters == 0 else OUTPUT_DIR / shift_label(shift_quarters)
+    base = OUTPUT_DIR.with_name("formulary_panel_quarter_by_time") if quarter else OUTPUT_DIR
+    return base if shift_quarters == 0 else base / shift_label(shift_quarters)
 
 
-def validate_config(config: dict) -> tuple[int, int, int]:
+def validate_config(config: dict) -> tuple[int, int, int, int]:
     """Validate and normalize the small run configuration."""
+    quarter = int(config["quarter"])
     n_blocks = int(config["n_input_blocks"])
     chunksize = int(config["chunksize"])
     time_shift = int(config["formulary_time_shift_quarters"])
+    if quarter not in {0, 1}:
+        raise ValueError("quarter must be 0 or 1.")
     if n_blocks < 1:
         raise ValueError("n_input_blocks must be at least 1.")
     if chunksize < 1:
         raise ValueError("chunksize must be at least 1.")
-    return n_blocks, chunksize, time_shift
+    return n_blocks, chunksize, time_shift, quarter
 
 
 def input_paths(source_dir: Path, n_blocks: int) -> list[Path]:
@@ -245,9 +262,9 @@ def route_blocks_by_quarter(
 
 def main() -> None:
     """Run both streaming passes and write one complete file per quarter."""
-    n_blocks, chunksize, time_shift = validate_config(RUN_CONFIG)
-    source_dir = input_dir(time_shift)
-    destination_dir = output_dir(time_shift)
+    n_blocks, chunksize, time_shift, quarter = validate_config(RUN_CONFIG)
+    source_dir = input_dir(time_shift, quarter)
+    destination_dir = output_dir(time_shift, quarter)
     sources = input_paths(source_dir, n_blocks)
     inventory = scan_quarter_inventory(sources, chunksize)
     quarters = all_discovered_quarters(inventory)

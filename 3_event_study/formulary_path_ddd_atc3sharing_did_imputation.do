@@ -17,8 +17,12 @@ set trace off
 // - D:/BoardPharma/data/formulary_path_cohort_data/event/req1/Not/
 //   shift_q{0|1}/{plan|state|county}/
 //   {event}_path_quarter_cohort_{year}.csv
-// - data/formulary_metadata/ndc_first_seen.csv
-// - I/O behavior: for each event, the five cohort CSVs are imported once and
+// - quarter_event=1: data/formulary_path_cohort_data_quarter/event/req1/Not/
+//   shift_q{0|1}/{plan|state|county}/
+//   {event}_path_quarter_cohort_{year}Q{quarter}.csv
+// - data/formulary_metadata/ndc_first_seen[_quarter][_shift_q{N}].csv,
+//   matching the selected event mode and formulary time shift
+// - I/O behavior: for each event, the cohort CSVs are imported once and
 //   cached as a temporary Stata dataset after the first-seen filter. Each
 //   direction-by-outcome regression reloads that temporary dataset from disk;
 //   the original CSVs are not read again within the same event.
@@ -33,14 +37,16 @@ set trace off
 // ================================================================
 
 * ================= user config =================
-local events to_B_still_in_A
-* to_B_not_in_A interlock_dissolution
-local treatment_groups A B
-local targets included tier_raw tier_upgrade tier_downgrade avg_copay_amt prefer
+local events to_B_still_in_A to_B_not_in_A interlock_dissolution
+local treatment_groups B A
+local targets avg_copay_amt
+* included tier_raw tier_upgrade tier_downgrade prefer
 * Uniformly sample this fraction of distinct history_id paths inside each cohort.
 * Sampling is independent of n_path; 1 keeps every path and 0 keeps none.
-local path_sample_fraction 1
+local path_sample_fraction 0.3
 local path_sample_seed 20260818
+* 1 uses event-quarter cohorts; 0 retains the event-year cohort design.
+local quarter_event 1
 local outlier_treatment winsorize
 local outlier_percentile p95
 local req 1
@@ -91,6 +97,10 @@ if !inrange(`path_sample_fraction', 0, 1) {
     di as error "path_sample_fraction must be between 0 and 1."
     exit 198
 }
+if !inlist(`quarter_event', 0, 1) {
+    di as error "quarter_event must be 0 or 1."
+    exit 198
+}
 
 * ================= paths and dependencies =================
 local code_path "`c(pwd)'"
@@ -100,11 +110,15 @@ local project_path = subinstr("`project_path'", "\\", "/", .)
 
 local path_data_root "D:/BoardPharma/data"
 local data_path "`path_data_root'/formulary_path_cohort_data/event/req1/Not/shift_q`formulary_time_shift_quarters'/`source_level'"
+if `quarter_event' == 1 {
+    local data_path "`project_path'/data/formulary_path_cohort_data_quarter/event/req1/Not/shift_q`formulary_time_shift_quarters'/`source_level'"
+}
 local panel_suffix "_planpath"
 local panel_label "planpath_ndc"
 local panel_level "quarter_planpath"
 local unit_label "Unique Formulary-Path-NDC-Cohorts"
 local import_stringcols "1 6/9"
+if `quarter_event' == 1 local import_stringcols "1 8/11"
 local sample_spec "baseline"
 if `formulary_time_shift_quarters' != 0 | `first_seen_year_offset' != 0 | `first_seen_quarter' != 1 {
     local seen_offset "`first_seen_year_offset'"
@@ -115,6 +129,7 @@ if `path_sample_fraction' < 1 {
     local path_sample_label = subinstr("`path_sample_fraction'", ".", "p", .)
     local sample_spec "`sample_spec'_pathsample`path_sample_label'"
 }
+if `quarter_event' == 1 local sample_spec "`sample_spec'_quarter_event"
 local spec_folder "req1_not_wsp95_fe`fe_level'_firm`panel_suffix'"
 local csv_root "`project_path'/csv/formulary_path/ddd"
 local tex_root "`project_path'/tex/formulary_path/ddd"
@@ -139,7 +154,12 @@ foreach command in did_imputation esttab estadd {
     }
 }
 
-local first_seen_file "`project_path'/data/formulary_metadata/ndc_first_seen.csv"
+local first_seen_stem "ndc_first_seen"
+if `quarter_event' == 1 local first_seen_stem "ndc_first_seen_quarter"
+if `formulary_time_shift_quarters' != 0 {
+    local first_seen_stem "`first_seen_stem'_shift_q`formulary_time_shift_quarters'"
+}
+local first_seen_file "`project_path'/data/formulary_metadata/`first_seen_stem'.csv"
 capture confirm file "`first_seen_file'"
 if _rc {
     di as error "Missing first-seen metadata: `first_seen_file'"
@@ -174,8 +194,29 @@ program define _post_planpath_ddd_estimates, eclass
 end
 
 * ================= estimation loop =================
+local retained_outcomes included tier_upgrade tier_downgrade prefer `targets'
+local retained_outcomes : list uniq retained_outcomes
+local cohort_required_vars "data_cohort"
+if `quarter_event' == 1 {
+    local cohort_required_vars "data_cohort_year data_cohort_quarter data_cohort_qtime"
+}
 set seed `path_sample_seed'
 foreach event of local events {
+    local cohort_list "2020 2021 2022 2023 2024"
+    if `quarter_event' == 1 {
+        local cohort_list ""
+        forvalues cohort_year = 2020/2024 {
+            forvalues cohort_quarter = 1/4 {
+                local cohort_tag "`cohort_year'Q`cohort_quarter'"
+                capture confirm file "`data_path'/`event'_path_quarter_cohort_`cohort_tag'.csv"
+                if !_rc local cohort_list "`cohort_list' `cohort_tag'"
+            }
+        }
+        if "`cohort_list'" == "" {
+            di as error "No quarterly path cohort files for `event' in `data_path'."
+            exit 601
+        }
+    }
     if "`event'" == "to_B_not_in_A" {
         local imported_share_a "event_to_b_not_in_a_a_sharingatc"
         local imported_share_b "event_to_b_not_in_a_b_sharingatc"
@@ -199,7 +240,7 @@ foreach event of local events {
     }
 
     local first 1
-    foreach cohort in 2020 2021 2022 2023 2024 {
+    foreach cohort of local cohort_list {
         local data_file "`data_path'/`event'_path_quarter_cohort_`cohort'.csv"
         capture confirm file "`data_file'"
         if _rc {
@@ -209,8 +250,8 @@ foreach event of local events {
         import delimited "`data_file'", clear varnames(1) case(lower) ///
             stringcols(`import_stringcols')
         foreach variable in history_id n_path n_path_copay n_path_prefer ndc boardname ///
-            year quarter data_cohort treated_a treated_b sample_a sample_b ///
-            `panel_event_vars' `imported_share_a' `imported_share_b' `targets' {
+            year quarter `cohort_required_vars' treated_a treated_b sample_a sample_b ///
+            `panel_event_vars' `imported_share_a' `imported_share_b' `retained_outcomes' {
             capture confirm variable `variable'
             if _rc {
                 di as error "Missing variable `variable' in `data_file'"
@@ -219,9 +260,23 @@ foreach event of local events {
         }
         rename `imported_share_a' cohort_sharing_a
         rename `imported_share_b' cohort_sharing_b
-        foreach variable in year quarter data_cohort n_path n_path_copay n_path_prefer ///
+        if `quarter_event' == 1 {
+            foreach cohort_var in data_cohort_year data_cohort_quarter data_cohort_qtime {
+                capture confirm numeric variable `cohort_var'
+                if _rc destring `cohort_var', replace
+            }
+            gen long data_cohort = data_cohort_qtime
+        }
+        else {
+            capture confirm numeric variable data_cohort
+            if _rc destring data_cohort, replace
+            gen int data_cohort_year = data_cohort
+            gen byte data_cohort_quarter = 1
+            gen long data_cohort_qtime = data_cohort * 4 + 1
+        }
+        foreach variable in year quarter data_cohort data_cohort_year data_cohort_quarter data_cohort_qtime n_path n_path_copay n_path_prefer ///
             treated_a treated_b sample_a sample_b `panel_event_vars' ///
-            cohort_sharing_a cohort_sharing_b `targets' {
+            cohort_sharing_a cohort_sharing_b `retained_outcomes' {
             capture confirm numeric variable `variable'
             if _rc destring `variable', replace
         }
@@ -236,7 +291,13 @@ foreach event of local events {
         assert n_path > 0 & n_path == floor(n_path)
         assert n_path_copay >= 0 & n_path_copay <= n_path & n_path_copay == floor(n_path_copay)
         assert n_path_prefer >= 0 & n_path_prefer <= n_path & n_path_prefer == floor(n_path_prefer)
-        assert data_cohort == `cohort'
+        if `quarter_event' == 1 {
+            assert data_cohort_year == real(substr("`cohort'", 1, 4))
+            assert data_cohort_quarter == real(substr("`cohort'", 6, 1))
+            assert data_cohort == 4 * data_cohort_year + data_cohort_quarter
+            assert data_cohort_qtime == data_cohort
+        }
+        else assert data_cohort == `cohort'
 
         * Draw paths uniformly within the cohort.  Every NDC and quarter on a
         * selected path is retained; n_path never affects the draw.
@@ -254,8 +315,8 @@ foreach event of local events {
                 __path_selected __path_selected_all
         }
         keep history_id n_path n_path_copay n_path_prefer ndc boardname ///
-            year quarter data_cohort treated_a treated_b sample_a sample_b ///
-            `panel_event_vars' cohort_sharing_a cohort_sharing_b `targets'
+            year quarter data_cohort data_cohort_year data_cohort_quarter data_cohort_qtime treated_a treated_b sample_a sample_b ///
+            `panel_event_vars' cohort_sharing_a cohort_sharing_b `retained_outcomes'
         if `first' {
             tempfile event_master
             save `event_master', replace
@@ -268,11 +329,21 @@ foreach event of local events {
     }
 
     use `event_master', clear
-    merge m:1 ndc using `first_seen_metadata', keepusing(first_seen_qtime)
+    * Retain cohort rows only; the lookup also contains NDCs outside this event.
+    merge m:1 ndc using `first_seen_metadata', ///
+        keep(master match) keepusing(first_seen_qtime)
     assert _merge == 3
     drop _merge
     gen long first_seen_cutoff = ///
-        (data_cohort + `first_seen_year_offset') * 4 + `first_seen_quarter'
+        (data_cohort_year + `first_seen_year_offset') * 4 + ///
+        cond(`quarter_event' == 1, data_cohort_quarter, `first_seen_quarter')
+    if `quarter_event' == 1 {
+        * Match the cohort maker's cutoff at the first available window quarter.
+        gen long observed_qtime = 4 * year + quarter
+        bysort data_cohort: egen long first_observed_qtime = min(observed_qtime)
+        replace first_seen_cutoff = max(first_seen_cutoff, first_observed_qtime)
+        drop observed_qtime first_observed_qtime
+    }
     keep if first_seen_qtime <= first_seen_cutoff
     drop first_seen_qtime first_seen_cutoff
     compress
@@ -285,15 +356,6 @@ foreach event of local events {
     assert inlist(__always_included, 0, 1)
     keep if __always_included == 1
     drop __always_included
-    sort history_id ndc data_cohort year quarter
-    by history_id ndc data_cohort: gen byte __first_window_quarter = _n == 1
-    foreach tier_change in tier_upgrade tier_downgrade {
-        assert !missing(`tier_change') | __first_window_quarter
-        replace `tier_change' = 0 if missing(`tier_change') & __first_window_quarter
-        assert !missing(`tier_change')
-    }
-    assert !missing(tier_raw)
-    drop __first_window_quarter
     compress
     tempfile event_master_always_included
     save `event_master_always_included', replace
@@ -333,6 +395,14 @@ foreach event of local events {
             }
             else {
                 use `event_master_always_included', clear
+                if inlist("`target'", "tier_upgrade", "tier_downgrade") {
+                    sort history_id ndc data_cohort year quarter
+                    by history_id ndc data_cohort: gen byte __first_window_quarter = _n == 1
+                    assert !missing(`target') | __first_window_quarter
+                    replace `target' = 0 if missing(`target') & __first_window_quarter
+                    assert !missing(`target')
+                    drop __first_window_quarter
+                }
                 * Coverage alone does not guarantee complete copay/prefer data.
                 * Balance the path-NDC panel separately for the current outcome.
                 bysort history_id ndc data_cohort: egen byte __target_complete = ///
@@ -361,9 +431,9 @@ foreach event of local events {
 
             tempvar q1_share_min q1_share_max
             bysort ndc boardname data_cohort: egen byte `q1_share_min' = ///
-                min(cond(year == data_cohort & quarter == 1, `sharing_source', .))
+                min(cond(year == data_cohort_year & quarter == data_cohort_quarter, `sharing_source', .))
             bysort ndc boardname data_cohort: egen byte `q1_share_max' = ///
-                max(cond(year == data_cohort & quarter == 1, `sharing_source', .))
+                max(cond(year == data_cohort_year & quarter == data_cohort_quarter, `sharing_source', .))
             assert !missing(`q1_share_min') & `q1_share_min' == `q1_share_max'
             gen byte atc_sharing = `q1_share_max'
             replace atc_sharing = 0 if treat == 0
@@ -396,14 +466,25 @@ foreach event of local events {
             egen long id = group(history_id ndc data_cohort)
             egen long history_cohort_q = group(history_id data_cohort q_time)
             isid id q_time
-            gen byte expected_quarters = 12
-            replace expected_quarters = 11 if `formulary_time_shift_quarters' == 1 & data_cohort == 2020
-            replace expected_quarters = 11 if `formulary_time_shift_quarters' == 0 & data_cohort == 2024
-            bysort id: assert _N == expected_quarters[1]
-            drop expected_quarters
-            gen int event_cohort_q = yq(data_cohort, 1) if treat == 1
+            if `quarter_event' == 1 {
+                bysort data_cohort: egen int window_start = min(q_time)
+                bysort data_cohort: egen int window_end = max(q_time)
+                assert window_start >= yq(data_cohort_year, data_cohort_quarter) - 4
+                assert window_end <= yq(data_cohort_year, data_cohort_quarter) + 7
+                bysort id (q_time): assert _N == window_end[1] - window_start[1] + 1
+                bysort id (q_time): assert q_time == window_start[1] + _n - 1
+                drop window_start window_end
+            }
+            else {
+                gen byte expected_quarters = 12
+                replace expected_quarters = 11 if `formulary_time_shift_quarters' == 1 & data_cohort == 2020
+                replace expected_quarters = 11 if `formulary_time_shift_quarters' == 0 & data_cohort == 2024
+                bysort id: assert _N == expected_quarters[1]
+                drop expected_quarters
+            }
+            gen int event_cohort_q = yq(data_cohort_year, data_cohort_quarter) if treat == 1
             format event_cohort_q %tq
-            gen byte pre_period = q_time < yq(data_cohort, 1)
+            gen byte pre_period = q_time < yq(data_cohort_year, data_cohort_quarter)
             bysort id (q_time): assert treat == treat[1]
             bysort id (q_time): assert atc_sharing == atc_sharing[1]
 

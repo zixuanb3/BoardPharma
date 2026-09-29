@@ -5,7 +5,7 @@ This repository contains the code for the empirical analysis of director mobilit
 - **SSR:** annual and quarterly firm-product panels used to estimate the effects of director-movement and interlock events on product-market outcomes.
 - **Formulary:** formulary, drug-firm, geographic, and plan-level panels used to estimate the effects of the same events on drug inclusion, tier placement, and cost sharing.
 
-Both pipelines construct event-level data from BoardEx director-board affiliations and BoardEx firm-pair interlock records. They differ only in the outcome data and downstream analysis unit.
+Both pipelines construct event-level data from BoardEx director-board affiliations. They differ in event timing, outcome data, and downstream analysis unit.
 
 ## Repository Structure
 
@@ -91,9 +91,9 @@ The principal movement events are `to_B_not_in_A`, `to_B_still_in_A`, and `inter
 ### BoardEx Event Inputs
 
 - `InterimData/boardex_pharma.dta`: BoardEx director-board affiliations.
-- `InterimData/boardex_interlock_direct_firmpair.dta`: direct interlock pairs.
-- `InterimData/boardex_interlock_indirect_firmpair.dta`: indirect interlock pairs.
 - `InterimData/formulary_company_roster.csv`: company universe used to restrict BoardEx-derived event construction to the formulary sample.
+- `data/boardex/individual_employment_record.csv` and `organization_composition_record.csv`: quarterly BoardEx role records produced by `BoardexRecordMaker.py`.
+- `data/formulary_roster/formulary_roster_2019_2025.csv`: quarterly formulary director roster produced by `FormularyRosterMaker.py`.
 
 ### Formulary, Plan, and Geographic Inputs
 
@@ -105,12 +105,13 @@ The principal movement events are `to_B_not_in_A`, `to_B_still_in_A`, and `inter
 
 ## Event Construction and Formulary Panel
 
-The Formulary pipeline uses `RawEventTableMaker.py` and `EventTableMaker.py` with the formulary company roster. The resulting `movement_event_candidates_formulary_*` and `movement_table_formulary_*` files retain BoardEx-derived event timing, event requirements, and directional firm-pair information.
+The Formulary pipeline uses `RawEventTableMaker.py` and `EventTableMaker.py` with either the annual company roster or the quarterly director roster. The resulting `movement_event_candidates_formulary_*` and `movement_table_formulary_*` files retain event timing, requirements, and directional firm-pair information. Quarterly events use their observed quarter and support `req0` and `req1`; annual events also support `req2`.
 
 The core construction sequence is:
 
 ```text
-BoardEx event tables + expanded formulary data
+BoardEx records → quarterly roster → movement event tables
+                              + expanded formulary data
         ↓
 FormularyPanelMaker.py
         ↓
@@ -119,24 +120,24 @@ ReorganizeFormularyData.py
 Drug-firm, geographic, and plan-level cohort builders
 ```
 
-1. `1_data_prep/FormularyPanelMaker.py` processes the expanded formulary data in complete-formulary blocks. It merges event and balance variables, constructs tier and ATC1-ATC4-sharing measures, and records the first quarter in which each NDC is included. It writes `data/formulary_panel/` block files and `data/formulary_metadata/ndc_first_seen*.csv`.
+1. `1_data_prep/FormularyPanelMaker.py` processes the expanded formulary data in complete-formulary blocks. It merges event and balance variables, constructs tier and ATC1-ATC4-sharing measures, and records the first quarter in which each NDC is included. Annual and quarterly event modes write separate `data/formulary_panel/` and `data/formulary_panel_quarter/` block files and matching `data/formulary_metadata/ndc_first_seen*.csv` files.
 
-2. `1_data_prep/ReorganizeFormularyData.py` rewrites the block-level panel into quarter-specific `formulary_panel_YYYYQX.csv` files. It supports separate paths for alternative timing-alignment specifications.
+2. `1_data_prep/ReorganizeFormularyData.py` rewrites the block-level panel into quarter-specific `formulary_panel_YYYYQX.csv` files. Annual and quarterly event modes use separate output directories, with timing-shift subdirectories where configured.
 
 ## Cohort Construction
 
-1. `1_data_prep/FormularyCohortPanelMaker.py` aggregates quarterly observations to NDC-firm outcomes. It constructs inclusion counts and shares, mean tier measures, balanced event cohorts, and direction-specific treatment, sample, and ATC3-sharing indicators.
+1. `1_data_prep/FormularyCohortPanelMaker.py` aggregates quarterly observations to NDC-firm outcomes. It constructs inclusion counts and shares, mean tier measures, balanced event cohorts, and direction-specific treatment, sample, and ATC3-sharing indicators. Quarterly event cohorts use the observed event quarter, four pre-event quarters, and eight event/post-event quarters.
 
 2. `1_data_prep/FormularyStateInsurerCohortPanelMaker.py` extends the NDC-firm cohort design to state, CMS Parent Organization, and joint state-insurer cells. It uses plan information, CMS directory data, and regional crosswalks for geographic assignment.
 
-3. `1_data_prep/PlanPanelMaker.py` constructs balanced and reproducibly sampled contract-plan-segment-drug cohorts at plan, state, and county level. It combines formulary outcomes with tier transitions and cost-sharing measures.
+3. `1_data_prep/PlanPanelMaker.py` constructs balanced and reproducibly sampled contract-plan-segment-drug cohorts at plan, state, and county level. Its path-weighted mode supports annual and quarterly event cohorts; copay matching is configurable.
 
 NDC eligibility is defined by the global first quarter in which `included=1`. Eligible NDCs retain their complete cohort histories under the selected timing-alignment specification.
 
 ## Descriptive Statistics
 
 - `2_stats/FormularyPanelStats.py` produces block-level coverage, event-incidence, and event-by-ATC-sharing summaries.
-- `2_stats/FormularyPanelEventStats.py` constructs annual Q1 diagnostics for event firms and NDCs by ATC1-ATC4-sharing status.
+- `2_stats/FormularyPanelEventStats.py` constructs annual Q1 or event-quarter diagnostics for event firms and NDCs by ATC1-ATC4-sharing status.
 
 ## Estimation
 
@@ -144,8 +145,9 @@ NDC eligibility is defined by the global first quarter in which `included=1`. El
 - `3_event_study/formulary_ddd_atc3sharing_did_imputation.do` estimates ATC3-sharing triple differences for those panels.
 - `3_event_study/formulary_plan_did_imputation_event_study.do` estimates dynamic models for contract-plan-drug cohorts at plan, state, and county level.
 - `3_event_study/formulary_plan_ddd_atc3sharing_did_imputation.do` estimates plan-level ATC3-sharing triple differences.
+- `3_event_study/formulary_path_did_imputation_event_study.do` and `formulary_path_ddd_atc3sharing_did_imputation.do` estimate path-weighted models from annual or quarterly event cohorts.
 
-The Formulary estimation programs stack event-year cohorts, implement direction-specific treatment definitions, classify ATC3 sharing at cohort-year Q1, apply the relevant NDC first-seen eligibility rule, and estimate `did_imputation` models with firm-level clustering. Dynamic programs export coefficients, autosample statistics, figures, and logs. Triple-difference programs additionally export result tables and sample summaries.
+The Formulary estimation programs stack event cohorts, implement direction-specific treatment definitions, classify ATC3 sharing at the cohort event time, apply the relevant NDC first-seen eligibility rule, and estimate `did_imputation` models with firm-level clustering. Dynamic programs export coefficients, autosample statistics, figures, and logs. Triple-difference programs additionally export result tables and sample summaries.
 
 ## Detailed Script Reference
 

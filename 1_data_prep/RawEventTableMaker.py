@@ -1,39 +1,45 @@
 """
 Purpose:
-Build raw event-candidate tables for director movement, direct interlock, and
-indirect interlock events.
+Build annual or quarterly director-movement candidates and membership-derived
+firm-interlock panels. Quarterly mode supports the formulary narrow roster;
+annual mode retains the existing sample and personnel definitions.
 
 Process:
-1. Load in-SSR BoardEx director-board memberships from `boardex_pharma.dta`.
-2. Build complete director-year board histories and derive movement events.
-3. Derive yearly firm-interlock edges from those director memberships.
-4. Add independent `stay`, `requirement1`, and `requirement2` flags to movement
-   candidates. No flag is forced to zero because another flag fails.
-5. Load direct and indirect interlock source files, then keep only pairs where
-   both firms appear in `boardex_ssr_price_sample.csv`.
-6. Add independent `stay`, `requirement1`, and `requirement2` flags to direct
-   and indirect interlock candidates.
-7. Combine direct and indirect interlock candidates into one output table,
-   using `event_type` to distinguish `direct_interlock` from
-   `indirect_interlock`.
-8. Write all raw event tables to `data/event_tables`.
+1. Select the membership input. When quarter=0, use the existing annual sample
+   settings. When quarter=1, require formulary=1, ignore large_sample, and load
+   the audited quarterly roster with personnel_definition="narrow".
+2. Deduplicate memberships, complete director-period histories, and compare
+   adjacent years or quarters to identify the three movement event types.
+3. Derive firm-interlock edges from all selected directors' memberships and
+   use the in-memory lookup to calculate each candidate's requirement1.
+4. In annual mode, calculate stay and requirement2 with the existing rules.
+   In quarterly mode, convert stay_x_years to four times as many consecutive
+   quarters: two years means eight quarters, forward for joins and backward
+   for dissolution. Skip requirement2 and its window truncation.
+5. Write the interlock panel and movement candidates to data/event_tables.
+   Quarterly panels add quarter; candidates add event_quarter and use
+   stay_8_quarters at the default two-year setting.
+6. The separate direct/indirect interlock candidate job remains disabled.
 
 Input:
-- InterimData/boardex_pharma.dta
-- InterimData/ssr_company_roster.csv when RUN_CONFIG["large_sample"] == 1
-- InterimData/formulary_company_roster.csv when RUN_CONFIG["formulary"] == 1
-- InterimData/boardex_ssr_price_sample.csv
-- InterimData/boardex_interlock_indirect_firmpair.dta
-- InterimData/boardex_interlock_direct_firmpair.dta
+- InterimData/boardex_pharma.dta when quarter=0 and large_sample=0
+- InterimData/ssr_company_roster.csv when quarter=0, large_sample=1, formulary=0
+- InterimData/formulary_company_roster.csv when quarter=0 and formulary=1
+- data/formulary_roster/formulary_roster_2019_2025.csv when quarter=1 and formulary=1
+- InterimData/boardex_ssr_price_sample.csv (disabled independent interlock job)
+- InterimData/boardex_interlock_indirect_firmpair.dta (disabled independent interlock job)
+- InterimData/boardex_interlock_direct_firmpair.dta (disabled independent interlock job)
 
 Output:
-- data/event_tables/firm_interlock_panel.csv
-- data/event_tables/movement_event_candidates.csv
-- data/event_tables/firm_interlock_panel_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
-- data/event_tables/movement_event_candidates_large_sample_{definition}.csv when RUN_CONFIG["large_sample"] == 1
-- data/event_tables/firm_interlock_panel_formulary_large_sample_{definition}.csv when RUN_CONFIG["formulary"] == 1
-- data/event_tables/movement_event_candidates_formulary_large_sample_{definition}.csv when RUN_CONFIG["formulary"] == 1
-- data/event_tables/interlock_event_candidates.csv
+- data/event_tables/firm_interlock_panel.csv when quarter=0 and large_sample=0
+- data/event_tables/movement_event_candidates.csv when quarter=0 and large_sample=0
+- data/event_tables/firm_interlock_panel_large_sample_{definition}.csv when quarter=0, large_sample=1, formulary=0
+- data/event_tables/movement_event_candidates_large_sample_{definition}.csv when quarter=0, large_sample=1, formulary=0
+- data/event_tables/firm_interlock_panel_formulary_large_sample_{definition}.csv when quarter=0 and formulary=1
+- data/event_tables/movement_event_candidates_formulary_large_sample_{definition}.csv when quarter=0 and formulary=1
+- data/event_tables/firm_interlock_panel_formulary_quarter_narrow.csv when quarter=1 and formulary=1
+- data/event_tables/movement_event_candidates_formulary_quarter_narrow.csv when quarter=1 and formulary=1
+- data/event_tables/interlock_event_candidates.csv (disabled independent interlock job)
 """
 
 from __future__ import annotations
@@ -53,21 +59,25 @@ OUTPUT_DIR = PROJECT_ROOT / "data" / "event_tables"
 PHARMA_PATH = INTERIM_DATA_PATH / "boardex_pharma.dta"
 LARGE_SAMPLE_ROSTER_PATH = INTERIM_DATA_PATH / "ssr_company_roster.csv"
 FORMULARY_ROSTER_PATH = INTERIM_DATA_PATH / "formulary_company_roster.csv"
+FORMULARY_QUARTER_ROSTER_PATH = (
+    PROJECT_ROOT / "data" / "formulary_roster" / "formulary_roster_2019_2025.csv"
+)
 SSR_SAMPLE_PATH = INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv"
 INDIRECT_INPUT_PATH = INTERIM_DATA_PATH / "boardex_interlock_indirect_firmpair.dta"
 DIRECT_INPUT_PATH = INTERIM_DATA_PATH / "boardex_interlock_direct_firmpair.dta"
 
 INTERLOCK_CANDIDATES_PATH = OUTPUT_DIR / "interlock_event_candidates.csv"
 
-PairYearSet = set[tuple[str, str, int]]
+PairPeriodSet = set[tuple[str, str, int]]
 CounterpartLookup = dict[tuple[str, int], set[str]]
 
 
 # ========================== USER CONFIG ==========================
 RUN_CONFIG = {
+    "quarter": 1,  # 0: existing annual workflow; 1: formulary quarters only.
     "stay_x_years": 2,
-    "requirement2_window": (-1, 1),
-    "large_sample": 1,
+    "requirement2_window": (-1, 1),  # Annual mode only.
+    "large_sample": 1,  # Ignored when quarter=1.
     "formulary": 1,
     "personnel_definition": "narrow",
 }
@@ -96,7 +106,7 @@ def build_counterpart_lookup(
 
 
 class MovementEventBuilder:
-    """Build director-movement events from in-SSR BoardEx membership histories."""
+    """Build annual or quarterly movement events from board membership histories."""
 
     PERSONNEL_TIERS = {
         "narrow": {"board"},
@@ -108,12 +118,19 @@ class MovementEventBuilder:
         self,
         input_path: Path,
         stay_x_years: int,
-        requirement2_window: tuple[int, int],
+        requirement2_window: tuple[int, int] | None,
         large_sample: int = 0,
         personnel_definition: str = "narrow",
+        quarter: int = 0,
     ) -> None:
         """Store movement-event configuration and derive stay-window lengths."""
-        if large_sample not in {0, 1}:
+        if quarter not in {0, 1}:
+            raise ValueError("quarter must be 0 or 1")
+        if stay_x_years < 1:
+            raise ValueError("stay_x_years must be >= 1")
+        if quarter and personnel_definition != "narrow":
+            raise ValueError("Quarterly formulary roster supports narrow personnel only")
+        if not quarter and large_sample not in {0, 1}:
             raise ValueError("large_sample must be 0 or 1")
         if large_sample == 1 and personnel_definition not in self.PERSONNEL_TIERS:
             raise ValueError("personnel_definition must be one of: narrow, medium, broad")
@@ -123,118 +140,154 @@ class MovementEventBuilder:
         self.requirement2_window = requirement2_window
         self.large_sample = large_sample
         self.personnel_definition = personnel_definition
-        self.stay_col = f"stay_{stay_x_years}_years"
+        self.quarter = quarter
+        if quarter:
+            self.stay_col = f"stay_{stay_x_years * 4}_quarters"
+            self.forward_stay_periods = self.backward_stay_periods = stay_x_years * 4
+        else:
+            self.stay_col = f"stay_{stay_x_years}_years"
+            if requirement2_window is None:
+                raise ValueError("Annual mode requires requirement2_window")
+            start_offset, end_offset = requirement2_window
+            self.forward_stay_periods = min(stay_x_years, max(0, end_offset) + 1)
+            self.backward_stay_periods = min(stay_x_years, max(0, -start_offset))
 
-        start_offset, end_offset = requirement2_window
-        self.forward_stay_years = min(stay_x_years, max(0, end_offset) + 1)
-        self.backward_stay_years = min(stay_x_years, max(0, -start_offset))
+    def load_quarter_memberships(self) -> pd.DataFrame:
+        """Deduplicate roster seats and encode quarters as consecutive integers."""
+        memberships = pd.read_csv(
+            self.input_path,
+            usecols=["DirectorID", "CompanyID", "BoardName", "Year", "Quarter"],
+            dtype={"DirectorID": "Int64", "CompanyID": "Int64",
+                   "Year": "Int64", "Quarter": "Int64", "BoardName": "string"},
+        )
+        if memberships.isna().any().any():
+            raise ValueError("Quarterly roster has missing identity or time fields")
+        if not memberships["Quarter"].isin([1, 2, 3, 4]).all():
+            raise ValueError("Quarter must be 1, 2, 3, or 4")
+        memberships["BoardName"] = memberships["BoardName"].str.strip().str.upper()
+        if memberships["BoardName"].eq("").any():
+            raise ValueError("Quarterly roster contains blank BoardName")
+        company_names = memberships[["CompanyID", "BoardName"]].drop_duplicates()
+        if (company_names["CompanyID"].duplicated().any()
+                or company_names["BoardName"].duplicated().any()):
+            raise ValueError("Quarterly CompanyID and BoardName must map one-to-one")
+        # The shared transition engine operates on consecutive integer periods.
+        memberships["period"] = (
+            (memberships["Year"] - 1960) * 4 + memberships["Quarter"] - 1
+        ).astype("int64")
+        memberships["DirectorID"] = memberships["DirectorID"].astype("int64")
+        return memberships[["DirectorID", "period", "BoardName"]].drop_duplicates()
 
     def build(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Return movement candidates and membership-derived firm-interlock edges."""
-        # 1) Load movement source universe.
-        if self.large_sample == 1:
-            memberships = pd.read_csv(
-                self.input_path,
-                usecols=["DirectorID", "year", "BoardName", "inSSR", "leader_tier"],
-            )
-            memberships = memberships.loc[
-                memberships["leader_tier"].isin(self.PERSONNEL_TIERS[self.personnel_definition])
-            ].copy()
+        if self.quarter:
+            memberships = self.load_quarter_memberships()
         else:
-            memberships = pd.read_stata(
-                self.input_path,
-                columns=["DirectorID", "year", "BoardName", "inSSR"],
-            )
-        memberships = memberships.dropna(subset=["DirectorID", "year", "BoardName"])
-        # Movement events are defined only on directors' in-SSR board seats.
-        memberships = memberships.loc[
-            memberships["inSSR"].eq(1),
-            ["DirectorID", "year", "BoardName"],
-        ].copy()
-        memberships["year"] = memberships["year"].astype(int)
-        memberships["BoardName"] = memberships["BoardName"].astype(str).str.upper()
-        memberships = memberships.drop_duplicates(subset=["DirectorID", "year", "BoardName"])
+            # 1) Load movement source universe.
+            if self.large_sample == 1:
+                memberships = pd.read_csv(
+                    self.input_path,
+                    usecols=["DirectorID", "year", "BoardName", "inSSR", "leader_tier"],
+                )
+                memberships = memberships.loc[
+                    memberships["leader_tier"].isin(self.PERSONNEL_TIERS[self.personnel_definition])
+                ].copy()
+            else:
+                memberships = pd.read_stata(
+                    self.input_path,
+                    columns=["DirectorID", "year", "BoardName", "inSSR"],
+                )
+            memberships = memberships.dropna(subset=["DirectorID", "year", "BoardName"])
+            # Movement events are defined only on directors' in-SSR board seats.
+            memberships = memberships.loc[
+                memberships["inSSR"].eq(1),
+                ["DirectorID", "year", "BoardName"],
+            ].copy()
+            memberships["year"] = memberships["year"].astype(int)
+            memberships["BoardName"] = memberships["BoardName"].astype(str).str.upper()
+            memberships = memberships.drop_duplicates(subset=["DirectorID", "year", "BoardName"])
+            memberships = memberships.rename(columns={"year": "period"})
 
-        # 2) Collapse each director-year to a sorted board list, then complete
-        #    each timeline from min_year - 1 through one year after its
-        #    max_year, capped at the sample's final observed year.
+        # 2) Collapse each director-period to a sorted board list, then complete
+        #    each timeline from min_period - 1 through one period after its
+        #    max_period, capped at the sample's final observed period.
         board_lists = (
-            memberships.groupby(["DirectorID", "year"], as_index=False)
+            memberships.groupby(["DirectorID", "period"], as_index=False)
             .agg(board_list=("BoardName", lambda values: sorted(pd.unique(values.dropna()).tolist())))
-            .sort_values(["DirectorID", "year"])
+            .sort_values(["DirectorID", "period"])
             .reset_index(drop=True)
         )
         if board_lists.empty:
-            complete_history = pd.DataFrame(columns=["DirectorID", "year", "board_list"])
+            complete_history = pd.DataFrame(columns=["DirectorID", "period", "board_list"])
         else:
-            sample_max_year = int(board_lists["year"].max())
-            year_bounds = board_lists.groupby("DirectorID", as_index=False)["year"].agg(
-                min_year="min",
-                max_year="max",
+            sample_max_period = int(board_lists["period"].max())
+            period_bounds = board_lists.groupby("DirectorID", as_index=False)["period"].agg(
+                min_period="min",
+                max_period="max",
             )
             skeleton = pd.concat(
                 [
                     pd.DataFrame(
                         {
                             "DirectorID": director_id,
-                            "year": range(
-                                int(min_year) - 1,
-                                min(int(max_year) + 1, sample_max_year) + 1,
+                            "period": range(
+                                int(min_period) - 1,
+                                min(int(max_period) + 1, sample_max_period) + 1,
                             ),
                         }
                     )
-                    for director_id, min_year, max_year in year_bounds.itertuples(index=False, name=None)
+                    for director_id, min_period, max_period in period_bounds.itertuples(index=False, name=None)
                 ],
                 ignore_index=True,
             )
-            complete_history = skeleton.merge(board_lists, on=["DirectorID", "year"], how="left")
-            complete_history = complete_history.sort_values(["DirectorID", "year"]).reset_index(drop=True)
+            complete_history = skeleton.merge(board_lists, on=["DirectorID", "period"], how="left")
+            complete_history = complete_history.sort_values(["DirectorID", "period"]).reset_index(drop=True)
             complete_history["board_list"] = complete_history["board_list"].apply(
                 lambda value: value if isinstance(value, list) else []
             )
 
         # 3) Build membership-derived firm interlocks. The internal lookup is
         #    undirected; the output edge table is directed and firm-centered.
-        pair_year_set: PairYearSet = set()
-        for year, board_list in complete_history[["year", "board_list"]].itertuples(index=False, name=None):
-            pair_year_set.update(
-                (firm_a, firm_b, int(year))
+        pair_period_set: PairPeriodSet = set()
+        for period, board_list in complete_history[["period", "board_list"]].itertuples(index=False, name=None):
+            pair_period_set.update(
+                (firm_a, firm_b, int(period))
                 for firm_a, firm_b in combinations(sorted(board_list), 2)
             )
 
         edge_rows = [
-            {"BoardName": firm_a, "year": year, "CounterpartBoard": firm_b}
-            for firm_a, firm_b, year in sorted(pair_year_set)
+            {"BoardName": firm_a, "period": period, "CounterpartBoard": firm_b}
+            for firm_a, firm_b, period in sorted(pair_period_set)
         ] + [
-            {"BoardName": firm_b, "year": year, "CounterpartBoard": firm_a}
-            for firm_a, firm_b, year in sorted(pair_year_set)
+            {"BoardName": firm_b, "period": period, "CounterpartBoard": firm_a}
+            for firm_a, firm_b, period in sorted(pair_period_set)
         ]
         firm_interlock_edges = (
-            pd.DataFrame(edge_rows).sort_values(["BoardName", "year", "CounterpartBoard"]).reset_index(drop=True)
+            pd.DataFrame(edge_rows).sort_values(["BoardName", "period", "CounterpartBoard"]).reset_index(drop=True)
             if edge_rows
-            else pd.DataFrame(columns=["BoardName", "year", "CounterpartBoard"])
+            else pd.DataFrame(columns=["BoardName", "period", "CounterpartBoard"])
         )
 
-        # 4) Compare adjacent director-years and write movement candidates.
+        # 4) Compare adjacent director-periods and write movement candidates.
         movement_rows: list[dict[str, object]] = []
         for director_id, director_panel in complete_history.groupby("DirectorID", sort=False):
-            year_board_pairs = list(
-                director_panel.sort_values("year")[["year", "board_list"]].itertuples(
+            period_board_pairs = list(
+                director_panel.sort_values("period")[["period", "board_list"]].itertuples(
                     index=False,
                     name=None,
                 )
             )
-            board_history = {int(year): set(board_list) for year, board_list in year_board_pairs}
+            board_history = {int(period): set(board_list) for period, board_list in period_board_pairs}
 
-            for (prev_year, prev_list), (event_year, current_list) in zip(
-                year_board_pairs,
-                year_board_pairs[1:],
+            for (prev_period, prev_list), (event_period, current_list) in zip(
+                period_board_pairs,
+                period_board_pairs[1:],
             ):
-                prev_year = int(prev_year)
-                event_year = int(event_year)
-                if event_year != prev_year + 1:
+                prev_period = int(prev_period)
+                event_period = int(event_period)
+                if event_period != prev_period + 1:
                     raise ValueError(
-                        f"DirectorID={director_id} has a non-consecutive year gap after skeleton expansion."
+                        f"DirectorID={director_id} has a non-consecutive period gap after skeleton expansion."
                     )
 
                 previous_boards = set(prev_list)
@@ -247,19 +300,19 @@ class MovementEventBuilder:
                 for firm_a in sorted(stayed_boards):
                     for firm_b in sorted(new_boards):
                         firm_low, firm_high = sorted((firm_a, firm_b))
-                        pair_tm1 = int((firm_low, firm_high, event_year - 1) in pair_year_set)
-                        pair_t = int((firm_low, firm_high, event_year) in pair_year_set)
+                        pair_tm1 = int((firm_low, firm_high, event_period - 1) in pair_period_set)
+                        pair_t = int((firm_low, firm_high, event_period) in pair_period_set)
                         stay = int(
                             all(
-                                firm_b in board_history.get(year, set())
-                                for year in range(event_year, event_year + self.forward_stay_years)
+                                firm_b in board_history.get(period, set())
+                                for period in range(event_period, event_period + self.forward_stay_periods)
                             )
                         )
                         movement_rows.append(
                             {
                                 "event_type": "to_B_still_in_A",
                                 "DirectorID": director_id,
-                                "event_year": event_year,
+                                "event_period": event_period,
                                 "FirmA": firm_a,
                                 "FirmB": firm_b,
                                 self.stay_col: stay,
@@ -273,19 +326,19 @@ class MovementEventBuilder:
                 for firm_a in sorted(left_boards):
                     for firm_b in sorted(new_boards):
                         firm_low, firm_high = sorted((firm_a, firm_b))
-                        pair_tm1 = int((firm_low, firm_high, event_year - 1) in pair_year_set)
-                        pair_t = int((firm_low, firm_high, event_year) in pair_year_set)
+                        pair_tm1 = int((firm_low, firm_high, event_period - 1) in pair_period_set)
+                        pair_t = int((firm_low, firm_high, event_period) in pair_period_set)
                         stay = int(
                             all(
-                                firm_b in board_history.get(year, set())
-                                for year in range(event_year, event_year + self.forward_stay_years)
+                                firm_b in board_history.get(period, set())
+                                for period in range(event_period, event_period + self.forward_stay_periods)
                             )
                         )
                         movement_rows.append(
                             {
                                 "event_type": "to_B_not_in_A",
                                 "DirectorID": director_id,
-                                "event_year": event_year,
+                                "event_period": event_period,
                                 "FirmA": firm_a,
                                 "FirmB": firm_b,
                                 self.stay_col: stay,
@@ -299,19 +352,19 @@ class MovementEventBuilder:
                 for firm_b in sorted(left_boards):
                     for firm_a in sorted(stayed_boards | (left_boards - {firm_b})):
                         firm_low, firm_high = sorted((firm_a, firm_b))
-                        pair_tm1 = int((firm_low, firm_high, event_year - 1) in pair_year_set)
-                        pair_t = int((firm_low, firm_high, event_year) in pair_year_set)
+                        pair_tm1 = int((firm_low, firm_high, event_period - 1) in pair_period_set)
+                        pair_t = int((firm_low, firm_high, event_period) in pair_period_set)
                         stay = int(
                             all(
-                                {firm_a, firm_b}.issubset(board_history.get(year, set()))
-                                for year in range(event_year - self.backward_stay_years, event_year)
+                                {firm_a, firm_b}.issubset(board_history.get(period, set()))
+                                for period in range(event_period - self.backward_stay_periods, event_period)
                             )
                         )
                         movement_rows.append(
                             {
                                 "event_type": "interlock_dissolution",
                                 "DirectorID": director_id,
-                                "event_year": event_year,
+                                "event_period": event_period,
                                 "FirmA": firm_a,
                                 "FirmB": firm_b,
                                 self.stay_col: stay,
@@ -324,7 +377,7 @@ class MovementEventBuilder:
         movement_columns = [
             "event_type",
             "DirectorID",
-            "event_year",
+            "event_period",
             "FirmA",
             "FirmB",
             self.stay_col,
@@ -332,45 +385,48 @@ class MovementEventBuilder:
             "pair_interlock_t-1",
             "pair_interlock_t",
         ]
-        # Deduplicate exact director-firm-pair candidates after all director-year transitions are scanned.
+        # Deduplicate exact director-firm-pair candidates after all director-period transitions are scanned.
         movement_candidates = (
             pd.DataFrame(movement_rows, columns=movement_columns)
             if movement_rows
             else pd.DataFrame(columns=movement_columns)
         )
         movement_candidates = (
-            movement_candidates.drop_duplicates(subset=["event_type", "DirectorID", "event_year", "FirmA", "FirmB"])
-            .sort_values(["event_type", "DirectorID", "event_year", "FirmA", "FirmB"])
+            movement_candidates.drop_duplicates(subset=["event_type", "DirectorID", "event_period", "FirmA", "FirmB"])
+            .sort_values(["event_type", "DirectorID", "event_period", "FirmA", "FirmB"])
             .reset_index(drop=True)
         )
+
+        if self.quarter:
+            return self.export_periods(movement_candidates, firm_interlock_edges)
 
         # 5) Add independent movement requirement2 for A and B sides.
         interlock_lookup = build_counterpart_lookup(
             firm_interlock_edges,
             "BoardName",
-            "year",
+            "period",
             "CounterpartBoard",
         )
         for side, firm_col in {"A": "FirmA", "B": "FirmB"}.items():
             requirement_col = f"requirement2_{side}"
-            board_years = (
-                movement_candidates[["event_type", "event_year", firm_col]]
+            board_periods = (
+                movement_candidates[["event_type", "event_period", firm_col]]
                 .rename(columns={firm_col: "BoardName"})
-                .dropna(subset=["BoardName", "event_year"])
+                .dropna(subset=["BoardName", "event_period"])
                 .drop_duplicates()
-                .sort_values(["event_type", "BoardName", "event_year"])
+                .sort_values(["event_type", "BoardName", "event_period"])
                 .reset_index(drop=True)
             )
 
             requirement_values: list[int] = []
-            for row in board_years.itertuples(index=False):
-                # Requirement2 is evaluated over the configured event-year window and is not
+            for row in board_periods.itertuples(index=False):
+                # Requirement2 is evaluated over the configured event-period window and is not
                 # conditioned on stay or requirement1.
                 history = [
-                    interlock_lookup.get((str(row.BoardName), year), set())
-                    for year in range(
-                        int(row.event_year) + self.requirement2_window[0],
-                        int(row.event_year) + self.requirement2_window[1] + 1,
+                    interlock_lookup.get((str(row.BoardName), period), set())
+                    for period in range(
+                        int(row.event_period) + self.requirement2_window[0],
+                        int(row.event_period) + self.requirement2_window[1] + 1,
                     )
                 ]
                 if row.event_type == "interlock_dissolution":
@@ -383,10 +439,10 @@ class MovementEventBuilder:
                     raise ValueError(f"Unsupported movement event type for requirement2: {row.event_type}")
                 requirement_values.append(value)
 
-            board_years[requirement_col] = requirement_values
+            board_periods[requirement_col] = requirement_values
             movement_candidates = movement_candidates.merge(
-                board_years.rename(columns={"BoardName": firm_col}),
-                on=["event_type", "event_year", firm_col],
+                board_periods.rename(columns={"BoardName": firm_col}),
+                on=["event_type", "event_period", firm_col],
                 how="left",
             )
             movement_candidates[requirement_col] = movement_candidates[requirement_col].fillna(0).astype("int8")
@@ -395,7 +451,7 @@ class MovementEventBuilder:
             [
                 "event_type",
                 "DirectorID",
-                "event_year",
+                "event_period",
                 "FirmA",
                 "FirmB",
                 self.stay_col,
@@ -406,7 +462,24 @@ class MovementEventBuilder:
                 "pair_interlock_t",
             ]
         ].copy()
-        return movement_candidates, firm_interlock_edges
+        return self.export_periods(movement_candidates, firm_interlock_edges)
+
+
+    def export_periods(
+        self, candidates: pd.DataFrame, edges: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Restore calendar fields after the shared integer-period calculations."""
+        candidates = candidates.rename(columns={"event_period": "event_year"})
+        edges = edges.rename(columns={"period": "year"})
+        if self.quarter:
+            for frame, year_col, quarter_col in (
+                (candidates, "event_year", "event_quarter"),
+                (edges, "year", "quarter"),
+            ):
+                periods = pd.to_numeric(frame[year_col], errors="raise").astype("int64")
+                frame.insert(frame.columns.get_loc(year_col) + 1, quarter_col, periods % 4 + 1)
+                frame[year_col] = periods // 4 + 1960
+        return candidates, edges
 
 
 class InterlockEventBuilder:
@@ -519,24 +592,32 @@ class InterlockEventBuilder:
 def main() -> None:
     """Run the raw event-table pipeline and write CSV outputs."""
     stay_x_years = int(RUN_CONFIG["stay_x_years"])
-    requirement2_window = tuple(RUN_CONFIG["requirement2_window"])
+    quarter = int(RUN_CONFIG["quarter"])
+    if quarter not in {0, 1}:
+        raise ValueError("quarter must be 0 or 1")
+    requirement2_window = None if quarter else tuple(RUN_CONFIG["requirement2_window"])
     if stay_x_years < 1:
         raise ValueError("stay_x_years must be >= 1")
-    if len(requirement2_window) != 2 or requirement2_window[0] > requirement2_window[1]:
+    if not quarter and (len(requirement2_window) != 2 or requirement2_window[0] > requirement2_window[1]):
         raise ValueError("requirement2_window must be (start_offset, end_offset) with start <= end")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Build and save movement-side raw tables first.
-    large_sample = int(RUN_CONFIG["large_sample"])
+    large_sample = 0 if quarter else int(RUN_CONFIG["large_sample"])
     formulary = int(RUN_CONFIG["formulary"])
     personnel_definition = str(RUN_CONFIG["personnel_definition"])
     if formulary not in {0, 1}:
         raise ValueError("formulary must be 0 or 1")
-    if formulary == 1 and large_sample != 1:
+    if quarter and formulary != 1:
+        raise ValueError("quarter=1 requires formulary=1")
+    if not quarter and formulary == 1 and large_sample != 1:
         raise ValueError("formulary requires large_sample == 1")
 
-    if formulary == 1:
+    if quarter:
+        movement_input_path = FORMULARY_QUARTER_ROSTER_PATH
+        movement_output_suffix = "_formulary_quarter_narrow"
+    elif formulary == 1:
         movement_input_path = FORMULARY_ROSTER_PATH
         movement_output_suffix = f"_formulary_large_sample_{personnel_definition}"
     elif large_sample == 1:
@@ -553,6 +634,7 @@ def main() -> None:
         requirement2_window=requirement2_window,
         large_sample=large_sample,
         personnel_definition=personnel_definition,
+        quarter=quarter,
     ).build()
     firm_interlock_edges.to_csv(firm_interlock_edges_path, index=False)
     movement_candidates.to_csv(movement_candidates_path, index=False)

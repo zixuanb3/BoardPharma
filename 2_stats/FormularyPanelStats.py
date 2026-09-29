@@ -1,23 +1,25 @@
 """
 Purpose:
-Summarize the 30 disk-backed formulary panel blocks without combining them in
-memory. Produce coverage, event-incidence, and event-by-ATC-sharing diagnostics.
+Summarize annual-event or quarterly-event formulary panel blocks without
+combining them in memory. Produce coverage and event-by-ATC diagnostics.
 
 Process:
 1. Stream the required columns from each formulary_panel block in small chunks.
-2. Deduplicate FORMULARY_ID-quarter and treated FORMULARY_ID-NDC observations,
-   restricting event NDCs to those first included by the event year's Q1.
+2. Deduplicate FORMULARY_ID-quarter and treated FORMULARY_ID-NDC observations.
+   Annual events use event-year Q1; quarterly events use their actual quarter
+   and the cohort's prior-year same-quarter NDC cutoff.
 3. Validate that each ATC sharing split exhausts its corresponding event count.
 4. Save concise CSV summaries and bar charts under the project-level csv and
    figures directories.
 
 Input:
-- data/formulary_panel/formulary_panel_1.csv through formulary_panel_30.csv
-- data/formulary_metadata/ndc_first_seen.csv
+- data/formulary_panel[/shift_qX]/formulary_panel_*.csv (quarter=0)
+- data/formulary_panel_quarter[/shift_qX]/formulary_panel_*.csv (quarter=1)
+- matching data/formulary_metadata/ndc_first_seen*.csv
 
 Output:
-- csv/formulary_panel_stats/{coverage,event,share}/*.csv
-- figures/formulary_panel_stats/{coverage,event,share}/*.png
+- csv/formulary_panel_stats[/quarter/shift_qX]/{coverage,event,share}/*.csv
+- figures/formulary_panel_stats[/quarter/shift_qX]/{coverage,event,share}/*.png
 """
 
 from __future__ import annotations
@@ -46,6 +48,8 @@ FIGURE_ROOT = PROJECT_ROOT / "figures" / "formulary_panel_stats"
 # ========================== USER CONFIG ==========================
 N_FORMULARY_BLOCKS = 30
 CHUNKSIZE = 150_000
+QUARTER = 1  # 0: annual events in Q1; 1: events in their actual quarter.
+FORMULARY_TIME_SHIFT_QUARTERS = 1
 ATC_LEVELS = (1, 2, 3, 4)
 EVENT_SPECS = (
     ("to_B_still_in_A", "A", "stay_a", "Move to B; still in A (A)"),
@@ -83,6 +87,57 @@ def configured_events() -> tuple[EventSpec, ...]:
     if len({event.slug for event in events}) != len(events):
         raise ValueError("Each event specification must have a unique slug.")
     return events
+
+
+def configure_paths() -> None:
+    """Select matching panel, NDC metadata, and output paths for this run."""
+    global PANEL_DIR, FIRST_SEEN_PATH, CSV_ROOT, FIGURE_ROOT
+    if QUARTER not in (0, 1):
+        raise ValueError("QUARTER must be 0 or 1.")
+    shift = FORMULARY_TIME_SHIFT_QUARTERS
+    if not isinstance(shift, int):
+        raise ValueError("FORMULARY_TIME_SHIFT_QUARTERS must be an integer.")
+    shift_suffix = f"shift_q{shift}" if shift else ""
+    panel_name = "formulary_panel_quarter" if QUARTER else "formulary_panel"
+    first_seen_name = "ndc_first_seen_quarter" if QUARTER else "ndc_first_seen"
+    PANEL_DIR = PROJECT_ROOT / "data" / panel_name
+    if shift_suffix:
+        PANEL_DIR /= shift_suffix
+        first_seen_name += f"_{shift_suffix}"
+    FIRST_SEEN_PATH = PROJECT_ROOT / "data" / "formulary_metadata" / f"{first_seen_name}.csv"
+    output_suffix = Path("quarter", shift_suffix or "shift_q0") if QUARTER else (Path("annual", shift_suffix) if shift_suffix else Path())
+    CSV_ROOT = PROJECT_ROOT / "csv" / "formulary_panel_stats" / output_suffix
+    FIGURE_ROOT = PROJECT_ROOT / "figures" / "formulary_panel_stats" / output_suffix
+
+
+def available_periods(paths: list[Path]) -> set[int]:
+    """Read the time column once to locate the observed edge of cohort windows."""
+    periods: set[int] = set()
+    for path in tqdm(paths, desc="Checking observed quarters", unit="file"):
+        for chunk in pd.read_csv(path, usecols=["YEAR_Q"], dtype="string", chunksize=CHUNKSIZE):
+            parsed = parse_year_quarter(chunk, path)
+            periods.update((parsed["_year"].astype(int) * 4 + parsed["_quarter"].astype(int)).unique())
+    if not periods:
+        raise ValueError("No formulary-quarter observations were found.")
+    return periods
+
+
+def cutoff_for_period(period: int, observed: set[int]) -> int:
+    """Match the cohort's t-4..t+7 window and first-observed-quarter clipping."""
+    interior = set(range(max(period - 4, min(observed)), min(period + 7, max(observed)) + 1))
+    missing = interior - observed
+    if missing:
+        raise FileNotFoundError(f"Cohort window for {period} is missing quarters: {sorted(missing)}")
+    window = observed.intersection(range(period - 4, period + 8))
+    if period not in window:
+        raise ValueError(f"Event quarter {period} is absent from the panel.")
+    return max(period - 4, min(window))
+
+
+def quarter_tag(period: int) -> str:
+    """Format an integer quarter index as YYYYQX."""
+    year = (period - 1) // 4
+    return f"{year}Q{period - year * 4}"
 
 
 def panel_paths() -> list[Path]:
@@ -176,17 +231,25 @@ def normalize_identifiers(data: pd.DataFrame, path: Path) -> pd.DataFrame:
     return data
 
 
-def available_by_event_q1(
+def available_by_event_cutoff(
     data: pd.DataFrame,
     first_seen_qtime: dict[str, int],
     path: Path,
+    cutoff_by_period: dict[int, int],
 ) -> pd.Series:
-    """Return whether each NDC was first included by its row year's Q1."""
+    """Return whether each NDC was first included by the event cutoff."""
     first_seen = data["NDC"].map(first_seen_qtime)
     if first_seen.isna().any():
         examples = data.loc[first_seen.isna(), "NDC"].drop_duplicates().head(10).tolist()
         raise KeyError(f"{path.name} has NDCs missing from the first-seen lookup: {examples}")
-    return first_seen.le(data["_year"].astype("int32") * 4 + 1)
+    if QUARTER:
+        period = data["_year"].astype("int32") * 4 + data["_quarter"].astype("int32")
+        cutoff = period.map(cutoff_by_period)
+        if cutoff.isna().any():
+            raise ValueError(f"{path.name} contains a quarter without a cutoff.")
+    else:
+        cutoff = data["_year"].astype("int32") * 4 + 1
+    return first_seen.le(cutoff)
 
 
 def add_block_coverage(
@@ -205,6 +268,7 @@ def accumulate_block(
     events: tuple[EventSpec, ...],
     columns: list[str],
     first_seen_qtime: dict[str, int],
+    cutoff_by_period: dict[int, int],
     quarter_counts: Counter[str],
     span_counts: Counter[int],
     event_counts: dict[str, Counter[int]],
@@ -220,7 +284,7 @@ def accumulate_block(
     reader = pd.read_csv(path, usecols=columns, dtype="string", chunksize=CHUNKSIZE)
     for data in tqdm(reader, desc=f"Reading {path.stem}", unit="chunk", leave=False):
         data = parse_year_quarter(normalize_identifiers(data, path), path)
-        available_mask = available_by_event_q1(data, first_seen_qtime, path)
+        available_mask = available_by_event_cutoff(data, first_seen_qtime, path, cutoff_by_period)
         coverage_pairs.update(
             zip(data["FORMULARY_ID"].astype(str), data["_year_quarter"].astype(str), strict=True)
         )
@@ -229,14 +293,18 @@ def accumulate_block(
             raw_event_mask = binary_indicator(data, event.event_column, path).eq(1)
             if not raw_event_mask.any():
                 continue
-            if data.loc[raw_event_mask, "_quarter"].ne(1).any():
+            if not QUARTER and data.loc[raw_event_mask, "_quarter"].ne(1).any():
                 raise ValueError(f"{path.name}.{event.event_column} contains event rows outside Q1.")
 
             event_mask = raw_event_mask & available_mask
-            event_rows = data.loc[event_mask, ["_year", "FORMULARY_ID", "NDC"]]
+            data["_period"] = (
+                data["_year"].astype("int32") * 4 + data["_quarter"].astype("int32")
+                if QUARTER else data["_year"].astype("int32")
+            )
+            event_rows = data.loc[event_mask, ["_period", "FORMULARY_ID", "NDC"]]
             event_id_rows = list(
                 zip(
-                    event_rows["_year"].astype(int),
+                    event_rows["_period"].astype(int),
                     event_rows["FORMULARY_ID"].astype(str),
                     event_rows["NDC"].astype(str),
                     strict=True,
@@ -294,44 +362,59 @@ def build_span_summary(span_counts: Counter[int]) -> pd.DataFrame:
     )
 
 
-def observed_years(coverage: pd.DataFrame) -> list[int]:
-    """Return every calendar year represented in the panel, including zero-event years."""
+def observed_event_periods(coverage: pd.DataFrame) -> list[int]:
+    """Return all observed calendar periods, including zero-event periods."""
     if coverage.empty:
         raise ValueError("No formulary-quarter observations were found.")
+    if QUARTER:
+        return (coverage["year"].astype(int) * 4 + coverage["quarter"].astype(int)).tolist()
     return list(range(int(coverage["year"].min()), int(coverage["year"].max()) + 1))
 
 
-def build_event_summary(years: list[int], counts: Counter[int], event: EventSpec) -> pd.DataFrame:
-    """Return yearly unique FORMULARY_ID-NDC event incidence for one event side."""
+def period_columns(periods: list[int]) -> dict[str, list[int] | list[str]]:
+    """Return year and, in quarterly mode, quarter identifiers for output."""
+    if QUARTER:
+        years = [(period - 1) // 4 for period in periods]
+        quarters = [period - year * 4 for period, year in zip(periods, years, strict=True)]
+        return {
+            "year": years,
+            "quarter": quarters,
+            "year_quarter": [f"{year}Q{quarter}" for year, quarter in zip(years, quarters, strict=True)],
+        }
+    return {"year": periods}
+
+
+def build_event_summary(periods: list[int], counts: Counter[int], event: EventSpec) -> pd.DataFrame:
+    """Return unique FORMULARY_ID-NDC incidence by configured event period."""
     return pd.DataFrame(
         {
-            "year": years,
+            **period_columns(periods),
             "event_type": event.event_type,
             "direction": event.direction,
-            "event_formulary_ndc": [int(counts[year]) for year in years],
+            "event_formulary_ndc": [int(counts[period]) for period in periods],
         }
     )
 
 
 def build_sharing_summary(
-    years: list[int],
+    periods: list[int],
     event_counts: Counter[int],
     counts: Counter[tuple[int, int]],
     event: EventSpec,
     level: int,
 ) -> pd.DataFrame:
-    """Return yearly treated counts split into ATC-sharing and non-sharing groups."""
-    sharing = [int(counts[(year, 1)]) for year in years]
-    nonsharing = [int(counts[(year, 0)]) for year in years]
+    """Return treated counts split into ATC-sharing and non-sharing groups."""
+    sharing = [int(counts[(period, 1)]) for period in periods]
+    nonsharing = [int(counts[(period, 0)]) for period in periods]
     total = [share + nonshare for share, nonshare in zip(sharing, nonsharing, strict=True)]
-    expected = [int(event_counts[year]) for year in years]
+    expected = [int(event_counts[period]) for period in periods]
     if total != expected:
         raise AssertionError(
             f"{event.slug}, ATC{level}: sharing plus non-sharing does not equal total event incidence."
         )
     return pd.DataFrame(
         {
-            "year": years,
+            **period_columns(periods),
             "event_type": event.event_type,
             "direction": event.direction,
             "atc_level": level,
@@ -359,15 +442,16 @@ def save_single_bar(summary: pd.DataFrame, x: str, y: str, title: str, path: Pat
 
 
 def save_sharing_bar(summary: pd.DataFrame, title: str, path: Path) -> None:
-    """Save stacked yearly sharing and non-sharing event counts."""
+    """Save stacked sharing and non-sharing event counts."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, axis = plt.subplots(figsize=(10, 5))
-    years = summary["year"].astype(str)
+    time_column = "year_quarter" if QUARTER else "year"
+    years = summary[time_column].astype(str)
     sharing = summary["sharing_formulary_ndc"]
     nonsharing = summary["nonsharing_formulary_ndc"]
     axis.bar(years, sharing, label="Sharing", color="#59A14F")
     axis.bar(years, nonsharing, bottom=sharing, label="Not sharing", color="#E15759")
-    axis.set_xlabel("Year")
+    axis.set_xlabel("Year quarter" if QUARTER else "Year")
     axis.set_ylabel("Event FORMULARY_ID-NDC count")
     axis.set_title(title)
     axis.legend()
@@ -380,7 +464,7 @@ def save_sharing_bar(summary: pd.DataFrame, title: str, path: Path) -> None:
 def write_outputs(
     coverage: pd.DataFrame,
     spans: pd.DataFrame,
-    years: list[int],
+    periods: list[int],
     events: tuple[EventSpec, ...],
     event_counts: dict[str, Counter[int]],
     sharing_counts: dict[tuple[str, int], Counter[tuple[int, int]]],
@@ -414,19 +498,19 @@ def write_outputs(
     )
 
     for event in events:
-        event_summary = build_event_summary(years, event_counts[event.slug], event)
+        event_summary = build_event_summary(periods, event_counts[event.slug], event)
         event_summary.to_csv(CSV_ROOT / "event" / f"{event.slug}.csv", index=False)
         save_single_bar(
             event_summary,
-            "year",
+            "year_quarter" if QUARTER else "year",
             "event_formulary_ndc",
-            f"{event.label}: yearly event incidence",
+            f"{event.label}: {'quarterly' if QUARTER else 'yearly'} event incidence",
             FIGURE_ROOT / "event" / f"{event.slug}.png",
         )
 
         for level in ATC_LEVELS:
             sharing_summary = build_sharing_summary(
-                years,
+                periods,
                 event_counts[event.slug],
                 sharing_counts[(event.slug, level)],
                 event,
@@ -445,11 +529,16 @@ def write_outputs(
 
 def main() -> None:
     """Stream all panel blocks, validate the statistics, and save diagnostics."""
+    configure_paths()
     events = configured_events()
     paths = panel_paths()
     columns = required_columns(events)
     validate_schema(paths, columns)
     first_seen_qtime = load_first_seen_lookup()
+    cutoff_by_period: dict[int, int] = {}
+    if QUARTER:
+        observed = available_periods(paths)
+        cutoff_by_period = {period: cutoff_for_period(period, observed) for period in observed}
 
     quarter_counts: Counter[str] = Counter()
     span_counts: Counter[int] = Counter()
@@ -464,6 +553,7 @@ def main() -> None:
             events,
             columns,
             first_seen_qtime,
+            cutoff_by_period,
             quarter_counts,
             span_counts,
             event_counts,
@@ -472,10 +562,21 @@ def main() -> None:
 
     coverage = build_coverage_summary(quarter_counts)
     spans = build_span_summary(span_counts)
+    if QUARTER:
+        cutoff_summary = coverage[["year", "quarter", "year_quarter"]].copy()
+        cutoff_summary["first_seen_cutoff_qtime"] = [
+            cutoff_by_period[year * 4 + quarter]
+            for year, quarter in zip(cutoff_summary["year"], cutoff_summary["quarter"], strict=True)
+        ]
+        cutoff_summary["first_seen_cutoff_year_quarter"] = cutoff_summary[
+            "first_seen_cutoff_qtime"
+        ].map(quarter_tag)
+        (CSV_ROOT / "coverage").mkdir(parents=True, exist_ok=True)
+        cutoff_summary.to_csv(CSV_ROOT / "coverage" / "first_seen_cutoffs.csv", index=False)
     write_outputs(
         coverage,
         spans,
-        observed_years(coverage),
+        observed_event_periods(coverage),
         events,
         event_counts,
         sharing_counts,

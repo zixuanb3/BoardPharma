@@ -1,5 +1,7 @@
 # Formulary Drug Panel and ATC Classification Data Package
 
+The five Python scripts in this directory were straightly copied from Haoyu's code. This README retains the source package's workflow notes; paths and data-package references below describe that source layout and may need adjustment when running scripts from this repository.
+
 ## 1. Purpose
 
 This folder organizes the CMS Formulary drug records, FDA NDC product data, standardized labeler-to-company mapping, panel construction scripts, and the existing panel outputs with ATC classifications. The intended workflow is:
