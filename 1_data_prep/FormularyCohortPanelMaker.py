@@ -1,28 +1,44 @@
 r"""
 Purpose:
 Aggregate quarter-organized formulary rows to drug-firm-quarter outcomes and
-build lean, direction-aware event cohorts for formulary did_imputation work.
+build direction-aware req1 event cohorts. RUN_CONFIG["quarter"] selects annual
+events (0) or events in their actual calendar quarter (1).
 
 Process:
-1. Stream each required formulary_panel_YYYYQX.csv in chunks and aggregate to
-   NDC x BoardName x YEAR_Q without loading a full quarter into memory.
+1. Build or reuse each required drug-quarter panel. When building, stream
+   formulary_panel_YYYYQX.csv and aggregate to NDC x BoardName x YEAR_Q.
 2. Construct four outcomes: included_count, included_share, mean_tiera, and
    mean_tier_raw; retain ATC3 plus req1 event and ATC3-sharing indicators.
-3. Reproduce SSR Not controls from pure movement events, and reproduce
-   include_eventpair=0 from req1 candidate firm pairs separately for A and B.
-4. Restrict cohort drug-firm ids to NDCs first included by the cohort year's
-   Q1, then save one combined A/B cohort file per event-year with
-   direction-specific treated, sample, and sharing flags.
+3. Match BoardName directly to event-table firm names, reproduce SSR Not
+   controls from pure movement events, and reproduce
+   include_eventpair=0 from req1 candidate pairs separately for A and B.
+4. In quarter=1, keep four pre-event quarters and eight quarters starting at
+   the event; missing quarters outside the available data range are allowed.
+   Keep NDCs first included by the same quarter in the offset year, then save
+   one combined A/B cohort per event quarter. Annual mode retains its calendar-
+   year window and configured first-seen quarter.
 
 Input:
-- data/formulary_panel_by_time/formulary_panel_YYYYQX.csv
-- data/formulary_metadata/ndc_first_seen.csv
-- data/event_tables/movement_table_formulary_large_sample_narrow.csv
-- data/event_tables/movement_event_candidates_formulary_large_sample_narrow.csv
+- quarter=0 with shift_q1:
+  data/formulary_panel_by_time/shift_q1/formulary_panel_YYYYQX.csv
+  data/formulary_metadata/ndc_first_seen_shift_q1.csv
+  data/event_tables/movement_table_formulary_large_sample_narrow.csv
+  data/event_tables/movement_event_candidates_formulary_large_sample_narrow.csv
+- quarter=1 with shift_q1:
+  data/formulary_panel_quarter_by_time/shift_q1/formulary_panel_YYYYQX.csv
+  data/formulary_metadata/ndc_first_seen_quarter_shift_q1.csv
+  data/event_tables/movement_table_formulary_quarter_narrow.csv
+  data/event_tables/movement_event_candidates_formulary_quarter_narrow.csv
 
 Output:
-- data/formulary_drug_panel_by_time/formulary_drug_panel_YYYYQX.csv
-- data/formulary_cohort_data/event/req1/Not/{event}_quarter_cohort_{year}.csv
+- quarter=0 with shift_q1 and first_seen_year_offset=-1:
+  data/formulary_drug_panel_by_time/shift_q1/formulary_drug_panel_YYYYQX.csv
+  data/formulary_cohort_data/event/req1/Not/shift_q1_seen_y-1_q1/
+  {event}_quarter_cohort_{year}.csv
+- quarter=1 with shift_q1 and first_seen_year_offset=-1:
+  data/formulary_drug_panel_quarter_by_time/shift_q1/formulary_drug_panel_YYYYQX.csv
+  data/formulary_cohort_data_quarter/event/req1/Not/shift_q1_seen_y-1_event_q/
+  {event}_quarter_cohort_YYYYQX.csv
 """
 
 from __future__ import annotations
@@ -46,14 +62,6 @@ COHORT_OUTPUT_DIR = DATA_ROOT / "formulary_cohort_data" / "event" / "req1" / "No
 EVENT_TABLE_DIR = DATA_ROOT / "event_tables"
 FIRST_SEEN_PATH = DATA_ROOT / "formulary_metadata" / "ndc_first_seen.csv"
 
-MOVEMENT_TABLE_PATH = (
-    EVENT_TABLE_DIR / "movement_table_formulary_large_sample_narrow.csv"
-)
-CANDIDATE_PATH = (
-    EVENT_TABLE_DIR
-    / "movement_event_candidates_formulary_large_sample_narrow.csv"
-)
-
 EVENT_TYPES = (
     "to_B_not_in_A",
     "to_B_still_in_A",
@@ -67,31 +75,37 @@ COHORT_YEARS = {
 }
 
 YEAR_Q_PATTERN = re.compile(r"^(\d{4})Q([1-4])$")
-STAY_COLUMN_PATTERN = re.compile(r"^stay_\d+_years$")
 
 
 # ========================== USER CONFIG ==========================
 # chunksize:
 # - Controls how many full formulary rows are read at once from one quarter.
 #
-# window_pre/window_post:
-# - A cohort c uses every available quarter in years c-window_pre through
-#   c+window_post.  The only intentionally absent period is 2025Q4.
+# window_pre/window_post: annual-event cohorts use calendar years.
+# quarter_pre_periods/quarter_post_periods: quarterly-event cohorts use four
+# quarters before the event and eight quarters starting with the event.
 #
 # formulary_time_shift_quarters:
 # - Must match FormularyPanelMaker.py and ReorganizeFormularyData.py.
+# rebuild_drug_quarter_panels:
+# - 0 reuses existing slim files from the same quarter/shift specification;
+#   1 regenerates them from the full reorganized formulary files.
 #
-# first_seen_year_offset/first_seen_quarter:
-# - Controls the NDC first-seen cutoff relative to the cohort year.  The
-#   default (0, 1) keeps NDCs first included by cohort-year Q1.
+# first_seen_year_offset: NDC must have first been included by this many years
+# before the event, in its event quarter. first_seen_quarter applies only to
+# annual mode, whose event quarter is Q1.
 RUN_CONFIG = {
+    "quarter": 1,
     "chunksize": 500_000,
     "window_pre": 1,
     "window_post": 1,
+    "quarter_pre_periods": 4,
+    "quarter_post_periods": 8,
     "req": 1,
     "include_eventpair": 0,
     "atc_level": 3,
     "formulary_time_shift_quarters": 1,
+    "rebuild_drug_quarter_panels": 1,
     "first_seen_year_offset": -1,
     "first_seen_quarter": 1,
 }
@@ -190,57 +204,81 @@ def sample_spec_label(shift_quarters: int, year_offset: int, quarter: int) -> st
     return f"{shift_label(shift_quarters)}_{first_seen_spec_label(year_offset, quarter)}"
 
 
-def quarter_input_dir(shift_quarters: int) -> Path:
+def quarter_input_dir(shift_quarters: int, quarter: int = 0) -> Path:
     """Return the quarter-organized formulary input directory."""
-    return QUARTER_INPUT_DIR if shift_quarters == 0 else QUARTER_INPUT_DIR / shift_label(shift_quarters)
+    base = QUARTER_INPUT_DIR.with_name("formulary_panel_quarter_by_time") if quarter else QUARTER_INPUT_DIR
+    return base if shift_quarters == 0 else base / shift_label(shift_quarters)
 
 
-def drug_quarter_output_dir(shift_quarters: int) -> Path:
+def drug_quarter_output_dir(shift_quarters: int, quarter: int = 0) -> Path:
     """Return the slim drug-quarter output directory."""
-    return DRUG_QUARTER_OUTPUT_DIR if shift_quarters == 0 else DRUG_QUARTER_OUTPUT_DIR / shift_label(shift_quarters)
+    base = DRUG_QUARTER_OUTPUT_DIR.with_name("formulary_drug_panel_quarter_by_time") if quarter else DRUG_QUARTER_OUTPUT_DIR
+    return base if shift_quarters == 0 else base / shift_label(shift_quarters)
 
 
-def first_seen_path(shift_quarters: int) -> Path:
-    """Return original-time NDC first-seen metadata for every panel shift."""
-    return FIRST_SEEN_PATH
+def first_seen_path(shift_quarters: int, quarter: int = 0) -> Path:
+    """Return the NDC first-seen metadata produced with the selected panel."""
+    base = FIRST_SEEN_PATH.with_name("ndc_first_seen_quarter.csv") if quarter else FIRST_SEEN_PATH
+    if shift_quarters == 0:
+        return base
+    return base.with_name(f"{base.stem}_{shift_label(shift_quarters)}.csv")
 
 
-def cohort_output_dir(shift_quarters: int, year_offset: int, quarter: int) -> Path:
+def cohort_output_dir(shift_quarters: int, year_offset: int, first_seen_quarter: int, quarter: int = 0) -> Path:
     """Return the cohort output directory, preserving the baseline path."""
-    if shift_quarters == 0 and year_offset == 0 and quarter == 1:
-        return COHORT_OUTPUT_DIR
-    return COHORT_OUTPUT_DIR / sample_spec_label(shift_quarters, year_offset, quarter)
+    base = COHORT_OUTPUT_DIR
+    if quarter:
+        base = DATA_ROOT / "formulary_cohort_data_quarter" / "event" / "req1" / "Not"
+        label = f"{shift_label(shift_quarters)}_seen_y{year_offset:+d}_event_q"
+        return base / label
+    if shift_quarters == 0 and year_offset == 0 and first_seen_quarter == 1:
+        return base
+    return base / sample_spec_label(shift_quarters, year_offset, first_seen_quarter)
 
 
-def validate_config(config: dict) -> tuple[int, int, int, int, int, int]:
+def validate_config(config: dict) -> tuple[int, int, int, int, int, int, int, int, int, int]:
     """Validate the fixed req1, Not-control formulary cohort specification."""
+    quarter = int(config["quarter"])
     chunksize = int(config["chunksize"])
     window_pre = int(config["window_pre"])
     window_post = int(config["window_post"])
+    quarter_pre_periods = int(config["quarter_pre_periods"])
+    quarter_post_periods = int(config["quarter_post_periods"])
     req = int(config["req"])
     include_eventpair = int(config["include_eventpair"])
     atc_level = int(config["atc_level"])
     time_shift = int(config["formulary_time_shift_quarters"])
+    rebuild_drug_quarter_panels = int(config["rebuild_drug_quarter_panels"])
     first_seen_year_offset = int(config["first_seen_year_offset"])
-    first_seen_quarter = int(config["first_seen_quarter"])
+    first_seen_quarter = int(config["first_seen_quarter"]) if not quarter else 1
 
+    if quarter not in {0, 1}:
+        raise ValueError("quarter must be 0 or 1.")
+    if rebuild_drug_quarter_panels not in {0, 1}:
+        raise ValueError("rebuild_drug_quarter_panels must be 0 or 1.")
     if chunksize < 1:
         raise ValueError("chunksize must be at least 1.")
     if (window_pre, window_post) != (1, 1):
         raise ValueError("This design requires window_pre=1 and window_post=1.")
+    if (quarter_pre_periods, quarter_post_periods) != (4, 8):
+        raise ValueError("Quarterly cohorts require four pre-event and eight event/post-event quarters.")
     if req != 1:
         raise ValueError("This formulary design is fixed at req=1.")
     if include_eventpair != 0:
         raise ValueError("This formulary design is fixed at include_eventpair=0.")
     if atc_level != 3:
         raise ValueError("This formulary design is fixed at ATC3 sharing.")
-    if first_seen_quarter not in {1, 2, 3, 4}:
+    if not quarter and first_seen_quarter not in {1, 2, 3, 4}:
         raise ValueError("first_seen_quarter must be 1, 2, 3, or 4.")
     return (
+        quarter,
         chunksize,
         window_pre,
         window_post,
+        quarter_pre_periods,
+        quarter_post_periods,
         time_shift,
+        rebuild_drug_quarter_panels,
         first_seen_year_offset,
         first_seen_quarter,
     )
@@ -267,6 +305,17 @@ def quarter_sort_key(tag: str) -> tuple[int, int]:
     return int(tag[:4]), int(tag[-1])
 
 
+def quarter_time(year: int, quarter: int) -> int:
+    """Encode a calendar quarter as a consecutive integer."""
+    return year * 4 + quarter
+
+
+def tag_from_quarter_time(value: int) -> str:
+    """Convert an encoded calendar quarter to YYYYQX."""
+    year, zero_based_quarter = divmod(value - 1, 4)
+    return canonical_year_q(year, zero_based_quarter + 1)
+
+
 def available_quarter_paths(source_dir: Path) -> dict[str, Path]:
     """Inventory the quarter-organized full formulary files."""
     paths: dict[str, Path] = {}
@@ -289,19 +338,76 @@ def expected_cohort_quarters(cohort_year: int, window_pre: int, window_post: int
     ]
 
 
+def quarterly_cohort_quarters(
+    cohort_year: int,
+    cohort_quarter: int,
+    pre_periods: int,
+    post_periods: int,
+) -> list[str]:
+    """Return four pre-event quarters and eight quarters from the event onward."""
+    event_time = quarter_time(cohort_year, cohort_quarter)
+    return [
+        tag_from_quarter_time(event_time + offset)
+        for offset in range(-pre_periods, post_periods)
+    ]
+
+
+def cohort_specifications(movement: pd.DataFrame, quarter: int) -> list[tuple[str, int, int | None]]:
+    """Select configured event years and observed req1 event quarters."""
+    if not quarter:
+        return [
+            (event_type, year, None)
+            for event_type in EVENT_TYPES
+            for year in COHORT_YEARS[event_type]
+        ]
+    eligible = movement.loc[movement["req1"].eq(1), ["event_type", "year", "quarter"]]
+    return [
+        (event_type, year, event_quarter)
+        for event_type in EVENT_TYPES
+        for year, event_quarter in sorted(
+            {
+                (int(row.year), int(row.quarter))
+                for row in eligible.loc[
+                    eligible["event_type"].eq(event_type)
+                    & eligible["year"].isin(COHORT_YEARS[event_type])
+                ].itertuples(index=False)
+            }
+        )
+    ]
+
+
 def required_quarters(
     available: dict[str, Path],
     window_pre: int,
     window_post: int,
-) -> tuple[list[str], dict[int, list[str]]]:
+    specifications: list[tuple[str, int, int | None]] | None = None,
+    quarter: int = 0,
+    quarter_pre_periods: int = 4,
+    quarter_post_periods: int = 8,
+) -> tuple[list[str], dict[int | tuple[int, int | None], list[str]]]:
     """Validate cohort windows while allowing missing quarters only at data edges."""
-    windows: dict[int, list[str]] = {}
+    legacy_annual = specifications is None
+    if specifications is None:
+        specifications = [
+            ("", year, None)
+            for year in sorted(set().union(*COHORT_YEARS.values()))
+        ]
+    windows: dict[int | tuple[int, int | None], list[str]] = {}
     all_required: set[str] = set()
     available_keys = {tag: quarter_sort_key(tag) for tag in available}
     min_available = min(available_keys.values())
     max_available = max(available_keys.values())
-    for cohort_year in sorted(set().union(*COHORT_YEARS.values())):
-        nominal = expected_cohort_quarters(cohort_year, window_pre, window_post)
+    for _event_type, cohort_year, cohort_quarter in specifications:
+        key = cohort_year if legacy_annual else (cohort_year, cohort_quarter)
+        if key in windows:
+            continue
+        nominal = (
+            quarterly_cohort_quarters(
+                cohort_year, cohort_quarter, quarter_pre_periods, quarter_post_periods
+            )
+            if quarter
+            else expected_cohort_quarters(cohort_year, window_pre, window_post)
+        )
         missing = [tag for tag in nominal if tag not in available]
         unexpected_missing = [
             tag
@@ -310,15 +416,15 @@ def required_quarters(
         ]
         if unexpected_missing:
             raise FileNotFoundError(
-                f"Cohort {cohort_year} is missing required quarter files: {unexpected_missing}"
+                f"Cohort {key} is missing required quarter files: {unexpected_missing}"
             )
         actual = [tag for tag in nominal if tag in available]
-        expected_count = len(nominal) - len(missing)
-        if len(actual) != expected_count:
-            raise ValueError(
-                f"Cohort {cohort_year} must contain {expected_count} available quarters; found {len(actual)}."
-            )
-        windows[cohort_year] = actual
+        if not actual:
+            raise FileNotFoundError(f"Cohort {key} has no available quarters.")
+        event_tag = canonical_year_q(cohort_year, cohort_quarter or 1)
+        if event_tag not in actual:
+            raise FileNotFoundError(f"Cohort {key} is missing its event quarter {event_tag}.")
+        windows[key] = actual
         all_required.update(actual)
     return sorted(all_required, key=quarter_sort_key), windows
 
@@ -534,6 +640,36 @@ def build_drug_quarter_panels(
     return outputs
 
 
+def existing_drug_quarter_panels(quarter_tags: list[str], directory: Path) -> dict[str, Path]:
+    """Reuse complete slim quarters and reject missing or incompatible files."""
+    required = {
+        "ndc", "boardname", "year_q", "year", "quarter", "atc3",
+        "included_count", "n_formularies_observed", "included_share",
+        "mean_tiera", "mean_tier_raw", *RAW_TO_OUTPUT_COLUMNS.values(),
+    }
+    outputs: dict[str, Path] = {}
+    for tag in quarter_tags:
+        path = directory / f"formulary_drug_panel_{tag}.csv"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Missing slim quarter {path}; set rebuild_drug_quarter_panels=1 to create it."
+            )
+        sample = pd.read_csv(path, nrows=1)
+        missing = sorted(required - set(sample.columns))
+        if missing:
+            raise KeyError(f"{path.name} is missing slim-panel columns: {missing}")
+        if sample.empty or str(sample.loc[0, "year_q"]) != tag:
+            raise ValueError(f"{path.name} is empty or contains the wrong quarter tag.")
+        board_names = sample["boardname"].astype("string")
+        if (board_names.str.startswith("{") & board_names.ne("{}")).any():
+            raise ValueError(
+                f"{path.name} still contains JSON BoardName values. Rebuild the full formulary panel "
+                "and then set rebuild_drug_quarter_panels=1."
+            )
+        outputs[tag] = path
+    return outputs
+
+
 # ========================== EVENT SOURCE TABLES ==========================
 
 
@@ -561,17 +697,50 @@ def load_first_seen_lookup(path: Path) -> dict[str, int]:
     )
 
 
-def load_event_sources() -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """Load the small canonical firm-year table and candidate-pair table."""
-    movement = pd.read_csv(MOVEMENT_TABLE_PATH, dtype="string")
-    candidate = pd.read_csv(CANDIDATE_PATH, dtype="string")
+def load_event_sources(quarter: int = 0) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Load matching annual or quarterly movement and candidate tables."""
+    suffix = "formulary_quarter_narrow" if quarter else "formulary_large_sample_narrow"
+    movement_path = EVENT_TABLE_DIR / f"movement_table_{suffix}.csv"
+    candidate_path = EVENT_TABLE_DIR / f"movement_event_candidates_{suffix}.csv"
+    movement = pd.read_csv(movement_path, dtype="string")
+    candidate = pd.read_csv(candidate_path, dtype="string")
+
+    movement_required = {"BoardName", "event_type", "firm_type", "year", "req1"}
+    candidate_required = {
+        "FirmA", "FirmB", "event_type", "event_year", "requirement1"
+    }
+    if quarter:
+        movement_required.add("quarter")
+        candidate_required.add("event_quarter")
+        stay_column = "stay_8_quarters"
+    else:
+        movement_required.update(("req0", "req2"))
+        candidate_required.update(("requirement2_A", "requirement2_B"))
+        stay_columns = [column for column in candidate if re.fullmatch(r"stay_\d+_years", column)]
+        if len(stay_columns) != 1:
+            raise ValueError(f"Expected exactly one stay_x_years column; found {stay_columns}")
+        stay_column = stay_columns[0]
+    candidate_required.add(stay_column)
+    for path, data, required in (
+        (movement_path, movement, movement_required),
+        (candidate_path, candidate, candidate_required),
+    ):
+        missing = sorted(required - set(data.columns))
+        if missing:
+            raise KeyError(f"{path.name} is missing columns: {missing}")
 
     movement["BoardName"] = normalize_string(movement["BoardName"], uppercase=True)
     movement["event_type"] = normalize_string(movement["event_type"])
     movement["firm_type"] = normalize_string(movement["firm_type"], uppercase=True)
     movement["year"] = pd.to_numeric(movement["year"], errors="raise").astype("int16")
-    for column in ("req0", "req1", "req2"):
+    if quarter:
+        movement["quarter"] = pd.to_numeric(movement["quarter"], errors="raise").astype("int8")
+        if not movement["quarter"].isin((1, 2, 3, 4)).all():
+            raise ValueError(f"{movement_path.name} has invalid event quarters.")
+    for column in (("req1",) if quarter else ("req0", "req1", "req2")):
         movement[column] = pd.to_numeric(movement[column], errors="raise").astype("int8")
+        if not movement[column].isin((0, 1)).all():
+            raise ValueError(f"{movement_path.name} has invalid {column} flags.")
 
     candidate["FirmA"] = normalize_string(candidate["FirmA"], uppercase=True)
     candidate["FirmB"] = normalize_string(candidate["FirmB"], uppercase=True)
@@ -579,12 +748,19 @@ def load_event_sources() -> tuple[pd.DataFrame, pd.DataFrame, str]:
     candidate["event_year"] = pd.to_numeric(
         candidate["event_year"], errors="raise"
     ).astype("int16")
-    stay_columns = [column for column in candidate if STAY_COLUMN_PATTERN.fullmatch(column)]
-    if len(stay_columns) != 1:
-        raise ValueError(f"Expected exactly one stay_x_years column; found {stay_columns}")
-    stay_column = stay_columns[0]
-    for column in (stay_column, "requirement1", "requirement2_A", "requirement2_B"):
+    if quarter:
+        candidate["event_quarter"] = pd.to_numeric(
+            candidate["event_quarter"], errors="raise"
+        ).astype("int8")
+        if not candidate["event_quarter"].isin((1, 2, 3, 4)).all():
+            raise ValueError(f"{candidate_path.name} has invalid event quarters.")
+    condition_columns = (stay_column, "requirement1")
+    if not quarter:
+        condition_columns += ("requirement2_A", "requirement2_B")
+    for column in condition_columns:
         candidate[column] = pd.to_numeric(candidate[column], errors="raise").astype("int8")
+        if not candidate[column].isin((0, 1)).all():
+            raise ValueError(f"{candidate_path.name} has invalid {column} flags.")
     return movement, candidate, stay_column
 
 
@@ -593,15 +769,18 @@ def treated_firms(
     event_type: str,
     side: str,
     cohort_year: int,
+    cohort_quarter: int | None = None,
 ) -> set[str]:
     """Return firms satisfying the fixed req1 treatment definition at cohort entry."""
-    rows = movement.loc[
+    condition = (
         movement["event_type"].eq(event_type)
         & movement["firm_type"].eq(side)
         & movement["year"].eq(cohort_year)
-        & movement["req1"].eq(1),
-        "BoardName",
-    ]
+        & movement["req1"].eq(1)
+    )
+    if cohort_quarter is not None:
+        condition &= movement["quarter"].eq(cohort_quarter)
+    rows = movement.loc[condition, "BoardName"]
     return set(rows.dropna().astype(str))
 
 
@@ -609,15 +788,22 @@ def pure_event_firms_in_window(
     movement: pd.DataFrame,
     event_type: str,
     side: str,
-    window_years: set[int],
+    window_tags: list[str] | set[int],
+    quarter: int = 0,
 ) -> set[str]:
     """Return firms with any raw event-table row, regardless of req flags."""
-    rows = movement.loc[
+    condition = (
         movement["event_type"].eq(event_type)
         & movement["firm_type"].eq(side)
-        & movement["year"].isin(window_years),
-        "BoardName",
-    ]
+    )
+    if quarter:
+        event_tags = movement["year"].astype(str) + "Q" + movement["quarter"].astype(str)
+        condition &= event_tags.isin(window_tags)
+    else:
+        condition &= movement["year"].isin(
+            {int(str(tag)[:4]) for tag in window_tags}
+        )
+    rows = movement.loc[condition, "BoardName"]
     return set(rows.dropna().astype(str))
 
 
@@ -627,14 +813,18 @@ def counterpart_only_firms(
     event_type: str,
     side: str,
     cohort_year: int,
+    cohort_quarter: int | None = None,
 ) -> set[str]:
     """Reproduce SSR include_eventpair=0 using the current req1 candidate set."""
-    current = candidate.loc[
+    condition = (
         candidate["event_type"].eq(event_type)
         & candidate["event_year"].eq(cohort_year)
         & candidate[stay_column].eq(1)
         & candidate["requirement1"].eq(1)
-    ]
+    )
+    if cohort_quarter is not None:
+        condition &= candidate["event_quarter"].eq(cohort_quarter)
+    current = candidate.loc[condition]
     firms_a = set(current["FirmA"].dropna().astype(str))
     firms_b = set(current["FirmB"].dropna().astype(str))
     return firms_b - firms_a if side == "A" else firms_a - firms_b
@@ -684,13 +874,20 @@ def keep_available_ndcs(
     cohort_year: int,
     first_seen_year_offset: int,
     first_seen_quarter: int,
+    cohort_quarter: int | None = None,
 ) -> pd.DataFrame:
-    """Keep NDCs first included by the configured cohort-relative cutoff."""
+    """Keep NDCs first included by the cutoff, clipped to the observed data edge."""
+    if cohort.empty:
+        return cohort.copy()
+
     first_seen = cohort["ndc"].map(first_seen_qtime)
     if first_seen.isna().any():
         examples = cohort.loc[first_seen.isna(), "ndc"].drop_duplicates().head(10).tolist()
         raise KeyError(f"Cohort NDCs are missing from the first-seen lookup: {examples}")
-    cutoff_qtime = (cohort_year + first_seen_year_offset) * 4 + first_seen_quarter
+    cutoff_quarter = cohort_quarter if cohort_quarter is not None else first_seen_quarter
+    requested_cutoff = quarter_time(cohort_year + first_seen_year_offset, cutoff_quarter)
+    available_qtime = cohort["year"].astype("int32") * 4 + cohort["quarter"].astype("int32")
+    cutoff_qtime = max(requested_cutoff, int(available_qtime.min()))
     return cohort.loc[first_seen.le(cutoff_qtime)].copy()
 
 
@@ -700,18 +897,21 @@ def validate_panel_treatment_flags(
     side: str,
     cohort_year: int,
     expected_firms: set[str],
+    cohort_quarter: int | None = None,
 ) -> None:
-    """Ensure aggregated req1 flags match the canonical movement table in Q1."""
+    """Ensure aggregated req1 flags match the movement table at event time."""
     event_column = output_event_column(event_type, side)
-    q1 = cohort.loc[
-        cohort["year"].eq(cohort_year) & cohort["quarter"].eq(1)
+    entry = cohort.loc[
+        cohort["year"].eq(cohort_year)
+        & cohort["quarter"].eq(cohort_quarter or 1)
     ]
-    observed = set(q1.loc[q1[event_column].eq(1), "boardname"].dropna().astype(str))
-    universe = set(q1["boardname"].dropna().astype(str))
+    observed = set(entry.loc[entry[event_column].eq(1), "boardname"].dropna().astype(str))
+    universe = set(entry["boardname"].dropna().astype(str))
     expected = expected_firms & universe
     if observed != expected:
         raise ValueError(
-            f"Req1 event mismatch for {event_type}, side {side}, {cohort_year}. "
+            f"Req1 event mismatch for {event_type}, side {side}, "
+            f"{canonical_year_q(cohort_year, cohort_quarter or 1)}. "
             f"Only in panel: {sorted(observed - expected)[:10]}; "
             f"only in movement table: {sorted(expected - observed)[:10]}"
         )
@@ -724,28 +924,31 @@ def add_direction_flags(
     stay_column: str,
     event_type: str,
     cohort_year: int,
+    quarter_tags: list[str],
+    cohort_quarter: int | None = None,
 ) -> pd.DataFrame:
     """Add treated/sample/sharing flags for A and B without duplicating rows."""
     result = cohort.copy()
-    window_years = set(range(cohort_year - 1, cohort_year + 2))
     universe = set(result["boardname"].dropna().astype(str))
     id_columns = ["ndc", "boardname"]
 
     for side in TREATMENT_GROUPS:
         side_lower = side.lower()
-        treated = treated_firms(movement, event_type, side, cohort_year)
+        treated = treated_firms(movement, event_type, side, cohort_year, cohort_quarter)
         validate_panel_treatment_flags(
             result,
             event_type,
             side,
             cohort_year,
             treated,
+            cohort_quarter,
         )
         pure_event = pure_event_firms_in_window(
             movement,
             event_type,
             side,
-            window_years,
+            quarter_tags,
+            int(cohort_quarter is not None),
         )
         excluded_counterparts = counterpart_only_firms(
             candidate,
@@ -753,42 +956,49 @@ def add_direction_flags(
             event_type,
             side,
             cohort_year,
+            cohort_quarter,
         )
+        treated_boards = treated & universe
         controls = universe - pure_event - excluded_counterparts
 
         treated_column = f"treated_{side_lower}"
         sample_column = f"sample_{side_lower}"
         share_column = cohort_sharing_column(side)
         source_share_column = output_sharing_column(event_type, side)
-        result[treated_column] = result["boardname"].isin(treated).astype("int8")
+        result[treated_column] = result["boardname"].isin(treated_boards).astype("int8")
         result[sample_column] = (
             result[treated_column].eq(1) | result["boardname"].isin(controls)
         ).astype("int8")
 
-        q1_share = result.loc[
-            result["year"].eq(cohort_year) & result["quarter"].eq(1),
+        entry_share = result.loc[
+            result["year"].eq(cohort_year)
+            & result["quarter"].eq(cohort_quarter or 1),
             [*id_columns, source_share_column],
         ].rename(columns={source_share_column: share_column})
-        if q1_share.duplicated(id_columns).any():
+        if entry_share.duplicated(id_columns).any():
             raise ValueError(
                 f"Cohort-entry sharing lookup is not unique for {event_type}, {side}, {cohort_year}."
             )
-        result = result.merge(q1_share, on=id_columns, how="left", validate="many_to_one")
+        result = result.merge(entry_share, on=id_columns, how="left", validate="many_to_one")
         result[share_column] = result[share_column].fillna(0).astype("int8")
         result.loc[result[treated_column].eq(0), share_column] = np.int8(0)
 
     return result
 
 
-def cohort_output_columns() -> list[str]:
+def cohort_output_columns(quarter: int = 0) -> list[str]:
     """Return the intentionally lean cohort schema."""
+    cohort_id_columns = (
+        ["data_cohort_year", "data_cohort_quarter", "data_cohort_qtime"]
+        if quarter else ["data_cohort"]
+    )
     return [
         "ndc",
         "boardname",
         "year_q",
         "year",
         "quarter",
-        "data_cohort",
+        *cohort_id_columns,
         "atc3",
         "included_count",
         "n_formularies_observed",
@@ -816,6 +1026,7 @@ def build_one_cohort(
     stay_column: str,
     event_type: str,
     cohort_year: int,
+    cohort_quarter: int | None = None,
 ) -> pd.DataFrame:
     """Build one combined-direction, balanced drug-firm cohort."""
     cohort = read_cohort_window(drug_quarter_paths, quarter_tags)
@@ -826,8 +1037,14 @@ def build_one_cohort(
         cohort_year,
         first_seen_year_offset,
         first_seen_quarter,
+        cohort_quarter,
     )
-    cohort["data_cohort"] = np.int16(cohort_year)
+    if cohort_quarter is None:
+        cohort["data_cohort"] = np.int16(cohort_year)
+    else:
+        cohort["data_cohort_year"] = np.int16(cohort_year)
+        cohort["data_cohort_quarter"] = np.int8(cohort_quarter)
+        cohort["data_cohort_qtime"] = np.int32(quarter_time(cohort_year, cohort_quarter))
     cohort = add_direction_flags(
         cohort,
         movement,
@@ -835,10 +1052,12 @@ def build_one_cohort(
         stay_column,
         event_type,
         cohort_year,
+        quarter_tags,
+        cohort_quarter,
     )
     cohort = cohort.loc[cohort["sample_a"].eq(1) | cohort["sample_b"].eq(1)].copy()
     return (
-        cohort[cohort_output_columns()]
+        cohort[cohort_output_columns(int(cohort_quarter is not None))]
         .sort_values(["boardname", "ndc", "year", "quarter"])
         .reset_index(drop=True)
     )
@@ -846,7 +1065,7 @@ def build_one_cohort(
 
 def build_cohort_outputs(
     drug_quarter_paths: dict[str, Path],
-    cohort_windows: dict[int, list[str]],
+    cohort_windows: dict[tuple[int, int | None], list[str]],
     first_seen_qtime: dict[str, int],
     first_seen_year_offset: int,
     first_seen_quarter: int,
@@ -854,21 +1073,20 @@ def build_cohort_outputs(
     candidate: pd.DataFrame,
     stay_column: str,
     destination_dir: Path,
+    specifications: list[tuple[str, int, int | None]],
 ) -> None:
-    """Write the configured event-year cohorts with visible progress."""
-    specifications = [
-        (event_type, cohort_year)
-        for event_type in EVENT_TYPES
-        for cohort_year in COHORT_YEARS[event_type]
-    ]
+    """Write the configured event-time cohorts with visible progress."""
     progress = tqdm(specifications, desc="Building formulary cohorts", unit="cohort")
-    for event_type, cohort_year in progress:
-        progress.set_postfix_str(f"{event_type}/{cohort_year}")
-        output_path = destination_dir / f"{event_type}_quarter_cohort_{cohort_year}.csv"
-        prepare_output_path(output_path, overwrite=True)
+    for event_type, cohort_year, cohort_quarter in progress:
+        cohort_tag = (
+            canonical_year_q(cohort_year, cohort_quarter)
+            if cohort_quarter is not None else str(cohort_year)
+        )
+        progress.set_postfix_str(f"{event_type}/{cohort_tag}")
+        output_path = destination_dir / f"{event_type}_quarter_cohort_{cohort_tag}.csv"
         cohort = build_one_cohort(
             drug_quarter_paths,
-            cohort_windows[cohort_year],
+            cohort_windows[(cohort_year, cohort_quarter)],
             first_seen_qtime,
             first_seen_year_offset,
             first_seen_quarter,
@@ -877,8 +1095,15 @@ def build_cohort_outputs(
             stay_column,
             event_type,
             cohort_year,
+            cohort_quarter,
         )
-        progress.set_postfix_str(f"{event_type}/{cohort_year}: writing cohort CSV")
+        if cohort_quarter is not None and not cohort[["treated_a", "treated_b"]].eq(1).any().any():
+            if output_path.exists():
+                output_path.unlink()
+            print(f"Skipping {event_type}/{cohort_tag}: no treated drug-firm ids remain.")
+            continue
+        prepare_output_path(output_path, overwrite=True)
+        progress.set_postfix_str(f"{event_type}/{cohort_tag}: writing cohort CSV")
         cohort.to_csv(output_path, index=False)
         del cohort
         gc.collect()
@@ -890,34 +1115,46 @@ def build_cohort_outputs(
 def main() -> None:
     """Build slim drug-quarter panels, then construct all requested cohorts."""
     (
+        quarter,
         chunksize,
         window_pre,
         window_post,
+        quarter_pre_periods,
+        quarter_post_periods,
         time_shift,
+        rebuild_drug_quarter_panels,
         first_seen_year_offset,
         first_seen_quarter,
     ) = validate_config(RUN_CONFIG)
-    source_dir = quarter_input_dir(time_shift)
-    drug_output_dir = drug_quarter_output_dir(time_shift)
+    source_dir = quarter_input_dir(time_shift, quarter)
+    drug_output_dir = drug_quarter_output_dir(time_shift, quarter)
     cohort_destination_dir = cohort_output_dir(
         time_shift,
         first_seen_year_offset,
         first_seen_quarter,
+        quarter,
     )
+    movement, candidate, stay_column = load_event_sources(quarter)
+    specifications = cohort_specifications(movement, quarter)
+    if not specifications:
+        raise ValueError("No req1 event cohorts were found for the configured years.")
     sources = available_quarter_paths(source_dir)
     quarter_tags, cohort_windows = required_quarters(
         sources,
         window_pre,
         window_post,
+        specifications,
+        quarter,
+        quarter_pre_periods,
+        quarter_post_periods,
     )
-    first_seen_qtime = load_first_seen_lookup(first_seen_path(time_shift))
-    movement, candidate, stay_column = load_event_sources()
-    drug_quarter_paths = build_drug_quarter_panels(
-        quarter_tags,
-        sources,
-        drug_output_dir,
-        chunksize,
-    )
+    first_seen_qtime = load_first_seen_lookup(first_seen_path(time_shift, quarter))
+    if rebuild_drug_quarter_panels:
+        drug_quarter_paths = build_drug_quarter_panels(
+            quarter_tags, sources, drug_output_dir, chunksize
+        )
+    else:
+        drug_quarter_paths = existing_drug_quarter_panels(quarter_tags, drug_output_dir)
     build_cohort_outputs(
         drug_quarter_paths,
         cohort_windows,
@@ -928,8 +1165,10 @@ def main() -> None:
         candidate,
         stay_column,
         cohort_destination_dir,
+        specifications,
     )
-    print(f"Saved drug-quarter panels to: {drug_output_dir}")
+    action = "Saved" if rebuild_drug_quarter_panels else "Reused"
+    print(f"{action} drug-quarter panels at: {drug_output_dir}")
     print(f"Saved combined-direction cohorts to: {cohort_destination_dir}")
 
 
