@@ -1,6 +1,10 @@
 tmp/
 output/
 __pycache__/
+*.pyc
+.pytest_cache/
+pytest-cache-files-*/
+.mypy_cache/
 0630/
 0706/
 0713/
@@ -9,5 +13,7 @@ __pycache__/
 0803/
 0810/
 0817/
+0907/
+0925/
 copayonly/
 year_level/
