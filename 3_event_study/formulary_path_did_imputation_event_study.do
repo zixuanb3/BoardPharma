@@ -36,11 +36,14 @@ set trace off
 
 * ================= user config =================
 local events to_B_still_in_A to_B_not_in_A interlock_dissolution
-local treatment_groups B
-local targets included tier_raw tier_upgrade tier_downgrade avg_copay_amt prefer
+local treatment_groups B A
+local targets included tier_raw avg_copay_amt
+* tier_upgrade tier_downgrade
+* The quarterly path panel stores copay as avg_copay_amt. tierA is not emitted
+* by PlanPanelMaker's quarterly path schema, and prefer is disabled in this run.
 * Uniformly sample this fraction of distinct history_id paths inside each cohort.
 * Sampling is independent of n_path; 1 keeps every path and 0 keeps none.
-local path_sample_fraction 1
+local path_sample_fraction 0.1
 local path_sample_seed 20260818
 * 1 uses event-quarter cohorts; 0 retains the event-year cohort design.
 local quarter_event 1
@@ -51,7 +54,7 @@ local control not
 local include_eventpair 0
 local personnel_definition narrow
 local large_sample 1
-local analysis_level state
+local analysis_level plan
 local formulary_time_shift_quarters 1
 local first_seen_year_offset -1
 local first_seen_quarter 1
@@ -220,25 +223,31 @@ postfile `sample_post' ///
 local retained_outcomes included tier_upgrade tier_downgrade prefer `targets'
 local retained_outcomes : list uniq retained_outcomes
 local cohort_required_vars "data_cohort"
+local source_company_var "boardname"
 if `quarter_event' == 1 {
     local cohort_required_vars "data_cohort_year data_cohort_quarter data_cohort_qtime"
+    local source_company_var "id"
 }
 set seed `path_sample_seed'
 foreach event of local events {
     local cohort_list "2020 2021 2022 2023 2024"
     if `quarter_event' == 1 {
-        local cohort_list ""
-        forvalues cohort_year = 2020/2024 {
-            forvalues cohort_quarter = 1/4 {
-                local cohort_tag "`cohort_year'Q`cohort_quarter'"
-                capture confirm file "`data_path'/`event'_path_quarter_cohort_`cohort_tag'.csv"
-                if !_rc local cohort_list "`cohort_list' `cohort_tag'"
-            }
+        * Explicitly retain only cohorts with at least one sharing event NDC.
+        * FormularyPanelStats and FormularyPanelEventStats produced identical
+        * positive-quarter lists for A and B at ATC3.
+        if "`event'" == "to_B_still_in_A" {
+            local cohort_list "2020Q1 2022Q1 2024Q1"
         }
-        if "`cohort_list'" == "" {
-            di as error "No quarterly path cohort files for `event' in `data_path'."
-            exit 601
+        else if "`event'" == "to_B_not_in_A" {
+            local cohort_list "2024Q1"
         }
+        else if "`event'" == "interlock_dissolution" {
+            local cohort_list "2021Q3 2022Q3 2024Q3 2024Q4"
+        }
+    }
+    if "`cohort_list'" == "" {
+        di as text "Skipping `event': no cohort has a sharing event NDC."
+        continue
     }
     local event_lower = lower("`event'")
     if "`event'" == "to_B_not_in_A" {
@@ -268,7 +277,7 @@ foreach event of local events {
 
         import delimited "`data_file'", clear varnames(1) case(lower) ///
             stringcols(`import_stringcols')
-        foreach required in history_id n_path n_path_copay n_path_prefer ndc boardname ///
+        foreach required in history_id n_path n_path_copay n_path_prefer ndc `source_company_var' ///
             year quarter ///
             `cohort_required_vars' ///
             treated_a treated_b sample_a sample_b ///
@@ -280,6 +289,7 @@ foreach event of local events {
                 exit 111
             }
         }
+        rename `source_company_var' companyid
         rename `imported_share_a' cohort_sharing_a
         rename `imported_share_b' cohort_sharing_b
         if `quarter_event' == 1 {
@@ -339,7 +349,7 @@ foreach event of local events {
             drop __path_tag __path_draw __path_rank __path_count ///
                 __path_selected __path_selected_all
         }
-        keep history_id n_path n_path_copay n_path_prefer ndc boardname ///
+        keep history_id n_path n_path_copay n_path_prefer ndc companyid ///
             year quarter data_cohort data_cohort_year data_cohort_quarter data_cohort_qtime ///
             treated_a treated_b sample_a sample_b `panel_event_vars' ///
             cohort_sharing_a cohort_sharing_b `retained_outcomes'
@@ -481,9 +491,9 @@ foreach event of local events {
             * Freeze the event-specific sharing classification at cohort Q1,
             * exactly as in the existing formulary cohort construction.
             tempvar q1_share_min q1_share_max
-            bysort ndc boardname data_cohort: egen byte `q1_share_min' = ///
+            bysort ndc companyid data_cohort: egen byte `q1_share_min' = ///
                 min(cond(year == data_cohort_year & quarter == data_cohort_quarter, `sharing_source', .))
-            bysort ndc boardname data_cohort: egen byte `q1_share_max' = ///
+            bysort ndc companyid data_cohort: egen byte `q1_share_max' = ///
                 max(cond(year == data_cohort_year & quarter == data_cohort_quarter, `sharing_source', .))
             assert !missing(`q1_share_min') & `q1_share_min' == `q1_share_max'
             gen byte atc_sharing = `q1_share_max'
@@ -523,17 +533,17 @@ foreach event of local events {
             gen int q_time = yq(year, quarter)
             format q_time %tq
             assert inrange(quarter, 1, 4)
-            assert !missing(ndc) & !missing(boardname)
+            assert !missing(ndc) & !missing(companyid)
             assert !missing(history_id)
             assert `weight_var' > 0
-            bysort ndc boardname data_cohort: ///
+            bysort ndc companyid data_cohort: ///
                 assert treated_in_stack == treated_in_stack[1]
-            bysort ndc boardname data_cohort: ///
+            bysort ndc companyid data_cohort: ///
                 assert atc_sharing == atc_sharing[1]
-            bysort ndc data_cohort boardname: gen byte board_tag = _n == 1
-            bysort ndc data_cohort: egen int board_count = total(board_tag)
-            assert board_count == 1
-            drop board_tag board_count
+            bysort ndc data_cohort companyid: gen byte company_tag = _n == 1
+            bysort ndc data_cohort: egen int company_count = total(company_tag)
+            assert company_count == 1
+            drop company_tag company_count
             egen long id = group(history_id ndc data_cohort)
             egen long history_cohort_q = group(history_id data_cohort q_time)
             isid id q_time
@@ -573,7 +583,7 @@ foreach event of local events {
                     exit 111
                 }
                 tempvar first_other_q other_history
-                bysort boardname data_cohort: egen `first_other_q' = ///
+                bysort companyid data_cohort: egen `first_other_q' = ///
                     min(cond(`other_event' == 1, q_time, .))
                 gen byte `other_history' = ///
                     !missing(`first_other_q') & q_time >= `first_other_q'
@@ -595,7 +605,7 @@ foreach event of local events {
                 fe(`fe_spec') ///
                 horizons(`did_horizons') pretrends(`did_pretrends') ///
                 hetby(atc_sharing_het) autosample tol(0.1) minn(0) ///
-                cluster(boardname)
+                cluster(companyid)
             local did_rc = _rc
             if `did_rc' != 0 {
                 di as error "did_imputation failed with r(`did_rc')."
@@ -754,7 +764,7 @@ foreach event of local events {
                 egen byte `id_tag' = tag(id) if `did_sample' & `condition'
                 quietly count if `id_tag' == 1
                 local ids_`group' = r(N)
-                egen byte `firm_tag' = tag(boardname) if `did_sample' & `condition'
+                egen byte `firm_tag' = tag(companyid) if `did_sample' & `condition'
                 quietly count if `firm_tag' == 1
                 local firms_`group' = r(N)
             }

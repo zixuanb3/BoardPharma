@@ -1,9 +1,10 @@
 r"""
 Purpose:
 Build memory-safe formulary-level event-study panels from the expanded brand
-formulary CSV. The output unit is FORMULARY_ID by BoardName by NDC by quarter.
+formulary CSV. In quarterly mode, the output unit is FORMULARY_ID by company id
+by NDC by quarter.
 All movement event types, both A/B treatment sides, balance flags, and
-direction-specific ATC1--ATC4 sharing indicators are stored in one panel.
+direction-specific ATC3 sharing indicators are stored in one panel.
 
 Process:
 1. Read FORMULARY_ID only, split complete formularies into fixed blocks, then
@@ -20,7 +21,7 @@ Process:
    together.
 
 Input:
-- D:/task1_expanded_brand_panel/task1_expanded_brand_panel.csv
+- D:/pharma/formulary/task1_expanded_brand_panel.csv
 - data/event_tables/movement_table_formulary_large_sample_{definition}.csv
 - data/event_tables/movement_event_candidates_formulary_large_sample_{definition}.csv
 - data/event_tables/movement_table_formulary_quarter_narrow.csv (quarter=1)
@@ -30,11 +31,11 @@ Output:
 - quarter=0: data/formulary_panel/shift_q1/formulary_panel_1.csv through
   formulary_panel_{n_formulary_blocks}.csv; metadata:
   data/formulary_metadata/ndc_first_seen_shift_q1.csv; temporary files:
-  D:/task1_expanded_brand_panel/formulary_panel_staging/narrow_req1_shift_q1/.
+  D:/pharma/formulary/formulary_panel_staging/narrow_req1_shift_q1/.
 - quarter=1: data/formulary_panel_quarter/shift_q1/formulary_panel_1.csv
   through formulary_panel_{n_formulary_blocks}.csv; metadata:
   data/formulary_metadata/ndc_first_seen_quarter_shift_q1.csv; temporary
-  files: D:/task1_expanded_brand_panel/formulary_panel_staging_quarter/
+  files: D:/pharma/formulary/formulary_panel_staging_quarter/
   narrow_req1_shift_q1/.
 """
 
@@ -57,7 +58,7 @@ OUTPUT_BASE_PATH = PROJECT_ROOT / "data" / "formulary_panel"
 FIRST_SEEN_PATH = PROJECT_ROOT / "data" / "formulary_metadata" / "ndc_first_seen.csv"
 EVENT_TABLE_DIR = PROJECT_ROOT / "data" / "event_tables"
 
-RAW_FORMULARY_PATH = Path(r"D:\task1_expanded_brand_panel\task1_expanded_brand_panel.csv")
+RAW_FORMULARY_PATH = Path(r"D:\pharma\formulary\task1_expanded_brand_panel.csv")
 STAGING_BASE_PATH = RAW_FORMULARY_PATH.parent / "formulary_panel_staging"
 
 PERSONNEL_DEFINITIONS = {"narrow", "medium", "broad"}
@@ -67,7 +68,7 @@ MOVEMENT_EVENTS = {
     "interlock_dissolution",
 }
 TREATMENT_GROUPS = {"A", "B"}
-ATC_LEVELS = (1, 2, 3, 4)
+ATC_LEVELS = (3,)
 FIRST_SEEN_QTIME_COLUMN = "_first_seen_qtime"
 
 
@@ -124,7 +125,7 @@ RUN_CONFIG = {
     "treatment_groups": ["A", "B"],
     "large_sample": 1,
     "personnel_definition": "narrow",
-    "atc": [1, 2, 3, 4],
+    "atc": [3],
     "req": 1,
     "formulary_time_shift_quarters": 1,
     "n_formulary_blocks": 30,
@@ -148,6 +149,16 @@ def clean_string(series: pd.Series, uppercase: bool = False) -> pd.Series:
     result = series.astype("string").str.strip()
     result = result.mask(result.eq(""), pd.NA)
     return result.str.upper() if uppercase else result
+
+
+def validate_company_id(series: pd.Series, source_name: str) -> pd.Series:
+    """Return positive integer company ids and reject missing or fractional values."""
+    numeric = pd.to_numeric(series, errors="raise")
+    invalid = numeric.isna() | numeric.le(0) | numeric.ne(numeric.round())
+    if invalid.any():
+        examples = series.loc[invalid].drop_duplicates().head(10).tolist()
+        raise ValueError(f"{source_name}.id contains invalid values. Examples: {examples}")
+    return numeric.astype("int32")
 
 
 def parse_year_quarter(data: pd.DataFrame, source_name: str) -> pd.DataFrame:
@@ -257,7 +268,7 @@ def validate_config(config: dict[str, object]) -> tuple[
 
     atc_levels = tuple(sorted({int(value) for value in ensure_list(config["atc"])}))
     if not atc_levels or set(atc_levels) - set(ATC_LEVELS):
-        raise ValueError("atc must contain one or more values from 1, 2, 3, and 4.")
+        raise ValueError("atc must contain ATC level 3 only.")
 
     req = int(config["req"])
     if req not in ({0, 1} if quarter else {0, 1, 2}):
@@ -297,25 +308,26 @@ def validate_config(config: dict[str, object]) -> tuple[
 # ========================== DATA LOADERS ==========================
 
 
-def required_input_columns(atc_levels: Iterable[int]) -> set[str]:
+def required_input_columns(atc_levels: Iterable[int], quarter: int = 0) -> set[str]:
     """Return columns that must exist in the raw formulary CSV."""
     return {
         "YEAR_Q",
         "FORMULARY_ID",
-        "BoardName",
+        "id" if quarter else "BoardName",
         "NDC",
         "included",
         "tier_raw",
+        "max_tier",
         *(f"ATC{level}" for level in atc_levels),
     }
 
 
-def validate_raw_schema(atc_levels: Iterable[int]) -> None:
+def validate_raw_schema(atc_levels: Iterable[int], quarter: int = 0) -> None:
     """Read only the header and validate raw formulary fields needed downstream."""
     if not RAW_FORMULARY_PATH.exists():
         raise FileNotFoundError(f"Raw formulary panel not found: {RAW_FORMULARY_PATH}")
     columns = list(pd.read_csv(RAW_FORMULARY_PATH, nrows=0).columns)
-    missing = sorted(required_input_columns(atc_levels) - set(columns))
+    missing = sorted(required_input_columns(atc_levels, quarter) - set(columns))
     if missing:
         raise KeyError(f"Raw formulary panel is missing required columns: {missing}")
 
@@ -333,14 +345,18 @@ def load_event_flags(
         raise FileNotFoundError(f"Movement event table not found: {path}")
 
     event_table = pd.read_csv(path, dtype="string")
-    required = {"BoardName", "year", "event_type", "firm_type", f"req{req}"}
+    firm_column = "id" if quarter else "BoardName"
+    required = {firm_column, "year", "event_type", "firm_type", f"req{req}"}
     if quarter:
         required.add("quarter")
     missing = sorted(required - set(event_table.columns))
     if missing:
         raise KeyError(f"{path.name} is missing columns: {missing}")
 
-    event_table["BoardName"] = clean_string(event_table["BoardName"], uppercase=True)
+    if quarter:
+        event_table[firm_column] = validate_company_id(event_table[firm_column], path.name)
+    else:
+        event_table[firm_column] = clean_string(event_table[firm_column], uppercase=True)
     event_table["event_type"] = clean_string(event_table["event_type"])
     event_table["firm_type"] = clean_string(event_table["firm_type"], uppercase=True)
     event_table["year"] = pd.to_numeric(event_table["year"], errors="raise").astype("int16")
@@ -350,7 +366,7 @@ def load_event_flags(
 
     flag_parts: list[pd.DataFrame] = []
     event_years: dict[str, set[int]] = {}
-    keys = ["BoardName", "year", "quarter"] if quarter else ["BoardName", "year"]
+    keys = [firm_column, "year", "quarter"] if quarter else [firm_column, "year"]
     for event_type in event_types:
         for treatment_group in treatment_groups:
             column = event_column(event_type, treatment_group)
@@ -409,11 +425,14 @@ def load_candidate_pairs(
 
     candidates = pd.read_csv(path, dtype="string")
     stay_column = f"stay_{stay_x_years * 4}_quarters" if quarter else f"stay_{stay_x_years}_years"
+    source_a, source_b = ("idA", "idB") if quarter else ("FirmA", "FirmB")
+    firm_column = "id" if quarter else "BoardName"
+    pair_column = "idPair" if quarter else "BoardNamePair"
     required = {
         "event_type",
         "event_year",
-        "FirmA",
-        "FirmB",
+        source_a,
+        source_b,
         stay_column,
         "requirement1",
     }
@@ -429,8 +448,11 @@ def load_candidate_pairs(
     candidates["event_year"] = pd.to_numeric(candidates["event_year"], errors="raise").astype("int16")
     if quarter:
         candidates["event_quarter"] = validate_event_quarter(candidates["event_quarter"], path.name)
-    for column in ("FirmA", "FirmB"):
-        candidates[column] = clean_string(candidates[column], uppercase=True)
+    for column in (source_a, source_b):
+        if quarter:
+            candidates[column] = validate_company_id(candidates[column], path.name)
+        else:
+            candidates[column] = clean_string(candidates[column], uppercase=True)
     condition_columns = (stay_column, "requirement1") if quarter else (
         stay_column, "requirement1", "requirement2_A", "requirement2_B"
     )
@@ -438,7 +460,7 @@ def load_candidate_pairs(
         candidates[column] = pd.to_numeric(candidates[column], errors="raise").astype("int8")
 
     pairs_by_event: dict[str, pd.DataFrame] = {}
-    keys = ["BoardName", "year", "quarter"] if quarter else ["BoardName", "year"]
+    keys = [firm_column, "year", "quarter"] if quarter else [firm_column, "year"]
     candidate_columns = ["event_year", "event_quarter"] if quarter else ["event_year"]
     for event_type in event_types:
         for side in treatment_groups:
@@ -446,13 +468,21 @@ def load_candidate_pairs(
             subset = candidates.loc[
                 candidates["event_type"].eq(event_type)
                 & candidate_condition(candidates, req, side, stay_column),
-                [*candidate_columns, "FirmA", "FirmB"],
+                [*candidate_columns, source_a, source_b],
             ].dropna()
 
             if side == "A":
-                pairs = subset.rename(columns={"event_year": "year", "FirmA": "BoardName", "FirmB": "BoardNamePair"})
+                pairs = subset.rename(columns={
+                    "event_year": "year",
+                    source_a: firm_column,
+                    source_b: pair_column,
+                })
             else:
-                pairs = subset.rename(columns={"event_year": "year", "FirmB": "BoardName", "FirmA": "BoardNamePair"})
+                pairs = subset.rename(columns={
+                    "event_year": "year",
+                    source_b: firm_column,
+                    source_a: pair_column,
+                })
             if quarter:
                 pairs = pairs.rename(columns={"event_quarter": "quarter"})
             pairs = pairs.drop_duplicates().reset_index(drop=True)
@@ -656,7 +686,8 @@ def add_event_flags(
     data: pd.DataFrame, event_flags: pd.DataFrame, event_columns: list[str], quarter: int = 0,
 ) -> pd.DataFrame:
     """Merge firm events in Q1 (annual) or their actual quarter (quarterly)."""
-    keys = ["BoardName", "year", "quarter"] if quarter else ["BoardName", "year"]
+    firm_column = "id" if quarter else "BoardName"
+    keys = [firm_column, "year", "quarter"] if quarter else [firm_column, "year"]
     result = data.merge(event_flags, on=keys, how="left", validate="many_to_one")
     result[event_columns] = result[event_columns].fillna(0).astype("int8")
     if not quarter:
@@ -808,23 +839,23 @@ def partner_atc_codes_quarter(
     atc_column: str,
 ) -> pd.DataFrame:
     """Collect partner ATC codes from NDCs first seen by event t+3."""
-    output_columns = ["year", "quarter", "BoardNamePair", "atc_code"]
+    output_columns = ["year", "quarter", "idPair", "atc_code"]
     if partner_scope.empty:
         return pd.DataFrame(columns=output_columns)
 
-    scope = partner_scope.rename(columns={"BoardNamePair": "BoardName"}).copy()
+    scope = partner_scope.rename(columns={"idPair": "id"}).copy()
     scope["event_qtime"] = scope["year"].astype("int32") * 4 + scope["quarter"].astype("int32")
     source = data.loc[
         data[atc_column].notna(),
-        ["year", "quarter", "BoardName", "NDC", atc_column, FIRST_SEEN_QTIME_COLUMN],
+        ["year", "quarter", "id", "NDC", atc_column, FIRST_SEEN_QTIME_COLUMN],
     ].drop_duplicates()
-    source = source.loc[source["BoardName"].isin(scope["BoardName"])].drop_duplicates()
+    source = source.loc[source["id"].isin(scope["id"])].drop_duplicates()
     if source.empty:
         return pd.DataFrame(columns=output_columns)
 
     scoped = source.merge(
         scope,
-        on=["year", "quarter", "BoardName"],
+        on=["year", "quarter", "id"],
         how="inner",
         validate="many_to_many",
     )
@@ -834,8 +865,8 @@ def partner_atc_codes_quarter(
     if scoped.empty:
         return pd.DataFrame(columns=output_columns)
 
-    atoms = explode_atc_codes(scoped, atc_column, ["year", "quarter", "BoardName"])
-    return atoms.rename(columns={"BoardName": "BoardNamePair"})[output_columns].drop_duplicates()
+    atoms = explode_atc_codes(scoped, atc_column, ["year", "quarter", "id"])
+    return atoms.rename(columns={"id": "idPair"})[output_columns].drop_duplicates()
 
 
 def add_sharing_flags(
@@ -851,12 +882,14 @@ def add_sharing_flags(
     """Add direction-specific event ATC overlap flags without duplicating outcome rows."""
     data["_row_id"] = np.arange(len(data), dtype=np.int64)
     all_pairs = pd.concat(candidate_pairs.values(), ignore_index=True)
-    partner_keys = ["year", "quarter", "BoardNamePair"] if quarter else ["year", "BoardNamePair"]
+    pair_column = "idPair" if quarter else "BoardNamePair"
+    firm_column = "id" if quarter else "BoardName"
+    partner_keys = ["year", "quarter", pair_column] if quarter else ["year", pair_column]
     partner_scope = all_pairs[partner_keys].drop_duplicates()
     if not quarter:
         partner_scope = partner_scope.rename(columns={"BoardNamePair": "BoardName"})
         partner_available_mask = available_by_event_year_end(data)
-    event_keys = ["year", "quarter", "BoardName"] if quarter else ["year", "BoardName"]
+    event_keys = ["year", "quarter", firm_column] if quarter else ["year", firm_column]
 
     for atc_level in atc_levels:
         atc_column = f"ATC{atc_level}"
@@ -896,7 +929,7 @@ def add_sharing_flags(
                         )
                         matches = paired_codes.merge(
                             partners,
-                            on=["year", "quarter", "BoardNamePair", "atc_code"] if quarter
+                            on=["year", "quarter", pair_column, "atc_code"] if quarter
                             else ["year", "BoardNamePair", "atc_code"],
                             how="inner",
                             validate="many_to_many",
@@ -917,17 +950,40 @@ def add_sharing_flags(
 
 
 def add_tier_a(data: pd.DataFrame) -> pd.DataFrame:
-    """Copy tier_raw and fill uncovered rows with the current formula-quarter maximum plus one."""
+    """Copy tier_raw and fill uncovered rows with the supplied max_tier plus one."""
     data["tier_raw"] = pd.to_numeric(data["tier_raw"], errors="coerce")
-    current_max = data.groupby(["FORMULARY_ID", "YEAR_Q"])["tier_raw"].transform("max")
-    data["tierA"] = data["tier_raw"].where(data["tier_raw"].notna(), current_max + 1)
+    data["max_tier"] = pd.to_numeric(data["max_tier"], errors="raise")
+
+    missing_max = data["max_tier"].isna()
+    if missing_max.any():
+        examples = data.loc[
+            missing_max, ["FORMULARY_ID", "YEAR_Q"]
+        ].drop_duplicates().head(10)
+        raise ValueError(f"max_tier is missing for some formulary-quarters. Examples:\n{examples}")
+
+    max_tier_counts = data.groupby(["FORMULARY_ID", "YEAR_Q"])["max_tier"].nunique()
+    inconsistent = max_tier_counts[max_tier_counts.ne(1)]
+    if not inconsistent.empty:
+        raise ValueError(
+            "max_tier is not unique within some FORMULARY_ID by YEAR_Q groups. "
+            f"Examples:\n{inconsistent.head(10)}"
+        )
+
+    tier_exceeds_max = data["tier_raw"].notna() & data["tier_raw"].gt(data["max_tier"])
+    if tier_exceeds_max.any():
+        examples = data.loc[
+            tier_exceeds_max,
+            ["FORMULARY_ID", "YEAR_Q", "NDC", "tier_raw", "max_tier"],
+        ].head(10)
+        raise ValueError(f"tier_raw exceeds max_tier. Examples:\n{examples}")
+
+    data["tierA"] = data["tier_raw"].fillna(data["max_tier"] + 1)
 
     unresolved = data["tierA"].isna()
     if unresolved.any():
         examples = data.loc[unresolved, ["FORMULARY_ID", "YEAR_Q"]].drop_duplicates().head(10)
         raise ValueError(
-            "tierA cannot be constructed because some FORMULARY_ID by YEAR_Q groups have no nonmissing "
-            f"tier_raw value. Examples:\n{examples}"
+            f"tierA could not be constructed. Examples:\n{examples}"
         )
     return data
 
@@ -957,11 +1013,18 @@ def process_block(
 
         progress.set_postfix_str("validating identifiers and quarters")
         data["FORMULARY_ID"] = clean_string(data["FORMULARY_ID"])
-        data["BoardName"] = clean_string(data["BoardName"], uppercase=True)
         data["NDC"] = clean_string(data["NDC"])
-        if data[["FORMULARY_ID", "NDC"]].isna().any().any():
-            raise ValueError(f"{stage_path.name} contains missing FORMULARY_ID or NDC values.")
-        data = data.dropna(subset=["BoardName"])
+        firm_column = "id" if quarter else "BoardName"
+        if quarter:
+            data[firm_column] = validate_company_id(data[firm_column], stage_path.name)
+        else:
+            data[firm_column] = clean_string(data[firm_column], uppercase=True)
+            data = data.dropna(subset=[firm_column])
+        required_identifiers = ["FORMULARY_ID", firm_column, "NDC"]
+        if data[required_identifiers].isna().any().any():
+            raise ValueError(
+                f"{stage_path.name} contains missing values in {required_identifiers}."
+            )
         data = parse_year_quarter(data, stage_path.name)
         data[FIRST_SEEN_QTIME_COLUMN] = data["NDC"].map(first_seen_qtime)
         if data[FIRST_SEEN_QTIME_COLUMN].isna().any():
@@ -1030,7 +1093,7 @@ def main() -> None:
         quarter,
     ) = validate_config(RUN_CONFIG)
     chunksize = int(RUN_CONFIG["chunksize"])
-    validate_raw_schema(atc_levels)
+    validate_raw_schema(atc_levels, quarter)
     suffix = movement_suffix(large_sample, personnel_definition, quarter)
 
     event_flags, event_years = load_event_flags(event_types, treatment_groups, req, suffix, quarter)

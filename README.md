@@ -12,9 +12,11 @@ Both pipelines construct event-level data from BoardEx director-board affiliatio
 ```text
 BoardPharma/
 ├── codes/
+│   ├── 02_code/          Upstream formulary, ATC, expansion, and copay preparation
 │   ├── 1_data_prep/       Event, panel, and cohort construction
 │   ├── 2_stats/           Descriptive statistics and diagnostics
 │   └── 3_event_study/     Stata estimation and inference programs
+├── crosswalks/            Labeler, BoardEx, company-name, and component-ID mappings
 ├── InterimData/           Processed source data
 ├── data/                  Intermediate data and analysis panels
 ├── csv/                   Estimation results and sample summaries
@@ -86,68 +88,141 @@ The principal movement events are `to_B_not_in_A`, `to_B_still_in_A`, and `inter
 
 # Formulary Pipeline
 
-## Foundational Inputs
+The current quarterly Formulary workflow uses a standardized integer company `id` from the labeler-company crosswalk. Quarterly BoardEx events, formulary outcomes, ATC3 sharing, plan histories, and estimation all use that identifier. The older annual workflow remains available through the `quarter=0` branches and continues to use `BoardName`.
 
-### BoardEx Event Inputs
-
-- `InterimData/boardex_pharma.dta`: BoardEx director-board affiliations.
-- `InterimData/formulary_company_roster.csv`: company universe used to restrict BoardEx-derived event construction to the formulary sample.
-- `data/boardex/individual_employment_record.csv` and `organization_composition_record.csv`: quarterly BoardEx role records produced by `BoardexRecordMaker.py`.
-- `data/formulary_roster/formulary_roster_2019_2025.csv`: quarterly formulary director roster produced by `FormularyRosterMaker.py`.
-
-### Formulary, Plan, and Geographic Inputs
-
-- `D:/task1_expanded_brand_panel/task1_expanded_brand_panel.csv`: expanded branded-drug formulary source.
-- `InterimData/merged_plan_information.csv`: contract, plan, segment, and geographic characteristics.
-- `InterimData/copay_avg_by_plan_tier.csv` and `InterimData/copay_avg_with_prefer.csv`: plan-level cost-sharing outcomes.
-- `data/directory/Monthly_Report_By_Contract_YYYY_MM.csv`: CMS contract-directory inputs.
-- `crosswalks/pdp_region_state_crosswalk.csv` and `crosswalks/ma_region_state_crosswalk.csv`: region-to-state mappings.
-
-## Event Construction and Formulary Panel
-
-The Formulary pipeline uses `RawEventTableMaker.py` and `EventTableMaker.py` with either the annual company roster or the quarterly director roster. The resulting `movement_event_candidates_formulary_*` and `movement_table_formulary_*` files retain event timing, requirements, and directional firm-pair information. Quarterly events use their observed quarter and support `req0` and `req1`; annual events also support `req2`.
-
-The core construction sequence is:
+## Quarterly Workflow at a Glance
 
 ```text
-BoardEx records → quarterly roster → movement event tables
-                              + expanded formulary data
+CMS formulary + FDA NDC + standardized company crosswalk
         ↓
-FormularyPanelMaker.py
+company-linked non-generic formulary panel
         ↓
-ReorganizeFormularyData.py
+RxNav ATC3/ATC4 enrichment
         ↓
-Drug-firm, geographic, and plan-level cohort builders
+complete formulary-quarter × NDC expansion
+        ↓
+quarterly company roster → quarterly movement events
+        ↓
+company-id × formulary × NDC quarterly event panel
+        ↓
+calendar-quarter panel files + NDC first-seen metadata
+        ↓
+balanced CPS formulary histories + tier copay
+        ↓
+event-quarter path-by-NDC cohorts
+        ↓
+quarterly DID and ATC3-sharing DDD estimation
 ```
 
-1. `1_data_prep/FormularyPanelMaker.py` processes the expanded formulary data in complete-formulary blocks. It merges event and balance variables, constructs tier and ATC1-ATC4-sharing measures, and records the first quarter in which each NDC is included. Annual and quarterly event modes write separate `data/formulary_panel/` and `data/formulary_panel_quarter/` block files and matching `data/formulary_metadata/ndc_first_seen*.csv` files.
+The quarterly scripts currently use `formulary_time_shift_quarters=1`. `FormularyPanelMaker.py` shifts the raw formulary quarter forward once and writes the result under `shift_q1`. `PlanPanelMaker.py` applies the same shift to the beneficiary-cost source when it builds the CPS crosswalk and copay inputs. Event columns in the selected formulary panel are already aligned and are not shifted again.
 
-2. `1_data_prep/ReorganizeFormularyData.py` rewrites the block-level panel into quarter-specific `formulary_panel_YYYYQX.csv` files. Annual and quarterly event modes use separate output directories, with timing-shift subdirectories where configured.
+## 1. Company-Linked Formulary and Copay Inputs
 
-## Cohort Construction
+The upstream preparation scripts are in `02_code/` and should be run in the following order.
 
-1. `1_data_prep/FormularyCohortPanelMaker.py` aggregates quarterly observations to NDC-firm outcomes. It constructs inclusion counts and shares, mean tier measures, balanced event cohorts, and direction-specific treatment, sample, and ATC3-sharing indicators. Quarterly event cohorts use the observed event quarter, four pre-event quarters, and eight event/post-event quarters.
+1. `02_code/task1_panel_with_flags.py` reads the CMS basic-drug formulary and FDA product file, converts each NDC to its FDA NDC9 lookup key, and joins `LabelerName` to `id` through `crosswalks/labeler_company_mapping_standardized_with_id.csv`. It keeps mapped non-generic rows, records `tier_raw` and the formulary-quarter `max_tier`, and writes `data/formulary/formulary_panel_with_company_id.csv`.
 
-2. `1_data_prep/FormularyStateInsurerCohortPanelMaker.py` extends the NDC-firm cohort design to state, CMS Parent Organization, and joint state-insurer cells. It uses plan information, CMS directory data, and regional crosswalks for geographic assignment.
+2. `02_code/atc_all_classes.py` enriches that panel in place. It normalizes NDC11 values, uses the RxNav cache under `D:/pharma`, queries retryable or missing NDCs, and adds `ATC3`, `ATC4`, `n_atc`, and `ATC_status`. The current quarterly analysis uses ATC3; ATC4 is retained in the upstream panel for other uses.
 
-3. `1_data_prep/PlanPanelMaker.py` constructs balanced and reproducibly sampled contract-plan-segment-drug cohorts at plan, state, and county level. Its path-weighted mode supports annual and quarterly event cohorts; copay matching is configurable.
+3. `02_code/expand_brand_ndc_panel.py` expands every observed formulary-quarter to the complete NDC set in the company-linked panel. Actual source rows keep their tier and receive `included=1`; added rows receive `included=0`. The script validates formulary-quarter maximum tiers and NDC metadata, writes in disk-backed batches, and produces `D:/pharma/formulary/task1_expanded_brand_panel.csv`.
 
-NDC eligibility is defined by the global first quarter in which `included=1`. Eligible NDCs retain their complete cohort histories under the selected timing-alignment specification.
+4. `02_code/export_copay_csv.py` reads the beneficiary-cost source, keeps candidate formularies with `COVERAGE_LEVEL=1`, and calculates daily nonpreferred copay from `COST_TYPE_NONPREF`, the reported amount, or the available minimum-maximum range. It writes `D:/pharma/formulary/beneficiary_cost_with_copay.csv`, which is required by the quarterly plan workflow.
 
-## Descriptive Statistics
+## 2. Quarterly Company Roster and Movement Events
 
-- `2_stats/FormularyPanelStats.py` produces block-level coverage, event-incidence, and event-by-ATC-sharing summaries.
-- `2_stats/FormularyPanelEventStats.py` constructs annual Q1 or event-quarter diagnostics for event firms and NDCs by ATC1-ATC4-sharing status.
+`1_data_prep/BoardexRecordMaker.py` produces the quarterly individual-employment and organization-composition extracts used by the roster builder.
 
-## Estimation
+`1_data_prep/FormularyRosterMaker.py` combines three BoardEx sources for 2019-2025. In the standardized mapping mode, BP rows match the crosswalk on exact `BoardName`, while IE and OC rows match on exact `CompanyName`. The crosswalk's integer `id` is the common company identifier. BP observations are expanded from each observed director-company-year to quarters 1-4; IE and OC retain their observed quarters. The script audits ambiguous matches, combines `ie`, `oc`, and `bp` provenance, and writes `data/formulary_roster/formulary_roster_2019_2025.csv` with director, company-id, quarter, country, and source fields.
 
-- `3_event_study/formulary_did_imputation_event_study.do` estimates dynamic `did_imputation` models for NDC-firm, state, insurer, and state-insurer panels.
-- `3_event_study/formulary_ddd_atc3sharing_did_imputation.do` estimates ATC3-sharing triple differences for those panels.
-- `3_event_study/formulary_plan_did_imputation_event_study.do` estimates dynamic models for contract-plan-drug cohorts at plan, state, and county level.
-- `3_event_study/formulary_plan_ddd_atc3sharing_did_imputation.do` estimates plan-level ATC3-sharing triple differences.
-- `3_event_study/formulary_path_did_imputation_event_study.do` and `formulary_path_ddd_atc3sharing_did_imputation.do` estimate path-weighted models from annual or quarterly event cohorts.
+The quarterly event sequence is:
 
-The Formulary estimation programs stack event cohorts, implement direction-specific treatment definitions, classify ATC3 sharing at the cohort event time, apply the relevant NDC first-seen eligibility rule, and estimate `did_imputation` models with firm-level clustering. Dynamic programs export coefficients, autosample statistics, figures, and logs. Triple-difference programs additionally export result tables and sample summaries.
+```text
+data/formulary_roster/formulary_roster_2019_2025.csv
+        ↓ RawEventTableMaker.py
+movement_event_candidates_formulary_quarter_narrow.csv
+firm_interlock_panel_formulary_quarter_narrow.csv
+        ↓ EventTableMaker.py
+movement_table_formulary_quarter_narrow.csv
+```
+
+`1_data_prep/RawEventTableMaker.py` runs quarterly mode with `quarter=1`, `formulary=1`, and the narrow personnel definition. It compares adjacent director-quarter memberships, constructs the `to_B_not_in_A`, `to_B_still_in_A`, and `interlock_dissolution` candidates, uses `idA` and `idB` for the directional firms, and evaluates the default two-year persistence rule as `stay_8_quarters`.
+
+`1_data_prep/EventTableMaker.py` converts the candidate file to company-quarter event eligibility. Quarterly mode outputs `id`, `year`, `quarter`, event type, A/B treatment side, `req0`, and `req1`. Quarterly mode does not calculate `req2`; that requirement remains part of the annual workflow.
+
+## 3. Quarterly Formulary Event Panel
+
+`1_data_prep/FormularyPanelMaker.py` combines the expanded formulary with the quarterly event tables. The current configuration uses quarterly events, both A and B treatment directions, `req1`, ATC3 sharing, 30 complete-formulary blocks, and a one-quarter formulary timing shift.
+
+For each block, the script:
+
+1. validates `FORMULARY_ID`, NDC, company `id`, quarter, `max_tier`, and the supplied event fields;
+2. records the first shifted quarter in which each NDC has `included=1`;
+3. merges events on company `id`, year, and quarter;
+4. marks formulary-event-quarter balance over event time -4 through +7;
+5. computes direction-specific ATC3-sharing indicators using the event counterpart's eligible NDCs;
+6. validates that observed `tier_raw` never exceeds `max_tier` and assigns uncovered rows to `max_tier+1` when the constructed `tierA` outcome is needed; and
+7. writes complete-formulary block files without loading the full expanded panel into memory.
+
+With the current settings, the main outputs are:
+
+- `data/formulary_panel_quarter/shift_q1/formulary_panel_1.csv` through `formulary_panel_30.csv`;
+- `data/formulary_metadata/ndc_first_seen_quarter_shift_q1.csv`.
+
+`1_data_prep/ReorganizeFormularyData.py` must use the same quarter, block-count, and timing-shift settings. It streams the 30 block files and rewrites them as chronological files under `data/formulary_panel_quarter_by_time/shift_q1/formulary_panel_YYYYQX.csv`. Downstream quarterly statistics and plan cohorts read these time-split files.
+
+## 4. Quarterly Diagnostics
+
+`2_stats/FormularyPanelStats.py` reads the time-split quarterly panel in calendar order. In quarterly mode it reports coverage, event incidence, and ATC3-sharing counts for all three event types and both treatment directions. An event NDC enters the quarterly diagnostic only if its first included quarter is no later than event time -4.
+
+`2_stats/FormularyPanelEventStats.py` selects one representative formulary in each observed target quarter and reports unique event firms, firms with at least one ATC3-sharing event NDC, and sharing/non-sharing event-NDC counts. It saves the selected formulary and source-file manifests together with CSV summaries and figures.
+
+The quarterly diagnostic outputs are written under:
+
+- `csv/formulary_panel_stats/quarter/shift_q1/` and `figures/formulary_panel_stats/quarter/shift_q1/`;
+- `csv/formulary_panel_event_stats/quarter/shift_q1/` and `figures/formulary_panel_event_stats/quarter/shift_q1/`.
+
+## 5. Quarterly Plan-Path Cohorts
+
+`1_data_prep/PlanPanelMaker.py` is the active quarterly cohort builder. Quarterly mode is fixed at the CPS level, where one analysis unit is a `CONTRACT_ID × PLAN_ID × SEGMENT_ID`. State and county repetitions in the beneficiary-cost source do not create additional path weight.
+
+The current configuration uses `quarter=1`, `level="plan"`, `formulary_time_shift_quarters=1`, `path_weighted_mode=1`, and `prefer=0`. Quarterly copay is always read from `D:/pharma/formulary/beneficiary_cost_with_copay.csv`; `prefer=1` is optional and uses `D:/pharma/copay_avg_with_prefer.csv`.
+
+For each observed req1 event quarter from 2020 through 2024, the script:
+
+1. builds the event window from quarter -4 through quarter +7 and rejects missing internal quarter files;
+2. creates a shifted CPS-quarter-formulary crosswalk and averages daily copay to a unique CPS-quarter-tier value;
+3. keeps CPS units with plan and formulary coverage in every required quarter;
+4. collapses identical complete formulary histories into `history_id` and records the number of represented plans in `n_path`;
+5. calculates outcome-specific `n_path_copay` and, when enabled, `n_path_prefer` weights;
+6. expands each history across eligible NDCs, merges inclusion, tier, ATC3-sharing, and copay outcomes, and applies the req1/Not treated-control rules for both A and B; and
+7. writes one path-by-NDC file for each event-quarter cohort, with a checkpoint that permits an interrupted build to resume from the last completed quarter.
+
+Quarterly path cohorts are written to:
+
+`data/formulary_path_cohort_data_quarter/event/req1/Not/shift_q1/plan/{event}_path_quarter_cohort_YYYYQX.csv`
+
+The NDC first-seen field is carried into these files. The first row of a cohort history has no within-cohort predecessor; the builder does not import a pre-cohort formulary merely to fill that value.
+
+## 6. Quarterly Estimation
+
+`3_event_study/formulary_path_did_imputation_event_study.do` estimates dynamic path-weighted effects. `3_event_study/formulary_path_ddd_atc3sharing_did_imputation.do` estimates the corresponding ATC3-sharing triple differences.
+
+The current quarterly specifications:
+
+- estimate `included`, `tier_raw`, and `avg_copay_amt`;
+- run both A- and B-side treatment definitions;
+- use plan-level quarterly path cohorts with `shift_q1`;
+- sample 10 percent of distinct `history_id` paths within each cohort using the configured seed;
+- use company `id` for event classification, firm counts, other-event histories, and clustering; and
+- retain only event quarters with at least one ATC3-sharing event NDC.
+
+The retained quarterly cohorts are `2020Q1`, `2022Q1`, and `2024Q1` for `to_B_still_in_A`; `2024Q1` for `to_B_not_in_A`; and `2021Q3`, `2022Q3`, `2024Q3`, and `2024Q4` for `interlock_dissolution`.
+
+The dynamic program exports event-time coefficients, sample counts, figures, and logs. The DDD program exports sharing and non-sharing effects, comparison statistics, tables, sample summaries, and logs.
+
+## Legacy Annual Formulary Workflow
+
+The annual branch remains available for older analyses. It uses `BoardName`, supports `req0`, `req1`, and `req2`, can calculate ATC1-ATC4 sharing, and writes block files under `data/formulary_panel/`. `FormularyCohortPanelMaker.py` and `FormularyStateInsurerCohortPanelMaker.py` continue to build NDC-firm, state, insurer, and state-insurer cohorts. Annual `PlanPanelMaker.py` retains plan, state, and county options and the older plan-information and copay inputs. The annual Stata programs remain separate from the quarterly path specifications described above.
 
 ## Detailed Script Reference
 

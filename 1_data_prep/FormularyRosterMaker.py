@@ -4,17 +4,21 @@ Usage: python FormularyRosterMaker.py --start-year 2019 --end-year 2025
 Use --mapping-source to select the standardized or expanded formulary mapping.
 An explicit --mapping path overrides the default path for the selected source.
 Use --audit-only to inspect joins without writing a roster. Requires pandas.
-IE/OC eligibility uses CompanyID -> BoardName from ALL BP years, then the
-selected formulary mapping. Year bounds apply to roster rows, not this crosswalk.
+For the standardized mapping, BP eligibility is matched on BoardName and IE/OC
+eligibility is matched on CompanyName. The mapping's id is the common company
+identifier; source names, CompanyID and DirectorName are omitted from output.
+The expanded mapping retains the legacy CompanyID -> BoardName eligibility rule.
 BP expands each observed director/company/year into quarters 1-4 only.
 Unobserved years are never created, and attributes are not filled across years.
-IE and OC retain observed quarters. All eligible BoardName-labeler relationships are kept;
-deduplication compares the nine data columns, not only director/company/time.
+IE and OC retain observed quarters. Standardized source rows use BoardName,
+LabelerName and CompanyName only during matching and do not output those names.
+Standardized rows with the same director, period, country and id combine sources.
 The additional source column records contributing roster sources in fixed order
 ie-oc-bp (e.g. ie, oc-bp, or ie-oc-bp). Attribute lookups do not add sources;
 quarters filled by BP expansion count as bp. Identical rows within one source
 contribute that source only once. Missing data values remain in the output.
-Missing BP CompanyName matches remain blank and are reported in the audit.
+Expanded-stream BP CompanyName matches that are absent from IE/OC remain blank
+and are reported in the audit.
 """
 
 from __future__ import annotations
@@ -27,22 +31,32 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[2]
-COLUMNS = [
+EXPANDED_COLUMNS = [
     "BoardName", "DirectorName", "DirectorID", "CompanyID", "Year",
     "Quarter", "HOCountryName", "LabelerName", "CompanyName",
 ]
-RENAME = {name.lower(): name for name in COLUMNS}
+STANDARDIZED_COLUMNS = [
+    # "BoardName",  # Used to match BP, but not needed in standardized output.
+    # "DirectorName",  # Not needed when standardized id identifies the company.
+    "DirectorID",
+    # "CompanyID",  # BoardEx CompanyID is not used in the standardized stream.
+    "Year", "Quarter", "HOCountryName",
+    # "LabelerName",  # Used by the mapping, but id identifies the company.
+    # "CompanyName",  # Used to match IE/OC, but not needed in output.
+    "id",
+]
+RENAME = {name.lower(): name for name in EXPANDED_COLUMNS}
 SOURCE_ORDER = ("ie", "oc", "bp")
 MAPPING_PATHS = {
-    "standardized": ROOT / "crosswalks/labeler_company_mapping_standardized.csv",
+    "standardized": ROOT / "crosswalks/labeler_company_mapping_standardized_with_id.csv",
     "expanded": ROOT / "crosswalks/labeler_board_name_mapping_expanded.csv",
 }
 
 
-def merge_sources(frame: pd.DataFrame) -> pd.DataFrame:
-    """Deduplicate on all nine data columns and combine contributing sources."""
+def merge_sources(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Deduplicate on all output data columns and combine contributing sources."""
     return (
-        frame.groupby(COLUMNS, dropna=False, sort=False)["source"]
+        frame.groupby(columns, dropna=False, sort=False)["source"]
         .agg(lambda values: "-".join(
             source for source in SOURCE_ORDER if source in set(values)
         ))
@@ -67,9 +81,40 @@ def read_records(path: Path, start: int, end: int, ids: set[int],
     return pd.concat(parts, ignore_index=True)
 
 
-def variants(frame: pd.DataFrame, column: str) -> dict:
-    """Report IDs with multiple nonmissing attribute values."""
-    grouped = frame.groupby("CompanyID")[column].agg(
+def read_standardized_records(
+    path: Path,
+    start: int,
+    end: int,
+    company_names: set[str],
+    country: bool,
+) -> pd.DataFrame:
+    """Read period rows whose exact CompanyName appears in the standardized map."""
+    columns = [
+        "directorid",
+        # "directorname",  # Not needed in standardized roster output.
+        # "companyid",  # CompanyName, not CompanyID, determines eligibility.
+        "companyname", "year", "quarter",
+    ]
+    if country:
+        columns.append("hocountryname")
+    parts = []
+    for chunk in pd.read_csv(
+        path,
+        usecols=columns,
+        chunksize=250_000,
+        low_memory=False,
+    ):
+        selected = chunk.loc[
+            chunk.year.between(start, end)
+            & chunk.companyname.isin(company_names)
+        ]
+        parts.append(selected.rename(columns=RENAME))
+    return pd.concat(parts, ignore_index=True)
+
+
+def variants(frame: pd.DataFrame, column: str, key: str = "CompanyID") -> dict:
+    """Report keys with multiple nonmissing attribute values."""
+    grouped = frame.groupby(key)[column].agg(
         lambda values: sorted(set(values.dropna()))
     )
     return {str(key): values for key, values in grouped.items() if len(values) > 1}
@@ -86,6 +131,15 @@ def expand_bp(bp: pd.DataFrame) -> pd.DataFrame:
     ).sort_values(keys + ["Quarter"])
 
 
+def expand_standardized_bp(bp: pd.DataFrame) -> pd.DataFrame:
+    """Expand each observed DirectorID-BoardName-Year record to four quarters."""
+    keys = ["DirectorID", "BoardName", "Year"]
+    observed = bp.sort_values(keys, kind="stable").drop_duplicates(keys, keep="first")
+    return observed.merge(
+        pd.DataFrame({"Quarter": [1, 2, 3, 4]}), how="cross"
+    ).sort_values(keys + ["Quarter"])
+
+
 def read_mapping(path: Path, source: str) -> pd.DataFrame:
     """Read the selected mapping and retain eligible BoardName-labeler pairs."""
     if source == "expanded":
@@ -95,12 +149,31 @@ def read_mapping(path: Path, source: str) -> pd.DataFrame:
         keep = pd.to_numeric(mapping["audit_keep"], errors="coerce").eq(1)
         mapping = mapping.loc[keep, ["BoardName", "LabelerName"]]
     else:
-        mapping = pd.read_csv(path, usecols=["BoardName", "LabelerName"])
+        mapping = pd.read_csv(
+            path,
+            usecols=["LabelerName", "BoardName", "CompanyName", "id"],
+        )
+        mapping = mapping.dropna(subset=["id"]).copy()
+        mapping["id"] = pd.to_numeric(mapping["id"], errors="raise").astype("int64")
+        return mapping.drop_duplicates()
     return mapping.dropna(subset=["BoardName"]).drop_duplicates()
 
 
-def build(args: argparse.Namespace) -> None:
-    """Audit filtered joins, then optionally write the unified quarterly roster."""
+def validate_standardized_match_keys(mapping: pd.DataFrame) -> None:
+    """Require each exact source name to identify only one company id."""
+    for column in ["BoardName", "CompanyName"]:
+        matched = mapping.dropna(subset=[column])
+        ambiguous = matched.groupby(column)["id"].nunique()
+        ambiguous = ambiguous[ambiguous.gt(1)]
+        if not ambiguous.empty:
+            examples = ambiguous.index.tolist()[:10]
+            raise ValueError(
+                f"Exact {column} values map to multiple ids; examples: {examples}"
+            )
+
+
+def build_expanded(args: argparse.Namespace) -> None:
+    """Build the legacy expanded-mapping roster."""
     mapping = read_mapping(args.mapping, args.mapping_source)
     bp_all = pd.read_stata(args.bp, convert_categoricals=False).rename(columns={"year": "Year"})
     # Build the IE/OC crosswalk BEFORE applying any BP year filter.
@@ -158,7 +231,7 @@ def build(args: argparse.Namespace) -> None:
         "ie_missing_country_rows": int(ie.HOCountryName.isna().sum()),
         "ieoc_multiple_companynames": variants(names, "CompanyName"),
         "mapping_boardnames_with_multiple_labelers": int((mapping.groupby("BoardName").LabelerName.nunique() > 1).sum()),
-        "deduplication_columns": COLUMNS,
+        "deduplication_columns": EXPANDED_COLUMNS,
         "source_order": list(SOURCE_ORDER),
         "source_definition": "Roster row provenance; attribute lookups do not add sources; BP-filled quarters count as bp.",
     }
@@ -182,13 +255,13 @@ def build(args: argparse.Namespace) -> None:
         ignore_index=True,
     )
     combined = combined.merge(mapping, on="BoardName", how="left", validate="many_to_many")
-    combined = combined[COLUMNS + ["source"]]
+    combined = combined[EXPANDED_COLUMNS + ["source"]]
     for column in ["DirectorID", "CompanyID", "Year", "Quarter"]:
         if not combined[column].eq(combined[column].round()).all():
             raise ValueError(f"Noninteger values in {column}")
         combined[column] = combined[column].astype("int64")
     before = len(combined)
-    combined = merge_sources(combined).sort_values(
+    combined = merge_sources(combined, EXPANDED_COLUMNS).sort_values(
         ["CompanyID", "DirectorID", "Year", "Quarter", "LabelerName", "CompanyName"],
         kind="stable",
     )
@@ -202,6 +275,185 @@ def build(args: argparse.Namespace) -> None:
     print(f"Wrote {len(combined):,} rows to {output_path}", flush=True)
 
 
+def build_standardized(args: argparse.Namespace) -> None:
+    """Build a roster using mapping id as the cross-source company identity."""
+    mapping = read_mapping(args.mapping, args.mapping_source)
+    validate_standardized_match_keys(mapping)
+    board_mapping = mapping.dropna(subset=["BoardName"]).drop_duplicates()
+    company_mapping = mapping.dropna(subset=["CompanyName"]).drop_duplicates()
+    board_names = set(board_mapping["BoardName"])
+    company_names = set(company_mapping["CompanyName"])
+
+    bp_columns = [
+        "BoardName",
+        # "DirectorName",  # Not needed in standardized roster output.
+        "DirectorID",
+        # "CompanyID",  # BoardName, not CompanyID, determines eligibility.
+        "year", "HOCountryName",
+    ]
+    bp_all = pd.read_stata(
+        args.bp,
+        columns=bp_columns,
+        convert_categoricals=False,
+    ).rename(columns={"year": "Year"})
+    bp = bp_all.loc[
+        bp_all.Year.between(args.start_year, args.end_year)
+        & bp_all.BoardName.isin(board_names),
+        ["BoardName", "DirectorID", "Year", "HOCountryName"],
+    ]
+    if bp[["BoardName", "DirectorID", "Year"]].isna().any().any():
+        raise ValueError("BP has missing board/director/year keys.")
+
+    print("Reading and filtering IE by CompanyName...", flush=True)
+    ie = read_standardized_records(
+        args.ie, args.start_year, args.end_year, company_names, True
+    )
+    print("Reading and filtering OC by CompanyName...", flush=True)
+    oc = read_standardized_records(
+        args.oc, args.start_year, args.end_year, company_names, False
+    )
+    for name, frame in [("IE", ie), ("OC", oc)]:
+        keys = ["CompanyName", "DirectorID", "Year", "Quarter"]
+        if frame[keys].isna().any().any():
+            raise ValueError(f"{name} has missing company/director/time keys.")
+        if not frame.Quarter.isin([1, 2, 3, 4]).all():
+            raise ValueError(f"{name} contains an invalid quarter.")
+
+    country_conflicts = variants(
+        ie, "HOCountryName", key="CompanyName"
+    )
+    countries = ie[["CompanyName", "HOCountryName"]].dropna().drop_duplicates()
+    missing_oc_country = sorted(set(oc.CompanyName) - set(countries.CompanyName))
+
+    audit = {
+        "start_year": args.start_year,
+        "end_year": args.end_year,
+        "mapping_source": args.mapping_source,
+        "input_paths": {
+            key: str(getattr(args, key)) for key in ["mapping", "bp", "ie", "oc"]
+        },
+        "matching_rules": {
+            "BP": "Exact BoardName match to a nonmissing mapping BoardName.",
+            "IE": "Exact CompanyName match to a nonmissing mapping CompanyName.",
+            "OC": "Exact CompanyName match to a nonmissing mapping CompanyName.",
+            "company_identity": "Mapping id; CompanyID is not used.",
+        },
+        "filtered_rows": {"BP": len(bp), "IE": len(ie), "OC": len(oc)},
+        "filtered_names": {
+            "BP_BoardName": bp.BoardName.nunique(),
+            "IE_CompanyName": ie.CompanyName.nunique(),
+            "OC_CompanyName": oc.CompanyName.nunique(),
+        },
+        "mapping_ids": mapping.id.nunique(),
+        "mapping_boardnames": len(board_names),
+        "mapping_companynames": len(company_names),
+        "bp_observed_years": sorted(bp.Year.unique().tolist()),
+        "bp_expansion_rule": "Expand each observed DirectorID-BoardName-Year into quarters 1-4; do not create missing years.",
+        "oc_companynames_missing_ie_country": missing_oc_country,
+        "ie_companynames_with_multiple_countries": country_conflicts,
+        "ie_missing_country_rows": int(ie.HOCountryName.isna().sum()),
+        "deduplication_columns": STANDARDIZED_COLUMNS,
+        "source_order": list(SOURCE_ORDER),
+        "source_definition": "Roster row provenance combined in fixed ie-oc-bp order for identical standardized data columns.",
+    }
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"formulary_roster_{args.start_year}_{args.end_year}"
+    audit_path = args.output_dir / f"{stem}_audit.json"
+
+    def save_audit() -> None:
+        audit_path.write_text(
+            json.dumps(audit, indent=2, ensure_ascii=False, default=int),
+            encoding="utf-8",
+        )
+
+    save_audit()
+    print(json.dumps(audit, indent=2, ensure_ascii=False, default=int), flush=True)
+    if args.audit_only:
+        return
+    if country_conflicts:
+        raise ValueError(f"IE country mapping is ambiguous; inspect {audit_path}")
+
+    bp_q = expand_standardized_bp(bp).merge(
+        board_mapping,
+        on="BoardName",
+        how="inner",
+        validate="many_to_many",
+    )
+    ie = ie.merge(
+        company_mapping,
+        on="CompanyName",
+        how="inner",
+        validate="many_to_many",
+    )
+    oc = oc.merge(
+        countries,
+        on="CompanyName",
+        how="left",
+        validate="many_to_one",
+    ).merge(
+        company_mapping,
+        on="CompanyName",
+        how="inner",
+        validate="many_to_many",
+    )
+    combined = pd.concat(
+        [bp_q.assign(source="bp"), ie.assign(source="ie"), oc.assign(source="oc")],
+        ignore_index=True,
+    )
+    combined = combined.dropna(subset=["id"])
+    combined["id"] = pd.to_numeric(combined["id"], errors="raise").astype("int64")
+    combined = combined[STANDARDIZED_COLUMNS + ["source"]]
+    for column in ["DirectorID", "Year", "Quarter"]:
+        if not combined[column].eq(combined[column].round()).all():
+            raise ValueError(f"Noninteger values in {column}")
+        combined[column] = combined[column].astype("int64")
+
+    before = len(combined)
+    combined = merge_sources(combined, STANDARDIZED_COLUMNS).sort_values(
+        ["id", "DirectorID", "Year", "Quarter", "HOCountryName"],
+        kind="stable",
+        na_position="last",
+    )
+    output_path = args.output_dir / f"{stem}.csv"
+    combined.to_csv(output_path, index=False, encoding="utf-8-sig")
+    membership_columns = ["DirectorID", "id", "Year", "Quarter"]
+    membership_summary = (
+        combined.groupby(membership_columns, dropna=False)
+        .agg(
+            rows=("source", "size"),
+            countries=("HOCountryName", lambda values: values.nunique(dropna=False)),
+        )
+        .reset_index()
+    )
+    duplicate_memberships = membership_summary.loc[membership_summary.rows.gt(1)]
+    unique_memberships = len(membership_summary)
+    audit.update(
+        bp_expanded_rows=len(bp_q),
+        rows_before_deduplication=before,
+        duplicates_removed=before - len(combined),
+        output_rows=len(combined),
+        output_ids=combined.id.nunique(),
+        unique_director_id_quarters=unique_memberships,
+        nonunique_director_id_quarter_keys=len(duplicate_memberships),
+        additional_rows_from_country_variants=len(combined) - unique_memberships,
+        nonunique_keys_with_multiple_countries=int(
+            duplicate_memberships.countries.gt(1).sum()
+        ),
+        source_counts=combined.source.value_counts().sort_index().to_dict(),
+        output_path=str(output_path),
+    )
+    save_audit()
+    print(f"Wrote {len(combined):,} rows to {output_path}", flush=True)
+
+
+def build(args: argparse.Namespace) -> None:
+    """Dispatch to the selected mapping stream."""
+    if args.mapping_source == "standardized":
+        build_standardized(args)
+    else:
+        build_expanded(args)
+
+
 def main() -> None:
     """Parse inclusive year bounds and optional input/output path overrides."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -210,7 +462,7 @@ def main() -> None:
     parser.add_argument(
         "--mapping-source",
         choices=sorted(MAPPING_PATHS),
-        default="expanded",
+        default="standardized",
         help="Mapping rules to use (default: expanded).",
     )
     parser.add_argument(

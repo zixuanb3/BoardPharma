@@ -1,35 +1,37 @@
 # -*- coding: utf-8 -*-
 """Purpose:
-    Build a drug-formulary-quarter panel with drug-type flags and BoardEx matches.
+    Build a drug-formulary-quarter panel with FDA drug information, company
+    component IDs, formulary tiers, and utilization-management flags.
+
+Process:
+    1. Build an FDA NDC9 lookup for labeler, marketing category, and drug names.
+    2. Build a unique LabelerName-to-id mapping from the company crosswalk.
+    3. Compute the maximum tier within each formulary-quarter.
+    4. Process the formulary in chunks, retain rows with a company id, and
+       derive generic and brand indicators.
 
 Input:
     D:\\pharma\\merged_basic_drugs_formulary.csv
     D:\\pharma\\full_list_of_ndc_codes\\fda_ndc_product.csv
-    D:\\pharma\\merged_beneficiary_cost.csv
-    D:\\pharma\\labeler_company_mapping_standardized.csv
+    crosswalks/labeler_company_mapping_standardized_with_id.csv
 
 Output:
-    D:\\pharma\\task1_final_panel.csv
-    D:\\pharma\\specialty_tier_plan_consistency_audit.csv
-
-Classification:
-    Generic means FDA marketing category contains ANDA.
-    Specialty means the formulary tier is specialty for any matched plan.
-    Brand means FDA category is observed and neither other flag is set.
+    data/formulary/formulary_panel_with_company_id.csv
 """
 
-import pandas as pd
 import csv
-import os, re, time
+import os
+from pathlib import Path
+import time
+
+import pandas as pd
 
 FORMULARY = r"D:\pharma\merged_basic_drugs_formulary.csv"
 FDA_PROD = r"D:\pharma\full_list_of_ndc_codes\fda_ndc_product.csv"
-MAPPING = r"D:\pharma\labeler_company_mapping_standardized.csv"
-BOARDEX_ORG = r"D:\Dropbox\BoardPharma\RawData\boardex\boardex_na\organization_composition.csv"
-BOARDEX_COMPANY = r"D:\Dropbox\BoardPharma\RawData\boardex\boardex_na\company_details.csv"
-COST_FILE = r"D:\pharma\merged_beneficiary_cost.csv"
-OUTPUT = r"D:\pharma\task1_final_panel.csv"
-SPECIALTY_AUDIT_OUTPUT = r"D:\pharma\specialty_tier_plan_consistency_audit.csv"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MAPPING = PROJECT_ROOT / "crosswalks" / "labeler_company_mapping_standardized_with_id.csv"
+OUTPUT_DIR = PROJECT_ROOT / "data" / "formulary"
+OUTPUT = OUTPUT_DIR / "formulary_panel_with_company_id.csv"
 FORMULARY_COLUMNS = [
     'YEAR_Q', 'FORMULARY_ID', 'FORMULARY_VERSION', 'CONTRACT_YEAR', 'RXCUI',
     'NDC', 'TIER_LEVEL_VALUE', 'QUANTITY_LIMIT_YN', 'QUANTITY_LIMIT_AMOUNT',
@@ -38,7 +40,6 @@ FORMULARY_COLUMNS = [
 ]
 FORMULARY_USECOLS = [
     'YEAR_Q', 'FORMULARY_ID', 'NDC', 'TIER_LEVEL_VALUE',
-    'PRIOR_AUTHORIZATION_YN', 'STEP_THERAPY_YN', 'QUANTITY_LIMIT_YN',
 ]
 
 
@@ -76,7 +77,7 @@ def iter_formulary_chunks(usecols, chunk_size):
 
 t0 = time.time()
 print("=" * 65)
-print("  Final Panel: Generic / Specialty / Brand Flags")
+print("  Final Panel: Generic / Brand Flags with Company IDs")
 print("=" * 65)
 
 # ══════════════════════════════════════════════════════════════
@@ -85,7 +86,7 @@ print("=" * 65)
 print("\n[1] Building FDA NDC lookup...")
 fda = pd.read_csv(FDA_PROD, dtype=str, encoding='utf-8',
                   usecols=['PRODUCTNDC', 'LABELERNAME', 'MARKETINGCATEGORYNAME',
-                           'PROPRIETARYNAME', 'NONPROPRIETARYNAME'])
+                           ])
 fda = fda.drop_duplicates(subset='PRODUCTNDC')
 fda['PRODUCTNDC'] = fda['PRODUCTNDC'].str.strip()
 fda['parts'] = fda['PRODUCTNDC'].str.split('-')
@@ -94,211 +95,39 @@ ndc9_map = fda.set_index('NDC9')
 print(f"  FDA unique NDCs: {len(ndc9_map):,}")
 
 # ══════════════════════════════════════════════════════════════
-# STEP 2: Labeler → BoardName
+# STEP 2: LabelerName → connected-component id
 # ══════════════════════════════════════════════════════════════
-print("\n[2] Building Labeler → BoardName mapping...")
-mapping = pd.read_csv(MAPPING, dtype=str)
+print("\n[2] Building LabelerName → id mapping...")
+mapping = pd.read_csv(MAPPING, usecols=['LabelerName', 'id'], dtype=str)
 mapping.columns = mapping.columns.str.strip()
-required_mapping_cols = {'LabelerName', 'BoardName', 'CompanyName'}
+required_mapping_cols = {'LabelerName', 'id'}
 missing_mapping_cols = required_mapping_cols.difference(mapping.columns)
 if missing_mapping_cols:
     raise ValueError(f"Mapping file is missing required columns: {sorted(missing_mapping_cols)}")
 
 mapping['LabelerName'] = mapping['LabelerName'].fillna('').str.strip()
-mapping['BoardName'] = mapping['BoardName'].fillna('').str.strip()
-mapping['CompanyName'] = mapping['CompanyName'].fillna('').str.strip()
-if 'from_mapping' in mapping.columns:
-    mapping['from_mapping'] = mapping['from_mapping'].fillna('0').str.strip()
-else:
-    mapping['from_mapping'] = '0'
-
-def normalize_company_name(value):
-    """Build an alphanumeric key for exact company-name joins."""
-    return re.sub(r'[^A-Z0-9]+', ' ', str(value).upper()).strip()
-
-
-def build_companyname_boardname_lookup(company_names):
-    """Join mapping CompanyName to BoardEx company and organization names."""
-    wanted = {normalize_company_name(name) for name in company_names if name}
-    company_details = pd.read_csv(
-        BOARDEX_COMPANY, usecols=['boardid', 'boardname'], dtype=str,
-        low_memory=False,
-    ).dropna(subset=['boardid', 'boardname']).drop_duplicates('boardid')
-    id_to_boardname = dict(zip(company_details['boardid'], company_details['boardname'].str.strip()))
-
-    # Match normalized CompanyName values directly to BoardEx canonical boardname values.
-    candidates = {}
-    for name in company_details['boardname'].dropna().astype(str):
-        key = normalize_company_name(name)
-        if key in wanted and key:
-            candidates.setdefault(key, set()).add(name.strip())
-    lookup = {key: next(iter(names)) for key, names in candidates.items() if len(names) == 1}
-
-    # Resolve remaining names through organization_composition.companyname -> companyid.
-    remaining = wanted.difference(lookup)
-    org_candidates = {}
-    if remaining:
-        for org_chunk in pd.read_csv(
-            BOARDEX_ORG, usecols=['companyid', 'companyname'], dtype=str,
-            chunksize=250_000, low_memory=False,
-        ):
-            org_chunk = org_chunk.dropna(subset=['companyid', 'companyname'])
-            org_chunk['_company_key'] = org_chunk['companyname'].map(normalize_company_name)
-            org_chunk = org_chunk[org_chunk['_company_key'].isin(remaining)].copy()
-            if org_chunk.empty:
-                continue
-            org_chunk['BoardName'] = org_chunk['companyid'].map(id_to_boardname)
-            org_chunk = org_chunk.dropna(subset=['BoardName'])
-            for key, names in org_chunk.groupby('_company_key')['BoardName']:
-                org_candidates.setdefault(key, set()).update(names.str.strip())
-
-    lookup.update({key: next(iter(names)) for key, names in org_candidates.items()
-                   if len(names) == 1})
-    return lookup
-
-
-company_lookup = build_companyname_boardname_lookup(mapping['CompanyName'])
-mapping['company_key'] = mapping['CompanyName'].map(normalize_company_name)
-company_matches = mapping['company_key'].map(company_lookup).fillna('')
-missing_boardname = mapping['BoardName'].eq('')
-mapping.loc[missing_boardname, 'BoardName'] = company_matches[missing_boardname]
-print(
-    f"  CompanyName → BoardEx matched {int((missing_boardname & company_matches.ne('')).sum()):,} "
-    f"previously blank rows across "
-    f"{mapping.loc[missing_boardname & company_matches.ne(''), 'LabelerName'].nunique():,} labelers"
-)
-
-mapping = mapping[mapping['LabelerName'] != ''].copy()
+mapping['id'] = pd.to_numeric(mapping['id'], errors='raise').astype('Int64')
+mapping = mapping[(mapping['LabelerName'] != '') & mapping['id'].notna()].copy()
 mapping['labeler_key'] = mapping['LabelerName'].str.upper()
-mapping['is_curated'] = mapping['from_mapping'].eq('1')
-
-# Prefer a single curated BoardEx match; otherwise accept only unambiguous matches.
-# Ambiguous labelers are left unmatched instead of depending on CSV row order.
-lb_to_bx = {}
-ambiguous_labelers = 0
-unmatched_labelers = 0
-for key, group in mapping.groupby('labeler_key', sort=False):
-    curated_names = group.loc[group['is_curated'], 'BoardName'].drop_duplicates().tolist()
-    all_names = group['BoardName'].drop_duplicates().tolist()
-    if len(curated_names) == 1:
-        lb_to_bx[key] = curated_names[0]
-    elif len(curated_names) > 1:
-        ambiguous_labelers += 1
-    elif len(all_names) == 1:
-        lb_to_bx[key] = all_names[0]
-    elif not all_names:
-        unmatched_labelers += 1
-    else:
-        ambiguous_labelers += 1
-
-lb_to_bx_lower = {k.lower(): v for k, v in lb_to_bx.items()}
-print(
-    f"  {len(lb_to_bx)} labelers mapped; {ambiguous_labelers} ambiguous and "
-    f"{unmatched_labelers} unmatched"
-)
-
-
-def get_boardex(labeler):
-    if pd.isna(labeler): return ''
-    key = str(labeler).strip().upper()
-    if key in lb_to_bx: return lb_to_bx[key]
-    kl = key.lower()
-    if kl in lb_to_bx_lower: return lb_to_bx_lower[kl]
-    return ''
-
-
-# ══════════════════════════════════════════════════════════════
-# STEP 3: Specialty-tier map from the merged Beneficiary Cost file
-# ══════════════════════════════════════════════════════════════
-print("\n[3] Building specialty-tier mapping...")
-if not os.path.isfile(COST_FILE):
-    raise FileNotFoundError(f"Merged Beneficiary Cost file not found: {COST_FILE}")
-
-# Read only the fields needed for specialty classification. Chunking avoids
-# loading the 1+ GB merged cost file into memory all at once.
-plan_tier_parts = []
-cost_chunk_size = 500_000
-specialty_key_cols = [
-    'YEAR_Q', 'FORMULARY_ID', 'TIER', 'CONTRACT_ID', 'PLAN_ID', 'SEGMENT_ID',
-]
-cost_usecols = specialty_key_cols + [
-    'TIER_SPECIALTY_YN', 'COVERAGE_LEVEL',
-]
-for cost_chunk in pd.read_csv(
-    COST_FILE,
-    usecols=cost_usecols,
-    dtype=str,
-    chunksize=cost_chunk_size,
-    low_memory=False,
-    on_bad_lines='error',
-):
-    cost_chunk = cost_chunk[cost_chunk['COVERAGE_LEVEL'].str.strip().eq('1')].copy()
-    if cost_chunk.empty:
-        continue
-
-    for col in specialty_key_cols:
-        if col != 'TIER':
-            cost_chunk[col] = cost_chunk[col].fillna('').str.strip()
-    cost_chunk['TIER'] = pd.to_numeric(cost_chunk['TIER'], errors='coerce')
-    cost_chunk = cost_chunk.dropna(subset=['TIER'])
-    cost_chunk = cost_chunk[
-        cost_chunk[['YEAR_Q', 'FORMULARY_ID', 'CONTRACT_ID', 'PLAN_ID', 'SEGMENT_ID']]
-        .ne('').all(axis=1)
-    ]
-    if cost_chunk.empty:
-        continue
-
-    cost_chunk['is_specialty'] = (
-        cost_chunk['TIER_SPECIALTY_YN'].fillna('N').str.upper().str.strip()
-        .eq('Y').astype('int8')
-    )
-    plan_tier_parts.append(
-        cost_chunk.groupby(specialty_key_cols, as_index=False, sort=False)
-        .agg(is_specialty=('is_specialty', 'max'))
+labeler_id = mapping[['labeler_key', 'id']].drop_duplicates()
+id_counts = labeler_id.groupby('labeler_key')['id'].nunique()
+conflicting_labelers = id_counts[id_counts.gt(1)]
+if not conflicting_labelers.empty:
+    raise ValueError(
+        "Each normalized LabelerName must map to one id; conflicting labelers: "
+        f"{conflicting_labelers.index.tolist()[:10]}"
     )
 
-if not plan_tier_parts:
-    raise ValueError(f"No usable plan-tier rows found in {COST_FILE}")
-
-# A plan-tier key may appear in multiple input chunks, so aggregate once more
-# after concatenation before computing cross-plan specialty consistency.
-plan_tier_map = pd.concat(plan_tier_parts, ignore_index=True).groupby(
-    specialty_key_cols, as_index=False, sort=False,
-).agg(is_specialty=('is_specialty', 'max'))
-del plan_tier_parts
-
-specialty_consistency = plan_tier_map.groupby(
-    ['YEAR_Q', 'FORMULARY_ID', 'TIER'], as_index=False, sort=False,
-).agg(
-    n_matched_plans=('is_specialty', 'size'),
-    n_specialty_plans=('is_specialty', 'sum'),
-    n_flag_values=('is_specialty', 'nunique'),
-)
-specialty_consistency['n_non_specialty_plans'] = (
-    specialty_consistency['n_matched_plans'] - specialty_consistency['n_specialty_plans']
-)
-
-# If any plan for the same quarter/Formulary/tier is Specialty, the merged
-# Formulary-tier flag is 1. This aggregation also prevents row multiplication.
-spec_map = plan_tier_map.groupby(
-    ['YEAR_Q', 'FORMULARY_ID', 'TIER'], as_index=False, sort=False,
-).agg(is_specialty=('is_specialty', 'max')).rename(columns={'TIER': 'tier_raw'})
-print(f"  Specialty-tier map: {len(spec_map):,} entries, {(spec_map['is_specialty'] == 1).sum():,} specialty tiers")
-
-specialty_audit = specialty_consistency[
-    specialty_consistency['n_flag_values'].gt(1)
-].copy()
-specialty_audit.to_csv(SPECIALTY_AUDIT_OUTPUT, index=False)
-print(
-    f"  Plan disagreements: {len(specialty_audit):,} formulary-quarter-tier keys; "
-    f"saved {SPECIALTY_AUDIT_OUTPUT}"
-)
+# Multiple mapping rows may carry different BN/CN names for the same labeler
+# and id. Keeping one row per key makes the later join many-to-one.
+labeler_id = labeler_id.drop_duplicates('labeler_key')
+print(f"  Unique LabelerName keys: {len(labeler_id):,}")
 
 # ══════════════════════════════════════════════════════════════
-# STEP 4: Precompute global tier maxima using a narrow first pass
+# STEP 3: Precompute global tier maxima using a narrow first pass
 # ══════════════════════════════════════════════════════════════
 chunk_size = 250000
-print("\n[4] Scanning tier keys for global formulary-quarter maxima...")
+print("\n[3] Scanning tier keys for global formulary-quarter maxima...")
 max_tier_parts = []
 for tier_chunk in iter_formulary_chunks(
     ['YEAR_Q', 'FORMULARY_ID', 'TIER_LEVEL_VALUE'], chunk_size,
@@ -316,69 +145,70 @@ max_tier = pd.concat(max_tier_parts, ignore_index=True).groupby(
 print(f"  Formulary-quarter keys: {len(max_tier):,}")
 
 # ══════════════════════════════════════════════════════════════
-# STEP 5: Process chunks and stream directly to a temporary output
+# STEP 4: Process chunks and stream directly to a temporary output
 # ══════════════════════════════════════════════════════════════
-print("\n[5] Processing formulary panel in chunks...")
-tmp_output = OUTPUT + '.tmp'
+print("\n[4] Processing formulary panel in chunks...")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+tmp_output = OUTPUT.with_suffix(OUTPUT.suffix + '.tmp')
 if os.path.exists(tmp_output):
     os.remove(tmp_output)
 
 first_chunk = True
-total_rows = 0
+source_rows = 0
+output_rows = 0
 labeler_rows = 0
-boardex_rows = 0
-flag_totals = {'is_generic': 0, 'is_specialty': 0, 'is_brand': 0}
+flag_totals = {'is_generic': 0, 'is_brand': 0}
 flag_combinations = {}
 
 for chunk_num, chunk in enumerate(iter_formulary_chunks(FORMULARY_USECOLS, chunk_size)):
-    total_rows += len(chunk)
+    source_rows += len(chunk)
     chunk = chunk.rename(columns={
         'TIER_LEVEL_VALUE': 'tier_raw',
-        'PRIOR_AUTHORIZATION_YN': 'PA',
-        'STEP_THERAPY_YN': 'ST',
-        'QUANTITY_LIMIT_YN': 'QL',
     })
 
     for col in ['NDC', 'YEAR_Q', 'FORMULARY_ID']:
         chunk[col] = chunk[col].astype(str).str.strip()
     chunk['tier_raw'] = pd.to_numeric(chunk['tier_raw'], errors='coerce').astype('Int64')
-    for col in ['PA', 'ST', 'QL']:
-        chunk[col] = (
-            chunk[col].astype(str).str.strip().str.upper()
-            .map({'Y': 1, 'N': 0}).fillna(0).astype('int8')
-        )
-
     # FDA product records use the 9-digit labeler-plus-product portion of NDC.
     ndc9 = chunk['NDC'].str.zfill(11).str[:9]
     chunk['LabelerName'] = ndc9.map(ndc9_map['LABELERNAME'])
     chunk['MARKETINGCATEGORYNAME'] = ndc9.map(ndc9_map['MARKETINGCATEGORYNAME'])
-    chunk['ProprietaryName'] = ndc9.map(ndc9_map['PROPRIETARYNAME'])
-    chunk['NonProprietaryName'] = ndc9.map(ndc9_map['NONPROPRIETARYNAME'])
 
     chunk['is_generic'] = (
         chunk['MARKETINGCATEGORYNAME'].str.upper().fillna('').str.contains('ANDA').astype('int8')
     )
-    chunk = chunk.merge(spec_map, on=['YEAR_Q', 'FORMULARY_ID', 'tier_raw'], how='left')
-    chunk['is_specialty'] = chunk['is_specialty'].fillna(0).astype('int8')
     has_fda_category = chunk['MARKETINGCATEGORYNAME'].notna()
     chunk['is_brand'] = (
-        has_fda_category & (chunk['is_generic'] == 0) & (chunk['is_specialty'] == 0)
+        has_fda_category & (chunk['is_generic'] == 0)
     ).astype('int8')
-    chunk['BoardName'] = chunk['LabelerName'].map(get_boardex)
+    chunk['labeler_key'] = chunk['LabelerName'].fillna('').str.strip().str.upper()
+    chunk = chunk.merge(
+        labeler_id,
+        on='labeler_key',
+        how='left',
+        validate='many_to_one',
+    ).drop(columns='labeler_key')
+    chunk = chunk.dropna(subset=['id'])
+    if chunk.empty:
+        continue
+
     chunk = chunk.merge(max_tier, on=['FORMULARY_ID', 'YEAR_Q'], how='left')
 
     keep = [
         'YEAR_Q', 'FORMULARY_ID', 'NDC', 'tier_raw', 'max_tier',
-        'LabelerName', 'BoardName', 'MARKETINGCATEGORYNAME',
-        'ProprietaryName', 'NonProprietaryName', 'is_generic',
-        'is_specialty', 'is_brand', 'PA', 'ST', 'QL',
+        'LabelerName', 'id',
+        'is_generic', 'is_brand',
     ]
     chunk = chunk[keep]
+    chunk = chunk[chunk['is_generic'].eq(0)]
+    if chunk.empty:
+        continue
+
+    output_rows += len(chunk)
     labeler_rows += int(chunk['LabelerName'].notna().sum())
-    boardex_rows += int(chunk['BoardName'].fillna('').ne('').sum())
     for flag in flag_totals:
         flag_totals[flag] += int(chunk[flag].sum())
-    combo_counts = chunk.groupby(['is_generic', 'is_specialty', 'is_brand']).size()
+    combo_counts = chunk.groupby(['is_generic', 'is_brand']).size()
     for combo, count in combo_counts.items():
         flag_combinations[combo] = flag_combinations.get(combo, 0) + int(count)
 
@@ -388,23 +218,24 @@ for chunk_num, chunk in enumerate(iter_formulary_chunks(FORMULARY_USECOLS, chunk
     )
     first_chunk = False
     if (chunk_num + 1) % 5 == 0:
-        print(f"  Processed {total_rows:,} rows...")
+        print(f"  Processed {source_rows:,} source rows; retained {output_rows:,} rows...")
 
 if first_chunk:
-    raise ValueError("The formulary input contains no data rows.")
+    raise ValueError("No formulary rows matched a mapping id.")
 os.replace(tmp_output, OUTPUT)
 
 print(f"\n{'=' * 65}")
 print("  FINAL PANEL SUMMARY")
 print(f"{'=' * 65}")
-print(f"  Total rows:                 {total_rows:>12,}")
-print(f"  With Labeler:               {labeler_rows:>12,} ({labeler_rows/total_rows*100:.1f}%)")
-print(f"  With BoardEx:               {boardex_rows:>12,} ({boardex_rows/total_rows*100:.1f}%)")
-for flag, label in [('is_generic', 'Generic'), ('is_specialty', 'Specialty'), ('is_brand', 'Brand')]:
-    print(f"  {label} rows: {flag_totals[flag]:>12,} ({flag_totals[flag]/total_rows*100:.1f}%)")
-print("  Flag combinations (generic, specialty, brand):")
+print(f"  Source rows:                {source_rows:>12,}")
+print(f"  Dropped without id:         {source_rows - output_rows:>12,}")
+print(f"  Output rows:                {output_rows:>12,}")
+print(f"  With Labeler:               {labeler_rows:>12,} ({labeler_rows/output_rows*100:.1f}%)")
+for flag, label in [('is_generic', 'Generic'), ('is_brand', 'Brand')]:
+    print(f"  {label} rows: {flag_totals[flag]:>12,} ({flag_totals[flag]/output_rows*100:.1f}%)")
+print("  Flag combinations (generic, brand):")
 for combo, count in sorted(flag_combinations.items()):
     print(f"    {combo}: {count:,}")
 sz = os.path.getsize(OUTPUT) / 1e9
-print(f"  {OUTPUT}: {total_rows:,} rows, {sz:.2f} GB, {time.time() - t0:.0f}s")
+print(f"  {OUTPUT}: {output_rows:,} rows, {sz:.2f} GB, {time.time() - t0:.0f}s")
 print(f"{'=' * 65}")

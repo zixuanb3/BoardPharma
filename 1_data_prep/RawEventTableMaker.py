@@ -10,6 +10,8 @@ Process:
    the audited quarterly roster with personnel_definition="narrow".
 2. Deduplicate memberships, complete director-period histories, and compare
    adjacent years or quarters to identify the three movement event types.
+   Quarterly mode identifies firms by mapping id and outputs idA/idB; annual
+   mode continues to identify firms by BoardName and outputs FirmA/FirmB.
 3. Derive firm-interlock edges from all selected directors' memberships and
    use the in-memory lookup to calculate each candidate's requirement1.
 4. In annual mode, calculate stay and requirement2 with the existing rules.
@@ -156,27 +158,25 @@ class MovementEventBuilder:
         """Deduplicate roster seats and encode quarters as consecutive integers."""
         memberships = pd.read_csv(
             self.input_path,
-            usecols=["DirectorID", "CompanyID", "BoardName", "Year", "Quarter"],
-            dtype={"DirectorID": "Int64", "CompanyID": "Int64",
-                   "Year": "Int64", "Quarter": "Int64", "BoardName": "string"},
+            usecols=["DirectorID", "Year", "Quarter", "id"],
+            dtype={
+                "DirectorID": "Int64",
+                "Year": "Int64",
+                "Quarter": "Int64",
+                "id": "Int64",
+            },
         )
         if memberships.isna().any().any():
             raise ValueError("Quarterly roster has missing identity or time fields")
         if not memberships["Quarter"].isin([1, 2, 3, 4]).all():
             raise ValueError("Quarter must be 1, 2, 3, or 4")
-        memberships["BoardName"] = memberships["BoardName"].str.strip().str.upper()
-        if memberships["BoardName"].eq("").any():
-            raise ValueError("Quarterly roster contains blank BoardName")
-        company_names = memberships[["CompanyID", "BoardName"]].drop_duplicates()
-        if (company_names["CompanyID"].duplicated().any()
-                or company_names["BoardName"].duplicated().any()):
-            raise ValueError("Quarterly CompanyID and BoardName must map one-to-one")
         # The shared transition engine operates on consecutive integer periods.
         memberships["period"] = (
             (memberships["Year"] - 1960) * 4 + memberships["Quarter"] - 1
         ).astype("int64")
         memberships["DirectorID"] = memberships["DirectorID"].astype("int64")
-        return memberships[["DirectorID", "period", "BoardName"]].drop_duplicates()
+        memberships["id"] = memberships["id"].astype("int64")
+        return memberships[["DirectorID", "period", "id"]].drop_duplicates()
 
     def build(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Return movement candidates and membership-derived firm-interlock edges."""
@@ -211,9 +211,15 @@ class MovementEventBuilder:
         # 2) Collapse each director-period to a sorted board list, then complete
         #    each timeline from min_period - 1 through one period after its
         #    max_period, capped at the sample's final observed period.
+        firm_col = "id" if self.quarter else "BoardName"
         board_lists = (
             memberships.groupby(["DirectorID", "period"], as_index=False)
-            .agg(board_list=("BoardName", lambda values: sorted(pd.unique(values.dropna()).tolist())))
+            .agg(
+                board_list=(
+                    firm_col,
+                    lambda values: sorted(pd.unique(values.dropna()).tolist()),
+                )
+            )
             .sort_values(["DirectorID", "period"])
             .reset_index(drop=True)
         )
@@ -255,20 +261,26 @@ class MovementEventBuilder:
                 for firm_a, firm_b in combinations(sorted(board_list), 2)
             )
 
+        edge_a_col, edge_b_col = (
+            ("idA", "idB") if self.quarter else ("BoardName", "CounterpartBoard")
+        )
         edge_rows = [
-            {"BoardName": firm_a, "period": period, "CounterpartBoard": firm_b}
+            {edge_a_col: firm_a, "period": period, edge_b_col: firm_b}
             for firm_a, firm_b, period in sorted(pair_period_set)
         ] + [
-            {"BoardName": firm_b, "period": period, "CounterpartBoard": firm_a}
+            {edge_a_col: firm_b, "period": period, edge_b_col: firm_a}
             for firm_a, firm_b, period in sorted(pair_period_set)
         ]
         firm_interlock_edges = (
-            pd.DataFrame(edge_rows).sort_values(["BoardName", "period", "CounterpartBoard"]).reset_index(drop=True)
+            pd.DataFrame(edge_rows).sort_values([edge_a_col, "period", edge_b_col]).reset_index(drop=True)
             if edge_rows
-            else pd.DataFrame(columns=["BoardName", "period", "CounterpartBoard"])
+            else pd.DataFrame(columns=[edge_a_col, "period", edge_b_col])
         )
 
         # 4) Compare adjacent director-periods and write movement candidates.
+        candidate_a_col, candidate_b_col = (
+            ("idA", "idB") if self.quarter else ("FirmA", "FirmB")
+        )
         movement_rows: list[dict[str, object]] = []
         for director_id, director_panel in complete_history.groupby("DirectorID", sort=False):
             period_board_pairs = list(
@@ -313,8 +325,8 @@ class MovementEventBuilder:
                                 "event_type": "to_B_still_in_A",
                                 "DirectorID": director_id,
                                 "event_period": event_period,
-                                "FirmA": firm_a,
-                                "FirmB": firm_b,
+                                candidate_a_col: firm_a,
+                                candidate_b_col: firm_b,
                                 self.stay_col: stay,
                                 "requirement1": int(pair_tm1 == 0),
                                 "pair_interlock_t-1": pair_tm1,
@@ -339,8 +351,8 @@ class MovementEventBuilder:
                                 "event_type": "to_B_not_in_A",
                                 "DirectorID": director_id,
                                 "event_period": event_period,
-                                "FirmA": firm_a,
-                                "FirmB": firm_b,
+                                candidate_a_col: firm_a,
+                                candidate_b_col: firm_b,
                                 self.stay_col: stay,
                                 "requirement1": int(pair_t == 0),
                                 "pair_interlock_t-1": pair_tm1,
@@ -365,8 +377,8 @@ class MovementEventBuilder:
                                 "event_type": "interlock_dissolution",
                                 "DirectorID": director_id,
                                 "event_period": event_period,
-                                "FirmA": firm_a,
-                                "FirmB": firm_b,
+                                candidate_a_col: firm_a,
+                                candidate_b_col: firm_b,
                                 self.stay_col: stay,
                                 "requirement1": int(pair_t == 0),
                                 "pair_interlock_t-1": pair_tm1,
@@ -378,8 +390,8 @@ class MovementEventBuilder:
             "event_type",
             "DirectorID",
             "event_period",
-            "FirmA",
-            "FirmB",
+            candidate_a_col,
+            candidate_b_col,
             self.stay_col,
             "requirement1",
             "pair_interlock_t-1",
@@ -392,8 +404,18 @@ class MovementEventBuilder:
             else pd.DataFrame(columns=movement_columns)
         )
         movement_candidates = (
-            movement_candidates.drop_duplicates(subset=["event_type", "DirectorID", "event_period", "FirmA", "FirmB"])
-            .sort_values(["event_type", "DirectorID", "event_period", "FirmA", "FirmB"])
+            movement_candidates.drop_duplicates(
+                subset=[
+                    "event_type",
+                    "DirectorID",
+                    "event_period",
+                    candidate_a_col,
+                    candidate_b_col,
+                ]
+            )
+            .sort_values(
+                ["event_type", "DirectorID", "event_period", candidate_a_col, candidate_b_col]
+            )
             .reset_index(drop=True)
         )
 

@@ -1,23 +1,26 @@
 """Purpose:
-    Add all available RxNav ATC classifications for each NDC in the base panel.
+    Add ATC3, ATC4, ATC count, and lookup status to the formulary panel.
+
+Process:
+    1. Read the panel NDC column and normalize each value to NDC11.
+    2. Use the cached RxNav results and query missing or retryable NDCs.
+    3. Add ATC3, ATC4, n_atc, and ATC_status in chunks.
+    4. Replace the original panel only after the complete temporary output
+       has been written successfully.
 
 Input:
-    ../01_input_data/task1_final_panel.csv
-    ../04_reference_data/WHO ATC-DDD 2024-07-31.csv
-    ../05_cache/ndc_atc_api_lookup.csv (optional legacy single-ATC cache)
-    ../05_cache/ndc_atc_all_cache.json (optional all-ATC cache)
+    data/formulary/formulary_panel_with_company_id.csv
+    D:/pharma/WHO ATC-DDD 2024-07-31.csv
+    D:/pharma/ndc_atc_api_lookup.csv
+    D:/pharma/ndc_atc_all_cache.json
 
 Output:
-    ../03_output_data/task1_final_panel_with_atc_all.csv
-    ../05_cache/ndc_atc_all_cache.json
-
-The output is written to a temporary file and replaces the previous output
-only after the complete input has been processed successfully.
+    data/formulary/formulary_panel_with_company_id.csv
 """
 
 import json
 import os
-import re
+import stat
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,17 +32,15 @@ import pandas as pd
 import requests
 
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-INPUT_DIR = PACKAGE_ROOT / "01_input_data"
-REFERENCE_DIR = PACKAGE_ROOT / "04_reference_data"
-CACHE_DIR = PACKAGE_ROOT / "05_cache"
-OUTPUT_DIR = PACKAGE_ROOT / "03_output_data"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PHARMA_DIR = Path(r"D:\pharma")
 
-PANEL = INPUT_DIR / "task1_final_panel.csv"
-WHO_FILE = REFERENCE_DIR / "WHO ATC-DDD 2024-07-31.csv"
-LEGACY_CACHE = CACHE_DIR / "ndc_atc_api_lookup.csv"
-ATC_CACHE = CACHE_DIR / "ndc_atc_all_cache.json"
-OUTPUT = OUTPUT_DIR / "task1_final_panel_with_atc_all.csv"
+PANEL = PROJECT_ROOT / "data" / "formulary" / "formulary_panel_with_company_id.csv"
+WHO_FILE = PHARMA_DIR / "WHO ATC-DDD 2024-07-31.csv"
+LEGACY_CACHE = PHARMA_DIR / "ndc_atc_api_lookup.csv"
+ATC_CACHE = PHARMA_DIR / "ndc_atc_all_cache.json"
+OUTPUT = PANEL
+OUTPUT_DIR = OUTPUT.parent
 TEMP_OUTPUT = OUTPUT.with_name(OUTPUT.name + ".building")
 
 CHUNK_SIZE = 250_000
@@ -48,8 +49,12 @@ REQUEST_TIMEOUT = 25
 REQUEST_ATTEMPTS = 2
 NEGATIVE_CACHE_TTL_DAYS = 90
 ATC_COLUMNS = [
-    "ATC1", "ATC1_name", "ATC2", "ATC2_name", "ATC3", "ATC3_name",
-    "ATC4", "ATC4_name", "n_atc", "ATC_status",
+    # "ATC1", "ATC1_name", "ATC2", "ATC2_name",
+    "ATC3",
+    # "ATC3_name",
+    "ATC4",
+    # "ATC4_name",
+    "n_atc", "ATC_status",
 ]
 
 
@@ -131,10 +136,12 @@ def load_all_cache():
 
 def save_all_cache(cache):
     """Atomically save the all-ATC cache so an interrupted write cannot corrupt it."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ATC_CACHE.parent.mkdir(parents=True, exist_ok=True)
     temp_cache = ATC_CACHE.with_name(ATC_CACHE.name + ".tmp")
     with temp_cache.open("w", encoding="utf-8") as target:
         json.dump(cache, target, ensure_ascii=False)
+    if ATC_CACHE.exists():
+        ATC_CACHE.chmod(ATC_CACHE.stat().st_mode | stat.S_IWRITE)
     os.replace(temp_cache, ATC_CACHE)
 
 
@@ -281,14 +288,14 @@ def build_mapping(cache):
         atcs = info.get("atc_list", []) or []
         if atcs:
             mapping[ndc_key] = {
-                "ATC1": ";".join(item.get("atc1", "") for item in atcs),
-                "ATC1_name": ";".join(item.get("atc1_name", "") for item in atcs),
-                "ATC2": ";".join(item.get("atc2", "") for item in atcs),
-                "ATC2_name": ";".join(item.get("atc2_name", "") for item in atcs),
+                # "ATC1": ";".join(item.get("atc1", "") for item in atcs),
+                # "ATC1_name": ";".join(item.get("atc1_name", "") for item in atcs),
+                # "ATC2": ";".join(item.get("atc2", "") for item in atcs),
+                # "ATC2_name": ";".join(item.get("atc2_name", "") for item in atcs),
                 "ATC3": ";".join(item.get("atc3", "") for item in atcs),
-                "ATC3_name": ";".join(item.get("atc3_name", "") for item in atcs),
+                # "ATC3_name": ";".join(item.get("atc3_name", "") for item in atcs),
                 "ATC4": ";".join(item.get("atc4", "") for item in atcs),
-                "ATC4_name": ";".join(item.get("atc4_name", "") for item in atcs),
+                # "ATC4_name": ";".join(item.get("atc4_name", "") for item in atcs),
                 "n_atc": len(atcs),
                 "ATC_status": info.get("status", "UNKNOWN"),
             }
@@ -327,7 +334,7 @@ def main():
         if not required.exists():
             raise FileNotFoundError(f"Required input file not found: {required}")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    PHARMA_DIR.mkdir(parents=True, exist_ok=True)
 
     who = pd.read_csv(WHO_FILE, dtype=str, usecols=["atc_code", "atc_name"])
     who["atc_code"] = who["atc_code"].str.strip()

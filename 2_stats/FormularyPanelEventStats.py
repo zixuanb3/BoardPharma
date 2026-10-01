@@ -10,16 +10,18 @@ Process:
 2. For each uncovered event period, select the first encountered FORMULARY_ID,
    retain only its rows for that period, and stop opening event columns once
    every target period has one selected formulary.
-3. Count unique event BoardName values and unique event NDC values split by
-   ATC1--ATC4 sharing status for all six event-direction indicators. Event NDC
-   NDC counts use the event-year Q1 cutoff in annual mode and the cohort's
-   prior-year same-quarter cutoff in quarterly mode.
+3. Count unique event firms, firms with at least one ATC-sharing event NDC, and
+   unique event NDC values split by ATC sharing status for all six event-
+   direction indicators. Quarterly event-NDC statistics require first-seen by
+   event t-4; only upstream ATC-sharing construction uses partner NDCs through
+   event t+3. Annual mode retains the event-year Q1 cutoff.
 4. Save the selection manifest, CSV summaries, and bar charts under concise
    project-level csv and figures folders.
 
 Input:
 - data/formulary_panel[/shift_qX]/formulary_panel_*.csv (quarter=0)
-- data/formulary_panel_quarter[/shift_qX]/formulary_panel_*.csv (quarter=1)
+- data/formulary_panel_quarter_by_time[/shift_qX]/formulary_panel_YYYYQX.csv
+  (quarter=1)
 - matching data/formulary_metadata/ndc_first_seen*.csv
 
 Output:
@@ -57,7 +59,8 @@ QUARTER = 1  # 0: annual events in Q1; 1: events in their actual quarter.
 FORMULARY_TIME_SHIFT_QUARTERS = 1
 TARGET_START_YEAR = 2019
 TARGET_END_YEAR = 2025
-ATC_LEVELS = (1, 2, 3, 4)
+ATC_LEVELS = (3,) if QUARTER else (1, 2, 3, 4)
+FIRM_COLUMN = "id" if QUARTER else "BoardName"
 
 # Start with early, late, and widely separated blocks. The script stops before
 # reaching the end of this order as soon as every target period is covered.
@@ -113,7 +116,7 @@ def configure_paths() -> None:
     if not isinstance(shift, int):
         raise ValueError("FORMULARY_TIME_SHIFT_QUARTERS must be an integer.")
     shift_suffix = f"shift_q{shift}" if shift else ""
-    panel_name = "formulary_panel_quarter" if QUARTER else "formulary_panel"
+    panel_name = "formulary_panel_quarter_by_time" if QUARTER else "formulary_panel"
     first_seen_name = "ndc_first_seen_quarter" if QUARTER else "ndc_first_seen"
     PANEL_DIR = PROJECT_ROOT / "data" / panel_name
     if shift_suffix:
@@ -125,11 +128,10 @@ def configure_paths() -> None:
     FIGURE_ROOT = PROJECT_ROOT / "figures" / "formulary_panel_event_stats" / output_suffix
 
 
-def available_periods() -> set[int]:
+def available_periods(paths: list[Path]) -> set[int]:
     """Read panel time columns to locate the cohort-window data boundary."""
     periods: set[int] = set()
-    for number in tqdm(range(1, N_FORMULARY_BLOCKS + 1), desc="Checking observed quarters", unit="file"):
-        path = panel_path(number)
+    for path in tqdm(paths, desc="Checking observed quarters", unit="file"):
         for chunk in pd.read_csv(path, usecols=["YEAR_Q"], dtype="string", chunksize=CHUNKSIZE):
             parsed = chunk["YEAR_Q"].str.extract(r"^\s*(\d{4})\s*Q([1-4])\s*$")
             if parsed.isna().any().any():
@@ -141,15 +143,14 @@ def available_periods() -> set[int]:
 
 
 def cutoff_for_period(period: int, observed: set[int]) -> int:
-    """Match the cohort's t-4..t+7 window and first-observed-quarter clipping."""
+    """Return the prior-year same-quarter event-NDC cutoff (event t-4)."""
     interior = set(range(max(period - 4, min(observed)), min(period + 7, max(observed)) + 1))
     missing = interior - observed
     if missing:
         raise FileNotFoundError(f"Cohort window for {period} is missing quarters: {sorted(missing)}")
-    window = observed.intersection(range(period - 4, period + 8))
-    if period not in window:
+    if period not in observed:
         raise ValueError(f"Event quarter {period} is absent from the panel.")
-    return max(period - 4, min(window))
+    return period - 4
 
 
 def quarter_tag(period: int) -> str:
@@ -192,17 +193,34 @@ def validate_block_order() -> None:
         raise ValueError("BLOCK_ORDER must contain each panel block exactly once.")
 
 
-def panel_path(block_number: int) -> Path:
-    """Return and validate one numbered panel block path."""
-    path = PANEL_DIR / f"formulary_panel_{block_number}.csv"
-    if not path.exists():
-        raise FileNotFoundError(f"Missing panel block: {path}")
-    return path
+def panel_paths() -> list[Path]:
+    """Return quarterly files chronologically or annual blocks by priority."""
+    if QUARTER:
+        paths = list(PANEL_DIR.glob("formulary_panel_????Q?.csv"))
+        if not paths:
+            raise FileNotFoundError(f"No quarterly panel files found in {PANEL_DIR}")
+
+        def quarter_key(path: Path) -> tuple[int, int]:
+            tag = path.stem.removeprefix("formulary_panel_")
+            year_text, quarter_text = tag.split("Q", maxsplit=1)
+            year, quarter = int(year_text), int(quarter_text)
+            if quarter not in range(1, 5):
+                raise ValueError(f"Invalid quarterly panel filename: {path.name}")
+            return year, quarter
+
+        return sorted(paths, key=quarter_key)
+
+    validate_block_order()
+    paths = [PANEL_DIR / f"formulary_panel_{number}.csv" for number in BLOCK_ORDER]
+    missing = [path for path in paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing panel blocks: {missing[:5]}")
+    return paths
 
 
 def required_columns(events: tuple[EventSpec, ...]) -> list[str]:
     """Return the only columns streamed from each potentially useful block."""
-    columns = ["FORMULARY_ID", "YEAR_Q", "BoardName", "NDC"]
+    columns = ["FORMULARY_ID", "YEAR_Q", FIRM_COLUMN, "NDC"]
     for event in events:
         columns.append(event.event_column)
         columns.extend(event.share_column(level) for level in ATC_LEVELS)
@@ -245,11 +263,20 @@ def load_first_seen_lookup() -> dict[str, int]:
 
 def normalize_data(data: pd.DataFrame, path: Path) -> pd.DataFrame:
     """Normalize identifiers and parse YEAR_Q into integer year and quarter fields."""
-    for column in ("FORMULARY_ID", "BoardName", "NDC"):
+    identifier_columns = ("FORMULARY_ID", FIRM_COLUMN, "NDC")
+    for column in identifier_columns:
         data[column] = data[column].astype("string").str.strip()
         data.loc[data[column].eq(""), column] = pd.NA
-    if data[["FORMULARY_ID", "BoardName", "NDC"]].isna().any().any():
-        raise ValueError(f"{path.name} contains missing FORMULARY_ID, BoardName, or NDC values.")
+    if data[list(identifier_columns)].isna().any().any():
+        raise ValueError(f"{path.name} contains missing values in {identifier_columns}.")
+
+    if QUARTER:
+        numeric_id = pd.to_numeric(data[FIRM_COLUMN], errors="coerce")
+        invalid_id = numeric_id.isna() | numeric_id.le(0) | numeric_id.ne(numeric_id.round())
+        if invalid_id.any():
+            examples = data.loc[invalid_id, FIRM_COLUMN].drop_duplicates().head(10).tolist()
+            raise ValueError(f"{path.name}.id must contain positive integers: {examples}")
+        data[FIRM_COLUMN] = numeric_id.astype("int32").astype("string")
 
     parsed = data["YEAR_Q"].astype("string").str.extract(r"^\s*(\d{4})\s*Q([1-4])\s*$")
     invalid = parsed[0].isna() | parsed[1].isna()
@@ -271,7 +298,7 @@ def available_by_event_cutoff(
     path: Path,
     cutoff_by_period: dict[int, int],
 ) -> pd.Series:
-    """Return whether each NDC was first included by the event cutoff."""
+    """Return whether each NDC was first included by the configured cutoff."""
     first_seen = data["NDC"].map(first_seen_qtime)
     if first_seen.isna().any():
         examples = data.loc[first_seen.isna(), "NDC"].drop_duplicates().head(10).tolist()
@@ -298,8 +325,8 @@ def binary_indicator(data: pd.DataFrame, column: str, path: Path) -> pd.Series:
 def add_new_selections(
     data: pd.DataFrame,
     target_order: list[int],
-    selected: dict[int, tuple[str, int]],
-    block_number: int,
+    selected: dict[int, tuple[str, str]],
+    source_file: str,
 ) -> None:
     """Select one deterministic formulary for each still-uncovered period."""
     missing = set(target_order) - set(selected)
@@ -315,10 +342,10 @@ def add_new_selections(
             continue
         values = candidates.loc[candidates["_period"].eq(period), "FORMULARY_ID"]
         if not values.empty:
-            selected[period] = (str(values.iloc[0]), block_number)
+            selected[period] = (str(values.iloc[0]), source_file)
 
 
-def selected_rows(data: pd.DataFrame, selected: dict[int, tuple[str, int]]) -> pd.DataFrame:
+def selected_rows(data: pd.DataFrame, selected: dict[int, tuple[str, str]]) -> pd.DataFrame:
     """Keep rows belonging to each period's selected formulary."""
     selection = pd.DataFrame(
         {
@@ -339,6 +366,7 @@ def accumulate_selected_rows(
     first_seen_qtime: dict[str, int],
     cutoff_by_period: dict[int, int],
     firm_sets: dict[int, dict[str, set[str]]],
+    sharing_firm_sets: dict[int, dict[str, set[str]]],
     ndc_sharing: dict[int, dict[tuple[str, int], dict[str, int]]],
 ) -> None:
     """Accumulate unique event firms and NDC share status from selected rows."""
@@ -354,7 +382,7 @@ def accumulate_selected_rows(
                 raise ValueError(f"{path.name}.{event.event_column} contains an event outside Q1.")
 
             firm_sets[int(period)][event.slug].update(
-                quarter_data.loc[raw_event_mask, "BoardName"].astype(str)
+                quarter_data.loc[raw_event_mask, FIRM_COLUMN].astype(str)
             )
             event_mask = raw_event_mask & available_mask
             for level in ATC_LEVELS:
@@ -362,6 +390,9 @@ def accumulate_selected_rows(
                 share = binary_indicator(quarter_data, share_column, path)
                 if share.loc[~raw_event_mask].eq(1).any():
                     raise ValueError(f"{path.name}.{share_column} equals 1 outside matching event rows.")
+                sharing_firm_sets[int(period)][event.slug].update(
+                    quarter_data.loc[event_mask & share.eq(1), FIRM_COLUMN].astype(str)
+                )
                 event_share = pd.DataFrame(
                     {
                         "NDC": quarter_data.loc[event_mask, "NDC"].astype(str),
@@ -376,9 +407,17 @@ def accumulate_selected_rows(
 def initialize_accumulators(
     years: list[int],
     events: tuple[EventSpec, ...],
-) -> tuple[dict[int, dict[str, set[str]]], dict[int, dict[tuple[str, int], dict[str, int]]]]:
+) -> tuple[
+    dict[int, dict[str, set[str]]],
+    dict[int, dict[str, set[str]]],
+    dict[int, dict[tuple[str, int], dict[str, int]]],
+]:
     """Create empty compact accumulators for all target year-event cells."""
     firm_sets = {
+        year: {event.slug: set() for event in events}
+        for year in years
+    }
+    sharing_firm_sets = {
         year: {event.slug: set() for event in events}
         for year in years
     }
@@ -386,11 +425,11 @@ def initialize_accumulators(
         year: {(event.slug, level): {} for event in events for level in ATC_LEVELS}
         for year in years
     }
-    return firm_sets, ndc_sharing
+    return firm_sets, sharing_firm_sets, ndc_sharing
 
 
 def selection_manifest(
-    selected: dict[int, tuple[str, int]],
+    selected: dict[int, tuple[str, str]],
     periods: list[int],
     cutoff_by_period: dict[int, int],
 ) -> pd.DataFrame:
@@ -401,7 +440,7 @@ def selection_manifest(
     columns = {
         **period_columns(periods),
         "formulary_id": [selected[period][0] for period in periods],
-        "source_block": [selected[period][1] for period in periods],
+        "source_file": [selected[period][1] for period in periods],
     }
     if QUARTER:
         columns["first_seen_cutoff_qtime"] = [cutoff_by_period[period] for period in periods]
@@ -411,14 +450,22 @@ def selection_manifest(
     return pd.DataFrame(columns)
 
 
-def firm_summary(periods: list[int], event: EventSpec, firm_sets: dict[int, dict[str, set[str]]]) -> pd.DataFrame:
-    """Return unique event-firm counts for one event-direction pair."""
+def firm_summary(
+    periods: list[int],
+    event: EventSpec,
+    firm_sets: dict[int, dict[str, set[str]]],
+    sharing_firm_sets: dict[int, dict[str, set[str]]],
+) -> pd.DataFrame:
+    """Return event-firm and ATC-sharing event-firm counts."""
     return pd.DataFrame(
         {
             **period_columns(periods),
             "event_type": event.event_type,
             "direction": event.direction,
-            "event_boardnames": [len(firm_sets[period][event.slug]) for period in periods],
+            "event_firms": [len(firm_sets[period][event.slug]) for period in periods],
+            "sharing_event_firms": [
+                len(sharing_firm_sets[period][event.slug]) for period in periods
+            ],
         }
     )
 
@@ -454,9 +501,9 @@ def save_firm_plot(summary: pd.DataFrame, event: EventSpec, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     figure, axis = plt.subplots(figsize=(11, 5))
     time_column = "year_quarter" if QUARTER else "year"
-    axis.bar(summary[time_column].astype(str), summary["event_boardnames"], color="#4C78A8")
+    axis.bar(summary[time_column].astype(str), summary["event_firms"], color="#4C78A8")
     axis.set_xlabel("Year quarter" if QUARTER else "Year")
-    axis.set_ylabel("Unique BoardName count")
+    axis.set_ylabel("Unique firm count")
     axis.set_title(f"{event.label}: firms with an event")
     axis.grid(axis="y", alpha=0.25)
     axis.tick_params(axis="x", rotation=60)
@@ -488,10 +535,11 @@ def save_ndc_plot(summary: pd.DataFrame, event: EventSpec, atc_level: int, path:
 
 def write_outputs(
     periods: list[int],
-    selected: dict[int, tuple[str, int]],
-    opened_blocks: list[int],
+    selected: dict[int, tuple[str, str]],
+    opened_files: list[str],
     events: tuple[EventSpec, ...],
     firm_sets: dict[int, dict[str, set[str]]],
+    sharing_firm_sets: dict[int, dict[str, set[str]]],
     ndc_sharing: dict[int, dict[tuple[str, int], dict[str, int]]],
     cutoff_by_period: dict[int, int],
 ) -> None:
@@ -501,10 +549,12 @@ def write_outputs(
     selection_manifest(selected, periods, cutoff_by_period).to_csv(
         CSV_ROOT / "selection" / "formularies.csv", index=False
     )
-    pd.DataFrame({"opened_block": opened_blocks}).to_csv(CSV_ROOT / "selection" / "blocks.csv", index=False)
+    pd.DataFrame({"opened_file": opened_files}).to_csv(
+        CSV_ROOT / "selection" / "files.csv", index=False
+    )
 
     for event in events:
-        firms = firm_summary(periods, event, firm_sets)
+        firms = firm_summary(periods, event, firm_sets, sharing_firm_sets)
         firms.to_csv(CSV_ROOT / "firm" / f"{event.slug}.csv", index=False)
         save_firm_plot(firms, event, FIGURE_ROOT / "firm" / f"{event.slug}.png")
         for level in ATC_LEVELS:
@@ -516,9 +566,9 @@ def write_outputs(
 def main() -> None:
     """Select one formulary per event period and save diagnostics."""
     configure_paths()
-    validate_block_order()
+    paths = panel_paths()
     events = configured_events()
-    observed = available_periods() if QUARTER else None
+    observed = available_periods(paths) if QUARTER else None
     periods = target_periods(observed)
     if not periods:
         raise ValueError("No observed formulary quarters fall in the target year range.")
@@ -528,20 +578,19 @@ def main() -> None:
     )
     columns = required_columns(events)
     first_seen_qtime = load_first_seen_lookup()
-    selected: dict[int, tuple[str, int]] = {}
-    opened_blocks: list[int] = []
-    firm_sets, ndc_sharing = initialize_accumulators(periods, events)
+    selected: dict[int, tuple[str, str]] = {}
+    opened_files: list[str] = []
+    firm_sets, sharing_firm_sets, ndc_sharing = initialize_accumulators(periods, events)
 
-    for block_number in tqdm(BLOCK_ORDER, desc="Opening prioritized panel blocks", unit="block"):
+    for path in tqdm(paths, desc="Opening panel files", unit="file"):
         if len(selected) == len(periods):
             break
-        path = panel_path(block_number)
         validate_schema(path, columns)
-        opened_blocks.append(block_number)
+        opened_files.append(path.name)
         reader = pd.read_csv(path, usecols=columns, dtype="string", chunksize=CHUNKSIZE)
-        for data in tqdm(reader, desc=f"Reading block {block_number}", unit="chunk", leave=False):
+        for data in tqdm(reader, desc=f"Reading {path.stem}", unit="chunk", leave=False):
             data = normalize_data(data, path)
-            add_new_selections(data, periods, selected, block_number)
+            add_new_selections(data, periods, selected, path.name)
             retained = selected_rows(data, selected)
             if not retained.empty:
                 accumulate_selected_rows(
@@ -551,6 +600,7 @@ def main() -> None:
                     first_seen_qtime,
                     cutoff_by_period,
                     firm_sets,
+                    sharing_firm_sets,
                     ndc_sharing,
                 )
             del data, retained
@@ -559,8 +609,17 @@ def main() -> None:
         missing = [period for period in periods if period not in selected]
         raise RuntimeError(f"Stopped after all blocks but target periods remain uncovered: {missing}")
 
-    write_outputs(periods, selected, opened_blocks, events, firm_sets, ndc_sharing, cutoff_by_period)
-    print(f"Opened {len(opened_blocks)} of {N_FORMULARY_BLOCKS} panel blocks: {opened_blocks}")
+    write_outputs(
+        periods,
+        selected,
+        opened_files,
+        events,
+        firm_sets,
+        sharing_firm_sets,
+        ndc_sharing,
+        cutoff_by_period,
+    )
+    print(f"Opened {len(opened_files)} of {len(paths)} panel files.")
     print(f"Saved CSV summaries under: {CSV_ROOT}")
     print(f"Saved figures under: {FIGURE_ROOT}")
 

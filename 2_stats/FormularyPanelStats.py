@@ -6,15 +6,16 @@ combining them in memory. Produce coverage and event-by-ATC diagnostics.
 Process:
 1. Stream the required columns from each formulary_panel block in small chunks.
 2. Deduplicate FORMULARY_ID-quarter and treated FORMULARY_ID-NDC observations.
-   Annual events use event-year Q1; quarterly events use their actual quarter
-   and the cohort's prior-year same-quarter NDC cutoff.
+   Annual events use event-year Q1; quarterly event-NDC statistics require the
+   NDC to have been first seen by the prior-year same quarter (event t-4).
 3. Validate that each ATC sharing split exhausts its corresponding event count.
 4. Save concise CSV summaries and bar charts under the project-level csv and
    figures directories.
 
 Input:
 - data/formulary_panel[/shift_qX]/formulary_panel_*.csv (quarter=0)
-- data/formulary_panel_quarter[/shift_qX]/formulary_panel_*.csv (quarter=1)
+- data/formulary_panel_quarter_by_time[/shift_qX]/formulary_panel_YYYYQX.csv
+  (quarter=1)
 - matching data/formulary_metadata/ndc_first_seen*.csv
 
 Output:
@@ -50,7 +51,7 @@ N_FORMULARY_BLOCKS = 30
 CHUNKSIZE = 150_000
 QUARTER = 1  # 0: annual events in Q1; 1: events in their actual quarter.
 FORMULARY_TIME_SHIFT_QUARTERS = 1
-ATC_LEVELS = (1, 2, 3, 4)
+ATC_LEVELS = (3,) if QUARTER else (1, 2, 3, 4)
 EVENT_SPECS = (
     ("to_B_still_in_A", "A", "stay_a", "Move to B; still in A (A)"),
     ("to_B_still_in_A", "B", "stay_b", "Move to B; still in A (B)"),
@@ -98,7 +99,7 @@ def configure_paths() -> None:
     if not isinstance(shift, int):
         raise ValueError("FORMULARY_TIME_SHIFT_QUARTERS must be an integer.")
     shift_suffix = f"shift_q{shift}" if shift else ""
-    panel_name = "formulary_panel_quarter" if QUARTER else "formulary_panel"
+    panel_name = "formulary_panel_quarter_by_time" if QUARTER else "formulary_panel"
     first_seen_name = "ndc_first_seen_quarter" if QUARTER else "ndc_first_seen"
     PANEL_DIR = PROJECT_ROOT / "data" / panel_name
     if shift_suffix:
@@ -123,15 +124,14 @@ def available_periods(paths: list[Path]) -> set[int]:
 
 
 def cutoff_for_period(period: int, observed: set[int]) -> int:
-    """Match the cohort's t-4..t+7 window and first-observed-quarter clipping."""
+    """Return the prior-year same-quarter event-NDC cutoff (event t-4)."""
     interior = set(range(max(period - 4, min(observed)), min(period + 7, max(observed)) + 1))
     missing = interior - observed
     if missing:
         raise FileNotFoundError(f"Cohort window for {period} is missing quarters: {sorted(missing)}")
-    window = observed.intersection(range(period - 4, period + 8))
-    if period not in window:
+    if period not in observed:
         raise ValueError(f"Event quarter {period} is absent from the panel.")
-    return max(period - 4, min(window))
+    return period - 4
 
 
 def quarter_tag(period: int) -> str:
@@ -141,7 +141,22 @@ def quarter_tag(period: int) -> str:
 
 
 def panel_paths() -> list[Path]:
-    """Return exactly the configured, consecutively numbered panel blocks."""
+    """Return the configured panel files in deterministic time or block order."""
+    if QUARTER:
+        paths = list(PANEL_DIR.glob("formulary_panel_????Q?.csv"))
+        if not paths:
+            raise FileNotFoundError(f"No quarterly panel files found in {PANEL_DIR}")
+
+        def quarter_key(path: Path) -> tuple[int, int]:
+            tag = path.stem.removeprefix("formulary_panel_")
+            year_text, quarter_text = tag.split("Q", maxsplit=1)
+            year, quarter = int(year_text), int(quarter_text)
+            if quarter not in range(1, 5):
+                raise ValueError(f"Invalid quarterly panel filename: {path.name}")
+            return year, quarter
+
+        return sorted(paths, key=quarter_key)
+
     if N_FORMULARY_BLOCKS < 1:
         raise ValueError("N_FORMULARY_BLOCKS must be at least 1.")
 
@@ -237,7 +252,7 @@ def available_by_event_cutoff(
     path: Path,
     cutoff_by_period: dict[int, int],
 ) -> pd.Series:
-    """Return whether each NDC was first included by the event cutoff."""
+    """Return whether each NDC was first included by the configured cutoff."""
     first_seen = data["NDC"].map(first_seen_qtime)
     if first_seen.isna().any():
         examples = data.loc[first_seen.isna(), "NDC"].drop_duplicates().head(10).tolist()

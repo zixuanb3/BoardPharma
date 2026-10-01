@@ -139,8 +139,8 @@ def build_event_table(
     if table_type == "movement":
         required = set(MOVEMENT_REQUIRED_COLUMNS)
         if quarter:
-            required -= {"requirement2_A", "requirement2_B"}
-            required.add("event_quarter")
+            required -= {"FirmA", "FirmB", "requirement2_A", "requirement2_B"}
+            required.update({"idA", "idB", "event_quarter"})
         missing = sorted({*required, stay_column} - set(candidates.columns))
         if missing:
             raise ValueError(f"{source_name} is missing columns: {missing}")
@@ -152,24 +152,27 @@ def build_event_table(
             shared_columns.append("event_quarter")
         sides = []
         for side in ("A", "B"):
-            columns = [*shared_columns, f"Firm{side}"]
+            firm_column = f"id{side}" if quarter else f"Firm{side}"
+            columns = [*shared_columns, firm_column]
             if not quarter:
                 columns.append(f"requirement2_{side}")
             rows = movement[columns].rename(columns={
                 "event_year": "year", "event_quarter": "quarter",
-                stay_column: "stay", f"Firm{side}": "BoardName",
+                stay_column: "stay", firm_column: "id" if quarter else "BoardName",
                 f"requirement2_{side}": "requirement2",
             })
             rows["firm_type"] = side
             sides.append(rows)
 
         firm_year = pd.concat(sides, ignore_index=True)
+        firm_key = "id" if quarter else "BoardName"
         time_columns = ["year", "quarter"] if quarter else ["year"]
-        group_columns = ["BoardName", *time_columns, "event_type", "firm_type"]
-        sort_columns = ["event_type", "firm_type", "BoardName", *time_columns]
+        group_columns = [firm_key, *time_columns, "event_type", "firm_type"]
+        sort_columns = ["event_type", "firm_type", firm_key, *time_columns]
 
     elif table_type == "interlock":
         # Interlock events are direction-free here, so no A/B firm_type is added.
+        firm_key = "BoardName"
         missing = sorted({*INTERLOCK_REQUIRED_COLUMNS, stay_column} - set(candidates.columns))
         if missing:
             raise ValueError(f"{source_name} is missing columns: {missing}")
@@ -191,8 +194,13 @@ def build_event_table(
         raise ValueError("table_type must be either 'movement' or 'interlock'")
 
     # Normalize key and requirement columns before boolean flag construction.
-    firm_year = firm_year.dropna(subset=["BoardName", "year"]).copy()
-    firm_year["BoardName"] = firm_year["BoardName"].astype(str)
+    firm_year = firm_year.dropna(subset=[firm_key, "year"]).copy()
+    if quarter:
+        firm_year[firm_key] = pd.to_numeric(
+            firm_year[firm_key], errors="raise"
+        ).astype(int)
+    else:
+        firm_year[firm_key] = firm_year[firm_key].astype(str)
     if not quarter:
         firm_year["year"] = pd.to_numeric(firm_year["year"], errors="raise").astype(int)
     if quarter:
