@@ -1,24 +1,36 @@
-"""Build a quarterly formulary roster from BP, IE and OC records.
+"""
+Purpose:
+    Build a quarterly formulary roster by combining BoardEx personnel (BP),
+    individual employment (IE), and organization composition (OC) records.
+    The standardized mapping uses mapping id as the common company identity;
+    the expanded mapping retains the legacy CompanyID-to-BoardName rule.
 
-Usage: python FormularyRosterMaker.py --start-year 2019 --end-year 2025
-Use --mapping-source to select the standardized or expanded formulary mapping.
-An explicit --mapping path overrides the default path for the selected source.
-Use --audit-only to inspect joins without writing a roster. Requires pandas.
-For the standardized mapping, BP eligibility is matched on BoardName and IE/OC
-eligibility is matched on CompanyName. The mapping's id is the common company
-identifier; source names, CompanyID and DirectorName are omitted from output.
-The expanded mapping retains the legacy CompanyID -> BoardName eligibility rule.
-BP expands each observed director/company/year into quarters 1-4 only.
-Unobserved years are never created, and attributes are not filled across years.
-IE and OC retain observed quarters. Standardized source rows use BoardName,
-LabelerName and CompanyName only during matching and do not output those names.
-Standardized rows with the same director, period, country and id combine sources.
-The additional source column records contributing roster sources in fixed order
-ie-oc-bp (e.g. ie, oc-bp, or ie-oc-bp). Attribute lookups do not add sources;
-quarters filled by BP expansion count as bp. Identical rows within one source
-contribute that source only once. Missing data values remain in the output.
-Expanded-stream BP CompanyName matches that are absent from IE/OC remain blank
-and are reported in the audit.
+Process:
+    1. Read the selected mapping and filter BP, IE, and OC records to the
+         requested inclusive year range and eligible companies.
+    2. Match BP by BoardName and IE/OC by CompanyName in the standardized
+         stream; the expanded stream matches IE/OC through CompanyID.
+    3. Expand each observed BP director/company/year record to quarters 1-4,
+         retain observed IE/OC quarters, and never create unobserved years.
+    4. Combine identical standardized rows, record contributing sources in the
+         fixed ie-oc-bp order, and write an audit summary. Use --audit-only to
+         inspect the joins without writing the roster.
+
+Input:
+    data/boardex/individual_employment_record.csv
+    data/boardex/organization_composition_record.csv
+    InterimData/boardex_pharma.dta
+    crosswalks/labeler_company_mapping_standardized_with_id.csv by default for
+    --mapping-source standardized, or
+    crosswalks/labeler_board_name_mapping_expanded.csv for expanded.
+    Command-line paths can override the mapping and source files.
+
+Output:
+    data/formulary_roster/formulary_{start_year}_{end_year}.csv
+    data/formulary_roster/formulary_{start_year}_{end_year}_audit.json
+    Standardized output contains DirectorID, Year, Quarter, HOCountryName,
+    id, and source. Expanded output retains the legacy source columns and
+    reports unmatched BP CompanyName values in the audit.
 """
 
 from __future__ import annotations
