@@ -131,7 +131,9 @@ def cutoff_for_period(period: int, observed: set[int]) -> int:
         raise FileNotFoundError(f"Cohort window for {period} is missing quarters: {sorted(missing)}")
     if period not in observed:
         raise ValueError(f"Event quarter {period} is absent from the panel.")
-    return period - 4
+    # Match FormularyCohortPanelMaker.keep_available_ndcs: request t-4, but
+    # clip to the first quarter actually available in this cohort window.
+    return max(period - 4, min(interior))
 
 
 def quarter_tag(period: int) -> str:

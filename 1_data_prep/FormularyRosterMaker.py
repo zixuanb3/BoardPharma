@@ -457,8 +457,8 @@ def build(args: argparse.Namespace) -> None:
 def main() -> None:
     """Parse inclusive year bounds and optional input/output path overrides."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start-year", type=int, default=2019)
-    parser.add_argument("--end-year", type=int, default=2025)
+    parser.add_argument("--start-year", type=int, default=2018)
+    parser.add_argument("--end-year", type=int, default=2026)
     parser.add_argument(
         "--mapping-source",
         choices=sorted(MAPPING_PATHS),

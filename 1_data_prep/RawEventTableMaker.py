@@ -62,7 +62,7 @@ PHARMA_PATH = INTERIM_DATA_PATH / "boardex_pharma.dta"
 LARGE_SAMPLE_ROSTER_PATH = INTERIM_DATA_PATH / "ssr_company_roster.csv"
 FORMULARY_ROSTER_PATH = INTERIM_DATA_PATH / "formulary_company_roster.csv"
 FORMULARY_QUARTER_ROSTER_PATH = (
-    PROJECT_ROOT / "data" / "formulary_roster" / "formulary_roster_2019_2025.csv"
+    PROJECT_ROOT / "data" / "formulary_roster" / "formulary_roster_2018_2026.csv"
 )
 SSR_SAMPLE_PATH = INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv"
 INDIRECT_INPUT_PATH = INTERIM_DATA_PATH / "boardex_interlock_indirect_firmpair.dta"
@@ -145,7 +145,8 @@ class MovementEventBuilder:
         self.quarter = quarter
         if quarter:
             self.stay_col = f"stay_{stay_x_years * 4}_quarters"
-            self.forward_stay_periods = self.backward_stay_periods = stay_x_years * 4
+            self.forward_stay_periods = stay_x_years * 4
+            self.backward_stay_periods = (stay_x_years - 1) * 4
         else:
             self.stay_col = f"stay_{stay_x_years}_years"
             if requirement2_window is None:
