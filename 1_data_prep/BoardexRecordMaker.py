@@ -42,9 +42,9 @@ class Config:
     open_end_year: int = 2026
     open_end_quarter: int = 4
     # A None year leaves that side unbounded; its quarter applies when set.
-    window_start_year: int | None = 2019
+    window_start_year: int | None = 2017
     window_start_quarter: int = 1
-    window_end_year: int | None = 2025
+    window_end_year: int | None = 2026
     window_end_quarter: int = 4
 
 
