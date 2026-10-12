@@ -1,12 +1,9 @@
-// Purpose: Estimate fresh FE1 REQ2 results with no Kappa dependencies.
-// Input: Fresh narrow cohorts and SSR price data.
-// Output: Specification CSVs and complete Stata logs in the isolated results root.
 clear all
 set more off
 set trace off
 cap mkdir "D:/Boardex_pharma/_repro_stata_tmp"
-cap mkdir "D:/pharma/rb26/t2/stata_temp"
-capture noisily set tempdir "D:/pharma/rb26/t2/stata_temp"
+cap mkdir "F:/BoardPharma/_repro_stata_tmp"
+capture noisily set tempdir "F:/BoardPharma/_repro_stata_tmp"
 
 // ================================================================
 // Purpose:
@@ -71,8 +68,8 @@ if `"`requested_req'"' != "" & `"`requested_req'"' != "all" local requirements `
 local treatment_groups A B
 if `"`requested_treatment_group'"' != "" & `"`requested_treatment_group'"' != "all" local treatment_groups `requested_treatment_group'
 local include_eventpair_values 0
-local kappa_controls none
-// This derived script accepts only the no-Kappa specification.
+local kappa_controls kappa_norm none kappa_asy kappa_norm_p95 kappa_asy_p95
+if `"`requested_kappa'"' != "" & `"`requested_kappa'"' != "all" local kappa_controls `requested_kappa'
 // Optional sensitivity mode: retain the full panel by coding missing Kappa as zero.
 local zero_fill_kappa : environment BOARDPHARMA_KAPPA_MISSING_ZERO
 if `"`zero_fill_kappa'"' == "" local zero_fill_kappa 0
@@ -153,7 +150,31 @@ foreach roster_variant of local roster_variants {
             // cohort file, so no roster-filtered mapping file is read here.
 
             // Build the BoardName to canonical Kappa-firm crosswalk.
-            // No Kappa or CUSIP lookup is required for this run.
+            preserve
+            import delimited using "`crosswalk_file'", clear varnames(1) stringcols(_all)
+            capture rename BoardName boardname
+            capture rename MatchedKey firm_key
+            capture rename matchedkey firm_key
+            capture recast str128 boardname
+            keep boardname firm_key
+            duplicates drop
+            isid boardname
+            tempfile firm_crosswalk
+            save `firm_crosswalk', replace
+            restore
+
+            // Kappa controls are keyed by canonical firm and data_cohort.
+            preserve
+            import delimited using "`kappa_file'", clear varnames(1) stringcols(_all)
+            foreach kappa_numeric_var in kappa_raw_pre kappa_norm_pre kappa_raw_p95_pre kappa_norm_p95_pre kappa_pre_valid {
+                capture confirm string variable `kappa_numeric_var'
+                if !_rc destring `kappa_numeric_var', replace ignore(",") force
+            }
+            keep firm_key data_cohort kappa_raw_pre kappa_norm_pre kappa_raw_p95_pre kappa_norm_p95_pre kappa_pre_valid
+            duplicates drop firm_key data_cohort, force
+            tempfile kappa_map
+            save `kappa_map', replace
+            restore
 
             foreach treatment_group of local treatment_groups {
                 local treatment_group = upper("`treatment_group'")
@@ -284,6 +305,8 @@ foreach roster_variant of local roster_variants {
                                             gen byte atc_sharing = atc3_sharing
                                             replace atc_sharing = 0 if missing(atc_sharing)
                                             drop atc3_sharing
+                                            merge m:1 boardname using `firm_crosswalk', keep(master match) nogen
+                                            merge m:1 firm_key data_cohort using `kappa_map', keep(master match) nogen
 
                                             capture confirm variable event_`event_label'
                                             if _rc {
@@ -350,8 +373,19 @@ foreach roster_variant of local roster_variants {
                                         gen treated = treated_in_stack
                                         gen event_cohort_did_imputation = event_cohort
 
-                                        // No observation is excluded for missing Kappa.
-                                        local missing_kappa = 0
+                                        if "`control_kappa'" == "none" {
+                                            local missing_kappa = .
+                                        }
+                                        else {
+                                            count if missing(`kappa_var')
+                                            local missing_kappa = r(N)
+                                            if `"`zero_fill_kappa'"' == "1" {
+                                                replace `kappa_var' = 0 if missing(`kappa_var')
+                                            }
+                                            else {
+                                                drop if missing(`kappa_var')
+                                            }
+                                        }
                                         if `fe_level' == 2 drop if missing(size_quintile) | missing(state)
 
                                         egen product_cohort_fe = group(product data_cohort)
@@ -365,8 +399,12 @@ foreach roster_variant of local roster_variants {
 
                                         gen atc_sharing_het = atc_sharing if treated == 1
                                         replace atc_sharing_het = 0 if treated == 0
-                                        local did_controls ""
-                                        if `window_event_control' == 1 local did_controls "controls(window_other_event)"
+                                        if "`control_kappa'" == "none" {
+                                            local did_controls "controls(`event_control_var')"
+                                        }
+                                        else {
+                                            local did_controls "controls(`kappa_var' `event_control_var')"
+                                        }
                                         local horizons "0/`window_post'"
 
                                             capture noisily did_imputation `target' id `period_var' event_cohort_did_imputation, ///
