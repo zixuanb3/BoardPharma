@@ -5,6 +5,9 @@ __pycache__/
 .pytest_cache/
 pytest-cache-files-*/
 .mypy_cache/
+copayonly/
+year_level/
+scripts/
 0630/
 0706/
 0713/
@@ -17,6 +20,4 @@ pytest-cache-files-*/
 0925/
 1001/
 1008/
-copayonly/
-year_level/
-scripts/
+1015/
