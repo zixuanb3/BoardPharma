@@ -113,7 +113,7 @@ RUN_CONFIG = {
         "to_B_still_in_A",
         "interlock_dissolution",
     ],
-    "event_requirements": [0, 1, 2],
+    "event_requirements": [1],
     "treat_types": ["event"],
     "control_types": ["pure_control", "not_yet", "not"],
     "control_variations": ["stable", "changing", "stable_interlock", "stable_no_interlock"],

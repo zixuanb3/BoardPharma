@@ -58,12 +58,12 @@ MOVEMENT_EVENTS = [
     "to_B_still_in_A",
     "interlock_dissolution",
 ]
-EVENT_REQUIREMENTS = [0, 1, 2]
+EVENT_REQUIREMENTS = [1]
 COHORT_YEARS = list(range(2009, 2019))
 TREATMENT_GROUPS = ["A", "B"]
 INCLUDE_EVENTPAIR = [0]
 CONTROL_FOLDERS = ["Not", "Not Yet", "Pure Control"]
-PLOT_CONTROL_FOLDER = "Pure Control"
+PLOT_CONTROL_FOLDER = "Not"
 PANEL = "quarter"
 EVENT_TYPE = "event"
 LARGE_SAMPLE = 1
