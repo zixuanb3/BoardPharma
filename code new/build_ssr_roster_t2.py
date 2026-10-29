@@ -14,7 +14,7 @@ Output:
     drop_sentinel_year and drop_sentinel_yearquarter. Audits include fixed name
     mappings, raw matched records, company date bounds, row-level flag decisions,
     build counts and an optional full-column comparison with existing T2 files.
-    Default output: D:/pharma/t2_standalone_20261008/rosters.
+    Default output: D:/pharma/t2_membership_policy_20261028/rosters.
 
 Usage:
     D:/ProgramData/anaconda3/python.exe build_ssr_roster_t2.py
@@ -24,8 +24,10 @@ Policy:
     Cutoff is fixed at 2026Q3. No historical CompanyID/alias discovery is run.
     IE board flags Yes/Inside/Outside, OC board seniority, and current role
     keywords remain active. This script implements T2 only, without T1 or T3.
-    Baseline years expand to all four quarters; they do not create employment
-    start/end dates or connect different observed baseline years by themselves.
+    Known person-company pairs use the union of all usable IE/OC role intervals.
+    Annual board evidence labels covered periods without extending employment.
+    Pairs without usable IE/OC dates retain four quarters per baseline year.
+    Existing role dates are preserved; gaps between observed spells remain gaps.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ import pandas as pd
 
 INTERIM_DIR = Path(r"D:/Dropbox/BoardPharma/InterimData")
 RAW_NA_DIR = Path(r"D:/Dropbox/BoardPharma/RawData/boardex/boardex_na")
-OUTPUT_DIR = Path(r"D:/pharma/t2_standalone_20261008/rosters")
+OUTPUT_DIR = Path(r"D:/pharma/t2_membership_policy_20261028/rosters")
 SAMPLE_START = 1990
 SAMPLE_END = CUTOFF_YEAR = 2026
 CUTOFF_PERIOD = 2026 * 4 + 2
@@ -783,34 +785,145 @@ def finalize(candidates: pd.DataFrame, bp, display, info, frequency: str) -> pd.
     return roster.merge(trace, on=time_key(frequency), how="left", validate="one_to_one")
 
 
-def append_baseline(current: pd.DataFrame, bp, display, info, frequency: str) -> tuple[pd.DataFrame, int]:
-    """Append observed director-year membership without changing spell profiles."""
-    board = build_board_candidates(bp, current, display, info, frequency)
+def finalize_unique(candidates: pd.DataFrame, display, info, frequency: str) -> pd.DataFrame:
+    """Finalize already unique periods without expensive repeated provenance grouping."""
+    key = time_key(frequency)
+    assert not candidates.duplicated(key).any()
+    roster = add_board_continuity_flag(candidates, frequency)
+    roster["BoardName"] = roster.company_key.map(display)
+    roster["HOCountryName"] = roster.company_key.map(lambda value: info[value][0])
+    roster["CompanyID"] = roster.company_key.map(lambda value: info[value][1])
+    roster["role_missing"] = roster.rolename.fillna("").eq("").astype(int)
+    roster["seniority_missing"] = roster.seniority.fillna("").eq("").astype(int)
+    roster["inSSR"] = 1
+    columns = ["DirectorID", "DirectorName", "BoardName", "company_key", "HOCountryName", "CompanyID", "year"]
+    if frequency == "quarter":
+        columns += ["quarter", "yearquarter"]
+    columns += ["rolename", "leader_tier", "role_priority", "board_continuity", "seniority",
+                "seniority_missing", "brdposition", "role_missing", "start_year", "end_year"]
+    if frequency == "quarter":
+        columns += ["start_period", "end_period"]
+    columns += ["delist_year", "delist_period", "start_imputed", "end_censored", "source",
+                "source_ie", "source_oc", "mapping_source", "mapping_confidence",
+                "mapping_conflict", "RawCompanyID", "inSSR"] + TRACE
+    if "baseline_present" in roster:
+        columns += ["baseline_present"]
+    for column in ["start_year", "end_year", "start_period", "end_period"]:
+        if column in roster:
+            roster[column] = pd.to_numeric(roster[column], errors="coerce")
+    return roster[columns].sort_values(["BoardName", "year"] +
+        (["quarter"] if frequency == "quarter" else []) + ["DirectorID"], kind="stable").reset_index(drop=True)
+
+
+def employment_roster(spells: pd.DataFrame, bp, display, info, frequency: str) -> pd.DataFrame:
+    """Union all usable company roles before determining membership continuity.
+
+    Expand observed role intervals, including non-leadership roles, without
+    filling gaps between separate spells. Resolve simultaneous roles with the
+    existing profile priority. The original role-date fields remain unchanged.
+    """
+    frame = spells.copy()
+    frame["leader_tier"] = [classify_leader(*values) for values in
+        frame[["rolename", "brdposition", "seniority"]].itertuples(index=False, name=None)]
+    frame["role_priority"] = frame.leader_tier.map(TIER_PRIORITY).astype(int)
+    start = "start_year" if frequency == "year" else "start_period"
+    end = "end_year" if frequency == "year" else "end_period"
+    lower = SAMPLE_START if frequency == "year" else SAMPLE_START * 4
+    upper = CUTOFF_YEAR if frequency == "year" else CUTOFF_PERIOD
+    starts = np.maximum(frame[start].to_numpy(), lower)
+    ends = np.minimum(frame[end].to_numpy(), upper)
+    lengths = np.maximum(ends - starts + 1, 0).astype(int)
+    repeated = frame.loc[frame.index.repeat(lengths)].copy().reset_index(drop=True)
+    offsets = np.arange(lengths.sum()) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+    periods = np.repeat(starts, lengths) + offsets
+    repeated["year"] = periods if frequency == "year" else periods // 4
+    if frequency == "quarter":
+        repeated["quarter"] = periods % 4 + 1
+        repeated["yearquarter"] = repeated.year.astype(str) + "q" + repeated.quarter.astype(str)
+    repeated["role_missing"] = repeated.rolename.fillna("").eq("").astype(int)
+    key = time_key(frequency)
+    repeated = repeated.sort_values(
+        key + ["role_priority", "role_missing", "start_year"],
+        ascending=[True] * len(key) + [False, True, False], kind="stable",
+    ).drop_duplicates(key)
+    roster = finalize_unique(repeated, display, info, frequency)
+    # Retain the global usable-pair universe, including spells outside the
+    # output window, so an annual baseline cannot invent a new covered period.
+    roster.attrs["employment_pairs"] = frame[["DirectorID", "company_key"]].drop_duplicates()
+    return roster
+
+
+def append_baseline(current: pd.DataFrame, bp, display, info, frequency: str,
+                    employment: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Use IE/OC coverage for known pairs; expand annual-only pairs to four quarters."""
+    board = build_board_candidates(bp, employment, display, info, frequency)
     board = board[board.year.between(SAMPLE_START, CUTOFF_YEAR)].copy()
     if frequency == "quarter":
         board = board[(board.year * 4 + board.quarter - 1).le(CUTOFF_PERIOD)].copy()
     key = time_key(frequency)
     board = board.drop_duplicates(key)
+    pair = ["DirectorID", "company_key"]
+    known_pairs = employment.attrs.get("employment_pairs", employment[pair].drop_duplicates())
+    has_usable_roles = pd.MultiIndex.from_frame(board[pair]).isin(
+        pd.MultiIndex.from_frame(known_pairs)
+    )
+    covered = pd.MultiIndex.from_frame(board[key]).isin(
+        pd.MultiIndex.from_frame(employment[key])
+    )
+    # For any pair with usable IE/OC dates, annual board evidence may label
+    # covered periods only. Entirely annual-only pairs retain all four quarters.
+    board = board.loc[~has_usable_roles | covered].copy().reset_index(drop=True)
     # Baseline role enrichment uses the current same-period record only.
     # It never attaches a first role from another year or another quarter.
-    enrich = current[key + TRACE + ["RawCompanyID"]]
+    enrich = employment[key + TRACE + ["RawCompanyID"]]
     board = board.merge(enrich, on=key, how="left", validate="one_to_one")
+    # Baseline board status must not erase the matched IE/OC role 
+    # Copy dates and their censoring/delisting metadata from the same period;
+    # baseline-only observations retain missing dates without imputation.
+    date_columns = [column for column in [
+        "start_year", "end_year", "start_period", "end_period",
+        "start_imputed", "end_censored", "delist_year", "delist_period",
+    ] if column in employment.columns]
+    matched_dates = employment.set_index(key)[date_columns].reindex(
+        pd.MultiIndex.from_frame(board[key])
+    )
+    for column in date_columns:
+        board[column] = matched_dates[column].reset_index(drop=True).combine_first(
+            board.get(column, pd.Series(np.nan, index=board.index)).reset_index(drop=True)
+        )
     board["RawCompanyID"] = board.RawCompanyID.fillna(board.CompanyID).astype(int)
     for column in TRACE:
         fallback = "boardex_pharma_annual_baseline" if "rules" in column else ""
         board[column] = board[column].fillna(fallback)
-    for column in ["delist_year", "delist_period"]:
-        board[column] = np.nan
-    current = current.copy()
+    current = employment.copy()
     baseline_keys = pd.MultiIndex.from_frame(board[key])
     current["baseline_present"] = pd.MultiIndex.from_frame(current[key]).isin(baseline_keys).astype(int)
     board["baseline_present"] = 1
-    combined = pd.concat([current, board], ignore_index=True)
-    roster = finalize(combined, bp, display, info, frequency)
+    # Each employment period already has its highest-priority role profile.
+    # A baseline can upgrade that period to board, but cannot replace an
+    # existing board profile. Source provenance always records both sources.
+    existing = current.set_index(key)
+    baseline = board.set_index(key)
+    shared = baseline.index.intersection(existing.index, sort=False)
+    promote = baseline.loc[shared, "role_priority"].gt(existing.loc[shared, "role_priority"])
+    promoted = shared[promote.to_numpy()]
+    existing = pd.concat([
+        existing.loc[~existing.index.isin(promoted)],
+        baseline.reindex(index=promoted, columns=existing.columns),
+    ])
+    provenance = ["source", "source_ie", "source_oc"]
+    existing.loc[shared, provenance] = baseline.loc[shared, provenance]
+    added = baseline.loc[~baseline.index.isin(existing.index)].reindex(columns=existing.columns)
+    combined = pd.concat([existing, added]).reset_index()
+    roster = finalize_unique(combined, display, info, frequency)
+    # Retain non-leadership roles after a board appointment while company
+    # employment remains continuous. They prevent false board-to-job exits;
+    # unrelated non-leadership employees do not enter the leadership roster.
+    roster = roster.loc[roster.leader_tier.ne("excluded") | roster.board_continuity.eq(1)].copy()
     # Every baseline observation must be recognized in narrow membership.
     narrow = roster.leader_tier.eq("board") | roster.board_continuity.eq(1)
     assert baseline_keys.isin(pd.MultiIndex.from_frame(roster.loc[narrow, key])).all()
-    return roster, len(board)
+    return roster.reset_index(drop=True), len(board)
 
 
 def write_audit(frame: pd.DataFrame, name: str) -> None:
@@ -961,7 +1074,9 @@ def build(args) -> None:
             frequency_rows = selected if frequency == "year" else selected[selected.quarter_interval_valid.eq(1)]
             spells = consolidate(frequency_rows, frequency)
             current = current_roster(expand(spells, frequency), bp, display, info, frequency)
-            roster, baseline_rows = append_baseline(current, bp, display, info, frequency)
+            employment = employment_roster(spells, bp, display, info, frequency)
+            roster, baseline_rows = append_baseline(current, bp, display, info, frequency,
+                                                   employment=employment)
             validate_roster(roster, variant, len(canonical), frequency)
             assert roster.company_key.isin(canonical).all()
             key = time_key(frequency)
@@ -995,7 +1110,7 @@ def build(args) -> None:
     manifest = {"experiment": "T2", "cutoff": "2026q3",
                 "initial_names": len(names), "current_company_ids": len(ids),
                 "historical_id_or_alias_discovery": False,
-                "baseline_policy": "Observed director-year SSR membership; all four quarters per baseline year",
+                "baseline_policy": "Usable IE/OC pairs use all-role coverage; annual board status labels covered periods only; annual-only pairs cover all four quarters",
                 "date_policy": {"75_80_imputed": "company earliest/latest valid endpoint quarter; flag40 company ends at cutoff",
                                 "75_80_drop": "exclude raw row", "start_30_imputed": "known year Q1",
                                 "end_25_imputed": "known year Q4", "25_30_drop": "exclude raw row",

@@ -9,8 +9,9 @@ Process:
 2. Build treated and control cohorts within the configured event window.
 3. Attach movement event-pair indicators and related other-event timing controls
    when those fields are available.
-4. Save cohort CSV files under a variant-specific cohort_data directory.
-5. Summarize generated cohort files and write distribution CSVs and figures.
+4. Assign event-quarter, full-window all/any, or independent quarterly overlap.
+5. Save cohort CSV files under a variant- and overlap-mode-specific directory.
+6. Summarize generated cohort files and write distribution CSVs and figures.
 
 Input:
 - `data/roster_variants/<variant>/leader_tier_<tier>/<year|quarter>-level[_A|_B]/ssr_firm_panel_*.csv`
@@ -21,13 +22,16 @@ Input:
 
 Output:
 - `data/roster_variants/<variant>/leader_tier_<tier>/cohort_data/<level-folder>/.../*_<year|quarter>_cohort_*.csv`
+- Alternative modes use `cohort_data_atc3_<mode>` with separate fixed/dynamic labels.
 - `csv/roster_variants/<variant>/leader_tier_<tier>/.../*.csv`
 - `figures/roster_variants/<variant>/leader_tier_<tier>/.../*.png`
 """
 
 from __future__ import annotations
 
+import argparse
 from functools import lru_cache
+import os
 from pathlib import Path
 import re
 import matplotlib.pyplot as plt
@@ -47,6 +51,32 @@ from pipeline_variant_config import (
 PROJECT_ROOT = OUTPUT_PROJECT_ROOT
 DATA_ROOT = PROJECT_ROOT / "data"
 ATC3_PRICE_SAMPLE_PATH = INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv"
+ATC3_OVERLAP_MODES = (
+    "event_quarter", "window_all", "window_any", "quarterly",
+)
+
+
+def validate_atc3_overlap_mode(value: str) -> str:
+    """Reject unknown overlap definitions before any output is written."""
+    if value not in ATC3_OVERLAP_MODES:
+        raise ValueError(
+            f"atc3_overlap_mode must be one of {ATC3_OVERLAP_MODES}: {value!r}. "
+            "Use window_all/window_any for fixed labels over the full cohort window; "
+            "event_year definitions are no longer accepted."
+        )
+    return value
+
+
+def cohort_directory_name(mode: str) -> str:
+    """Keep the historical default path and isolate the two alternative modes."""
+    validate_atc3_overlap_mode(mode)
+    return "cohort_data" if mode == "event_quarter" else f"cohort_data_atc3_{mode}"
+
+
+def distribution_directory_name(name: str, mode: str) -> str:
+    """Prevent alternative-mode plots and summaries from replacing default output."""
+    return name if mode == "event_quarter" else f"{name}_atc3_{mode}"
+
 
 MOVEMENT_EVENTS = (
     "to_B_not_in_A",
@@ -140,7 +170,7 @@ def load_atc3_product_panel() -> pd.DataFrame:
 
 @lru_cache(maxsize=2)
 def load_atc3_market_indices(panel_level: str) -> tuple[dict, dict]:
-    """Build cached event-period firm/product ATC3 indices."""
+    """Cache complete-market ATC3 sets at the requested observation frequency."""
     market = load_atc3_product_panel()
     if panel_level == "year":
         # Annual events are anchored at Q1, so annual sharing also uses Q1.
@@ -167,6 +197,8 @@ def load_atc3_market_indices(panel_level: str) -> tuple[dict, dict]:
 
 # ========================== USER CONFIG ==========================
 RUN_CONFIG = {
+    # Fixed modes freeze labels; quarterly recomputes every observation quarter.
+    "atc3_overlap_mode": os.environ.get("BOARDPHARMA_ATC3_OVERLAP_MODE", "event_quarter"),
     "event_types": [
         "to_B_not_in_A",
         "to_B_still_in_A",
@@ -288,6 +320,9 @@ class CohortPanelMaker:
 
     def __init__(self, config: dict) -> None:
         self.config = config
+        self.atc3_overlap_mode = validate_atc3_overlap_mode(
+            config.get("atc3_overlap_mode", "event_quarter")
+        )
         self.roster_variant = ""
         self.panel_level = ""
         self.variant_root = Path()
@@ -306,6 +341,8 @@ class CohortPanelMaker:
                 self.panel_level = str(
                     metadata.get("regression_panel_level", metadata["panel_level"])
                 )
+                if self.atc3_overlap_mode != "event_quarter" and self.panel_level != "quarter":
+                    raise ValueError("Full-window ATC3 modes require a quarterly outcome panel")
                 self.variant_root = personnel_output_dir(
                     self.roster_variant, self.personnel_definition
                 )
@@ -349,6 +386,7 @@ class CohortPanelMaker:
                                             "Running cohort build: "
                                             f"variant={self.roster_variant}, tier={self.personnel_definition}, "
                                             f"level={self.panel_level}, {direction_msg}, "
+                                            f"atc3_overlap_mode={self.atc3_overlap_mode}, "
                                             f"event_type={event_type}, req{event_requirement}, "
                                             f"control_type={control_type}, balanced={balanced}"
                                         )
@@ -398,7 +436,10 @@ class CohortPanelMaker:
             treatment_group=treatment_group,
             include_eventpair=include_eventpair,
         )
-        output_root = self.variant_root / "cohort_data" / level_folder / "event" / req_folder
+        output_root = (
+            self.variant_root / cohort_directory_name(self.atc3_overlap_mode)
+            / level_folder / "event" / req_folder
+        )
 
         start_year = int(self.config["plot_start_year"])
         end_year = int(self.config["plot_end_year"])
@@ -565,11 +606,9 @@ class CohortPanelMaker:
                 )
             ].copy()
 
-        # Build ATC3 sharing at the cohort stage. For a treated FirmA row,
-        # compare its product ATC3 with every product sold by the event's
-        # FirmB partner at the event period. For a treated FirmB row, reverse
-        # the direction. The indicator is frozen at the event-period product
-        # comparison and copied across the complete event window.
+        # Compare each treated product with the event counterpart's full market
+        # portfolio. Window-all/window-any reduce the complete sequence of
+        # quarterly matches to a fixed label; quarterly keeps that sequence.
         cohort_df = self.add_atc3_sharing(
             cohort_df=cohort_df,
             event_type=event_type,
@@ -577,6 +616,7 @@ class CohortPanelMaker:
             treatment_group=treatment_group,
             cohort_time=cohort_time,
             event_col=event_col,
+            window_periods=window_periods,
         )
 
         if not is_indirect_interlock(event_type):
@@ -593,6 +633,10 @@ class CohortPanelMaker:
                 event_requirement=event_requirement,
                 treatment_group=treatment_group,
             )
+        # Require at least one treated unit after all cohort eligibility filters.
+        # Return an empty schema-compatible file when the entire stack is excluded.
+        if not cohort_df[event_col].eq(1).any():
+            return cohort_df.iloc[:0].copy()
         return cohort_df
 
     def add_window_other_event_marker(
@@ -653,12 +697,14 @@ class CohortPanelMaker:
         treatment_group: str,
         cohort_time: int,
         event_col: str,
+        window_periods: list[int] | None = None,
     ) -> pd.DataFrame:
-        """Attach event-period product ATC3 overlap for treated firms."""
+        """Attach the selected ATC3 labels without changing outcome rows or order."""
         result = cohort_df.copy()
         result["atc3_sharing"] = pd.Series(
             0, index=result.index, dtype="int8"
         )
+        result["atc3_overlap_mode"] = self.atc3_overlap_mode
         if is_indirect_interlock(event_type) or result.empty:
             return result
 
@@ -682,42 +728,82 @@ class CohortPanelMaker:
             event_requirement=event_requirement,
             treatment_group=treatment_group,
         )
+        mode = self.atc3_overlap_mode
+        if mode != "event_quarter" and self.panel_level != "quarter":
+            raise ValueError("Full-window ATC3 modes require a quarterly outcome panel")
         partner_atc3, product_atc3 = load_atc3_market_indices(self.panel_level)
 
         result["_cohort_firm_key"] = result["BoardName"].map(normalize_firm_key)
         result["_product_key"] = result["product"].map(normalize_product_key)
-        event_products = result.loc[
-            result["_time_id"].eq(cohort_time)
-            & result[event_col].eq(1)
-            & result["_cohort_firm_key"].isin(treated_keys),
-            ["_cohort_firm_key", "_product_key"],
-        ].dropna(subset=["_cohort_firm_key", "_product_key"]).drop_duplicates()
+        # Partner identities stay tied to the focal A/B event. Every window mode
+        # compares the same firms' actual product ATC3 sets within each quarter.
+        # Fixed labels are min/max of those quarterly checks over the full
+        # configured window, including all pre-event and post-event quarters.
+        eligible = result[event_col].eq(1) & result["_cohort_firm_key"].isin(treated_keys)
+        if mode == "event_quarter":
+            eligible &= result["_time_id"].eq(cohort_time)
+            result["_atc3_market_time"] = cohort_time
+        else:
+            if window_periods is None:
+                # Direct callers use the same window settings as the cohort
+                # builder; build_one_cohort passes its exact period list.
+                pre = int(self.config.get("window_pre_quarters", self.config.get("window_pre_years", 1) * 4))
+                post = int(self.config.get("window_post_quarters", self.config.get("window_post_years", 1) * 4))
+                window_periods = list(range(cohort_time - pre, cohort_time + post + 1))
+            window_periods = sorted(set(window_periods))
+            if not window_periods or cohort_time not in window_periods:
+                raise ValueError("The ATC3 window must be nonempty and contain the cohort event quarter")
+            eligible &= result["_time_id"].isin(window_periods)
+            result["_atc3_market_time"] = result["_time_id"]
 
-        sharing_pairs: set[tuple[str, str]] = set()
-        for treated_key, product_key in event_products.itertuples(index=False, name=None):
+        comparison_columns = ["_atc3_market_time", "_cohort_firm_key", "_product_key"]
+        comparisons = result.loc[eligible, comparison_columns].drop_duplicates()
+        if mode in {"window_all", "window_any"}:
+            # Include every required quarter, even when an outcome row is absent
+            # in an unbalanced input. A missing market match must not disappear
+            # from the all-quarter denominator. This creates comparison keys
+            # only; no synthetic outcome row is inserted into the cohort.
+            units = comparisons[["_cohort_firm_key", "_product_key"]].drop_duplicates()
+            comparisons = pd.DataFrame(
+                [(period, firm, product)
+                 for period in window_periods
+                 for firm, product in units.itertuples(index=False, name=None)],
+                columns=comparison_columns,
+            )
+        partner_sets: dict[tuple[int, str], set[str]] = {}
+        sharing_keys: set[tuple[int, str, str]] = set()
+        for market_time, treated_key, product_key in comparisons.itertuples(index=False, name=None):
             treated_atc_values = product_atc3.get(
-                (cohort_time, treated_key, product_key), set()
+                (market_time, treated_key, product_key), set()
             )
-            partner_atc_values: set[str] = set()
-            for partner_key in partner_lookup.get((cohort_time, treated_key), set()):
-                partner_atc_values.update(
-                    partner_atc3.get((cohort_time, partner_key), set())
-                )
-            if treated_atc_values.intersection(partner_atc_values):
-                sharing_pairs.add((treated_key, product_key))
+            partner_cache_key = (market_time, treated_key)
+            if partner_cache_key not in partner_sets:
+                partner_sets[partner_cache_key] = set().union(*(
+                    partner_atc3.get((market_time, partner_key), set())
+                    for partner_key in partner_lookup.get((cohort_time, treated_key), set())
+                ))
+            overlap = bool(treated_atc_values.intersection(partner_sets[partner_cache_key]))
+            if overlap:
+                sharing_keys.add((market_time, treated_key, product_key))
 
-        if sharing_pairs:
-            row_index = pd.MultiIndex.from_frame(
-                result[["_cohort_firm_key", "_product_key"]]
-            )
-            sharing_index = pd.MultiIndex.from_tuples(
-                sharing_pairs, names=["_cohort_firm_key", "_product_key"]
-            )
+        if sharing_keys:
+            if mode in {"window_all", "window_any"}:
+                counts: dict[tuple[str, str], int] = {}
+                for _, firm, product in sharing_keys:
+                    counts[(firm, product)] = counts.get((firm, product), 0) + 1
+                sharing_pairs = [pair for pair, count in counts.items()
+                                 if mode == "window_any" or count == len(window_periods)]
+                pair_columns = ["_cohort_firm_key", "_product_key"]
+                row_index = pd.MultiIndex.from_frame(result[pair_columns])
+                sharing_index = pd.MultiIndex.from_tuples(sharing_pairs, names=pair_columns)
+            else:
+                row_index = pd.MultiIndex.from_frame(result[comparison_columns])
+                sharing_index = pd.MultiIndex.from_tuples(list(sharing_keys), names=comparison_columns)
             result.loc[row_index.isin(sharing_index), "atc3_sharing"] = 1
 
         # Controls are never assigned the treated-side sharing label.
         result.loc[~result[event_col].eq(1), "atc3_sharing"] = 0
-        return result.drop(columns=["_cohort_firm_key", "_product_key"])
+        return result.drop(columns=comparison_columns)
 
     def get_atc3_partner_index(
         self,
@@ -979,6 +1065,9 @@ class CohortPlotter:
 
     def __init__(self, config: dict) -> None:
         self.config = config
+        self.atc3_overlap_mode = validate_atc3_overlap_mode(
+            config.get("atc3_overlap_mode", "event_quarter")
+        )
         self.roster_variant = ""
         self.personnel_definition = ""
         self.panel_level = ""
@@ -1044,7 +1133,10 @@ class CohortPlotter:
         control_variations: list[str],
         balanced_states: list[int],
     ) -> None:
-        unit_config = DISTRIBUTION_CONFIGS[unit_level]
+        unit_config = dict(DISTRIBUTION_CONFIGS[unit_level])
+        unit_config["figure_root"] = distribution_directory_name(
+            unit_config["figure_root"], self.atc3_overlap_mode
+        )
         id_cols = unit_config["id_cols"]
         start_year = int(self.config["plot_start_year"])
         end_year = int(self.config["plot_end_year"])
@@ -1072,7 +1164,10 @@ class CohortPlotter:
         req_folder = f"req{event_requirement}"
 
         for treat_type in treat_types:
-            cohort_root = self.variant_root / "cohort_data" / level_folder / treat_type / req_folder
+            cohort_root = (
+                self.variant_root / cohort_directory_name(self.atc3_overlap_mode)
+                / level_folder / treat_type / req_folder
+            )
             for control_type in control_types:
                 folder_name = CONTROL_FOLDER_MAP[control_type]
                 for balanced in balanced_states:
@@ -1230,5 +1325,13 @@ class CohortPlotter:
 
 
 if __name__ == "__main__":
-    CohortPanelMaker(RUN_CONFIG).run()
-    CohortPlotter(RUN_CONFIG).run()
+    parser = argparse.ArgumentParser(description="Build event cohorts with selectable ATC3 overlap.")
+    parser.add_argument(
+        "--atc3-overlap-mode", choices=ATC3_OVERLAP_MODES,
+        default=RUN_CONFIG["atc3_overlap_mode"],
+        help="Freeze event-quarter or full-window all/any overlap; quarterly checks every window quarter independently.",
+    )
+    args = parser.parse_args()
+    run_config = {**RUN_CONFIG, "atc3_overlap_mode": args.atc3_overlap_mode}
+    CohortPanelMaker(run_config).run()
+    CohortPlotter(run_config).run()

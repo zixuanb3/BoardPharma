@@ -31,8 +31,9 @@ cap mkdir "D:/Boardex_pharma/_repro_stata_tmp"
 //
 // Notes:
 //   - atc3_sharing is constructed by CohortPanelMaker from the complete
-//     SSR price sample and is already frozen at the event-product level across
-//     the event window. No ATC mapping merge is performed here.
+//     SSR price sample. event_quarter/window_all/window_any freeze the label; quarterly
+//     compares both portfolios independently in each quarter. No ATC merge is
+//     performed here. Select the same mode used to generate the cohort files.
 //   - Annual company size is the within-year quintile of total quantity sold
 //     across all products in SSR price sample.
 //   - Kappa controls are the movement-aligned prior-year or prior-four-quarter
@@ -55,7 +56,22 @@ local state_file "C:/Users/12150/Documents/GitHub/Grad-IO/outputs/ssr_states/ssr
 
 local roster_variants imputed_year imputed_yearquarter drop_sentinel_year drop_sentinel_yearquarter
 local personnel_definitions narrow medium broad
-args requested_roster_variant requested_personnel_definition requested_req requested_fe requested_target requested_window_event_control requested_treatment_group requested_event requested_control requested_kappa
+args requested_roster_variant requested_personnel_definition requested_req requested_fe requested_target requested_window_event_control requested_treatment_group requested_event requested_control requested_kappa requested_atc3_overlap_mode
+
+// The optional eleventh argument overrides the shared Python/Stata environment.
+local atc3_overlap_mode : environment BOARDPHARMA_ATC3_OVERLAP_MODE
+if `"`atc3_overlap_mode'"' == "" local atc3_overlap_mode event_quarter
+if `"`requested_atc3_overlap_mode'"' != "" local atc3_overlap_mode `requested_atc3_overlap_mode'
+if !inlist("`atc3_overlap_mode'", "event_quarter", "window_all", "window_any", "quarterly") {
+    di as error "ATC3 overlap mode must be event_quarter, window_all, window_any, or quarterly; rebuild old event_year cohorts"
+    exit 198
+}
+local cohort_data_folder cohort_data
+local overlap_suffix ""
+if "`atc3_overlap_mode'" != "event_quarter" {
+    local cohort_data_folder "cohort_data_atc3_`atc3_overlap_mode'"
+    local overlap_suffix "_atc3_`atc3_overlap_mode'"
+}
 
 // Optional fast path for unusually large cells that stall during post-estimation
 // sample-count diagnostics. Regression estimates are unchanged; only the
@@ -182,7 +198,7 @@ foreach roster_variant of local roster_variants {
                     local relation without
                     if `include_eventpair' == 1 local relation with
                     local panel_group_folder "quarter-level_`treatment_group'_`relation'_`counterpart'"
-                    local cohort_root "`variant_root'/cohort_data/`panel_group_folder'"
+                    local cohort_root "`variant_root'/`cohort_data_folder'/`panel_group_folder'"
 
                     foreach fe_level of local fe_levels {
                         local output_root "`project_path'/csv/ddd_atcsharing_req2_fe1_window_event_control/`roster_variant'/leader_tier_`personnel_definition'/fe`fe_level'/`atc'/`panel_group_folder'"
@@ -232,6 +248,7 @@ foreach roster_variant of local roster_variants {
                                     // Stata writes to the same stacked-price file.
                                     local cache_namespace : environment BOARDPHARMA_CACHE_NAMESPACE
                                     if `"`cache_namespace'"' == "" local cache_namespace "default"
+                                    local cache_namespace "`cache_namespace'_atc3v4treated_`atc3_overlap_mode'"
                                     local cache_root "`variant_root'/cache_`cache_namespace'"
                                     cap mkdir "`cache_root'"
                                     local cache_file "`cache_root'/`panel_group_folder'_`event'_req`req'_`control_name'_cohort_atc3_stacked.dta"
@@ -250,8 +267,8 @@ foreach roster_variant of local roster_variants {
                                         if "`control_kappa'" == "kappa_norm_p95" local kappa_var kappa_norm_p95_pre
                                         if "`control_kappa'" == "kappa_asy_p95" local kappa_var kappa_raw_p95_pre
                                         if "`control_kappa'" == "none" local kappa_var ""
-                                        local output_file "`output_root'/`event'_req`req'_`control_name'_`window_event_label'_`control_kappa'_`target'.csv"
-                                        local log_file "`log_root'/`event'_req`req'_`control_name'_`window_event_label'_`control_kappa'_`target'.log"
+                                        local output_file "`output_root'/`event'_req`req'_`control_name'_`window_event_label'_`control_kappa'_`target'`overlap_suffix'.csv"
+                                        local log_file "`log_root'/`event'_req`req'_`control_name'_`window_event_label'_`control_kappa'_`target'`overlap_suffix'.log"
                                         cap log close
                                         log using "`log_file'", text replace
 
@@ -260,7 +277,7 @@ foreach roster_variant of local roster_variants {
                                         // The raw cache can already exist when the
                                         // second Kappa specification reuses it. Keep
                                         // the cohort count defined in both branches.
-                                        local n_cohorts : word count `cohort_files'
+                                        local n_cohorts 0
                                         capture confirm file "`cache_file'"
                                         if _rc {
                                             tempfile master
@@ -323,6 +340,9 @@ foreach roster_variant of local roster_variants {
                                                 }
                                                 else gen double rel_period = year - event_period
                                                 keep if inrange(rel_period, -`window_pre', `window_post')
+                                                // Retain a stack only if treated outcome rows survive the window.
+                                                quietly count if treated_in_stack == 1
+                                                if r(N) == 0 continue
                                                 quietly count
                                                 if r(N) == 0 continue
 
@@ -359,8 +379,31 @@ foreach roster_variant of local roster_variants {
 
                                         use "`cache_file'", clear
 
+                                        // Verify fresh and cached labels. Historical default
+                                        // cohorts predate mode metadata and remain readable.
+                                        capture confirm variable atc3_overlap_mode
+                                        if _rc {
+                                            if "`atc3_overlap_mode'" != "event_quarter" {
+                                                di as error "Missing overlap-mode metadata; rebuild cohorts"
+                                                exit 459
+                                            }
+                                        }
+                                        else {
+                                            assert atc3_overlap_mode == "`atc3_overlap_mode'"
+                                        }
+
                                         // Apply the outcome-specific transformation after
                                         // loading the shared raw-price cache.
+                                        // Apply the same treated-positive rule to fresh and cached stacks.
+                                        // This precedes pooled winsorization and every estimation call.
+                                        tempvar cohort_has_treated cohort_tag
+                                        bysort data_cohort: egen byte `cohort_has_treated' = max(treated_in_stack)
+                                        drop if `cohort_has_treated' != 1
+                                        egen byte `cohort_tag' = tag(data_cohort)
+                                        quietly count if `cohort_tag' == 1
+                                        local n_cohorts = r(N)
+                                        assert `cohort_has_treated' == 1
+
                                         if "`outlier_treatment'" == "winsorize" {
                                             quietly summarize `target', detail
                                             replace `target' = r(`outlier_percentile') if `target' > r(`outlier_percentile') & !missing(`target')
