@@ -31,10 +31,10 @@ set trace off
 // ================================================================
 
 * ================= user config =================
-local atcs atc3 atc2
+local atcs atc3
 * atc3 atc2
 local large_sample 1
-local personnel_definition medium
+local personnel_definition narrow
 * narrow medium broad
 local separate_modes 0
 * 1
@@ -58,17 +58,17 @@ local events interlock_dissolution to_B_still_in_A to_B_not_in_A
 *direct_interlock indirect_interlock to_B_still_in_A to_B_not_in_A
 local controls not 
 * notyet purecontrol not
-local targets price
+local targets price0 price
 *revenue quantity price0 price
 local standardize_types log_transform
 * log_transform standardize normalize
 local event_types event
 * first_event
-local reqs 0 1 2
+local reqs 1
 * 0 1 2
 local control_for_other_events other_event
 * none other_event
-local control_kappas kappa_asy
+local control_kappas kappa_asy none
 * none kappa_asy kappa_norm
 local control_atcs separate
 * separate

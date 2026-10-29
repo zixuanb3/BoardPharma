@@ -76,11 +76,11 @@ CounterpartLookup = dict[tuple[str, int], set[str]]
 
 # ========================== USER CONFIG ==========================
 RUN_CONFIG = {
-    "quarter": 1,  # 0: existing annual workflow; 1: formulary quarters only.
+    "quarter": 0,  # 0: existing annual workflow; 1: formulary quarters only.
     "stay_x_years": 2,
     "requirement2_window": (-1, 1),  # Annual mode only.
     "large_sample": 1,  # Ignored when quarter=1.
-    "formulary": 1,
+    "formulary": 0,
     "personnel_definition": "narrow",
 }
 # ===============================================================
