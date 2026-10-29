@@ -16,7 +16,9 @@ Process:
    formulary histories and records the number of represented CPS units.
 3. Read quarterly formulary panels, attach outcomes and events, and compare raw
    tier with the immediately preceding calendar quarter.
-4. Apply req1/Not treated-control rules and stream directly into 15 cohort CSVs.
+4. Apply req1/Not treated-control rules and stream sampled histories into cohort
+   CSVs. With path_average=1, also accumulate all-history weighted sums from the
+   same expanded data and write one NDC-company-quarter row per cohort.
 
 Input:
 - D:/pharma/formulary/beneficiary_cost_with_copay.csv (quarterly mode)
@@ -38,6 +40,8 @@ Output:
   {event}_path_quarter_cohort_{year}.csv
 - data/formulary_path_cohort_data_quarter/event/req1/Not/{shift}/{level}/
   {event}_path_quarter_cohort_{year}Q{quarter}.csv
+- path_average=1 additionally writes the averaged schema under path_average/
+  within the corresponding path cohort directory and shared checkpoint.
 """
 
 from __future__ import annotations
@@ -124,15 +128,33 @@ COHORT_YEARS = (2020, 2021, 2022, 2023, 2024)
 #   so one expansion batch stays near max_expanded_rows_per_batch.
 # sample_fraction/random_seed:
 # - sample_fraction is the share of balanced plan units retained separately
-#   within each cohort year, before plan-drug expansion.
+#   within each cohort year, before plan-drug expansion.  These two settings
+#   apply only when path_weighted_mode=0.
 # - random_seed makes the cohort-specific samples reproducible.
+# path_sample_fraction/path_sample_seed:
+# - In path-weighted mode, sample distinct history_id paths separately within
+#   each event-by-cohort output before any rows are written.  Every quarter and
+#   NDC on a selected path is retained, and n_path/n_path_copay keep their full
+#   CPS counts for regression weighting.
+# - path_sample_seed makes these event-cohort path samples reproducible.
 # path_weighted_mode:
 # - 0 preserves the legacy sampled CPS-by-NDC pipeline exactly.
 # - 1 keeps every balanced CPS, collapses identical full formulary histories,
 #   and writes history-by-NDC panels with path counts as regression weights.
+# path_average:
+# - 0 preserves the path-weighted output and sampling behavior.
+# - 1 requires path_weighted_mode=1 and adds a full-history weighted-average
+#   output without replacing the sampled history-level path output. included
+#   uses every history; tier_raw and avg_copay_amt use only history-NDC pairs
+#   included in every required cohort quarter. tier_raw uses n_path and copay
+#   uses n_path_copay, whose zero weights naturally leave copay out of its mean.
+#   Averaged files omit history_id and path weights and are written under the
+#   path_average subdirectory.
 # prefer:
 # - 0 (default) does not read a prefer file and writes missing prefer values.
 # - 1 reads PREFER_PATH and builds outcome-specific n_path_prefer weights.
+# - The compact quarterly path output supports prefer=0; prefer=1 remains
+#   available only for the annual path schema.
 # Quarterly copay has no switch: it always comes from BENEFICIARY_COPAY_PATH.
 RUN_CONFIG = {
     "quarter": 1,
@@ -140,10 +162,13 @@ RUN_CONFIG = {
     "formulary_time_shift_quarters": 1,
     "sample_fraction": 0.01,
     "random_seed": 20250810,
+    "path_sample_fraction": 0.1,
+    "path_sample_seed": 20260818,
     "path_weighted_mode": 1,
+    "path_average": 1,
     "prefer": 0,
-    "chunksize": 1_000_000,
-    "max_expanded_rows_per_batch": 1_000_000,
+    "chunksize": 2_000_000,
+    "max_expanded_rows_per_batch": 2_000_000,
 }
 # ===============================================================
 
@@ -430,33 +455,66 @@ def append_path_build_log(log_path: Path, message: str) -> None:
 
 def write_path_checkpoint(
     checkpoint_path: Path,
-    completed_quarters: list[str],
+    path_completed_quarters: list[str],
+    average_completed_quarters: list[str],
     ordered_quarters: list[str],
     output_paths: dict[tuple[str, int], Path],
     output_rows: dict[tuple[str, int], int],
+    average_output_paths: dict[tuple[str, int], Path],
+    average_output_rows: dict[tuple[str, int], int],
     spec: AnalysisSpec,
     time_shift: int,
     quarter: int = 0,
     prefer_mode: int = 0,
+    path_sample_fraction: float = 1.0,
+    path_sample_seed: int = 0,
+    path_average: int = 0,
 ) -> None:
     """Atomically record the last fully committed quarter and output sizes."""
+    has_average = bool(average_output_paths)
     payload = {
-        "version": 2,
+        "version": 4 if has_average else 3,
         "level": spec.level,
         "time_shift": time_shift,
         "prefer": prefer_mode,
-        "schema": quarterly_path_panel_columns() if quarter else path_panel_columns(),
+        "path_sample_fraction": path_sample_fraction,
+        "path_sample_seed": path_sample_seed,
+        "schemas": path_output_schemas(
+            output_paths, average_output_paths, quarter
+        ),
         "ordered_quarters": ordered_quarters,
-        "completed_quarters": completed_quarters,
         "file_sizes": {
-            path.name: path.stat().st_size if path.exists() else 0
-            for path in output_paths.values()
+            label: path.stat().st_size if path.exists() else 0
+            for label, path in tracked_path_outputs(
+                output_paths, average_output_paths
+            ).items()
         },
-        "output_rows": {
-            output_paths[key].name: int(count)
-            for key, count in output_rows.items()
-        },
+        "output_rows": (
+            {
+                **{
+                    f"path/{output_paths[key].name}": int(count)
+                    for key, count in output_rows.items()
+                },
+                **{
+                    f"path_average/{average_output_paths[key].name}": int(count)
+                    for key, count in average_output_rows.items()
+                },
+            }
+            if has_average
+            else {
+                output_paths[key].name: int(count)
+                for key, count in output_rows.items()
+            }
+        ),
     }
+    if has_average:
+        payload.update(
+            path_average=path_average,
+            path_completed_quarters=path_completed_quarters,
+            average_completed_quarters=average_completed_quarters,
+        )
+    else:
+        payload["completed_quarters"] = path_completed_quarters
     temporary_path = checkpoint_path.with_suffix(".tmp")
     temporary_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True),
@@ -465,66 +523,206 @@ def write_path_checkpoint(
     temporary_path.replace(checkpoint_path)
 
 
-def initialize_path_outputs(
-    checkpoint_path: Path,
-    ordered_quarters: list[str],
-    output_paths: dict[tuple[str, int], Path],
-    spec: AnalysisSpec,
-    time_shift: int,
-    quarter: int = 0,
-    prefer_mode: int = 0,
-) -> tuple[list[str], dict[tuple[str, int], bool], dict[tuple[str, int], int]]:
-    """Start fresh or roll partial output back to the last completed quarter."""
-    if not checkpoint_path.exists():
-        for path in output_paths.values():
-            prepare_output_path(path)
-        return (
-            [],
-            {key: False for key in output_paths},
-            {key: 0 for key in output_paths},
-        )
-
-    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    expected = {
-        "version": 2,
-        "level": spec.level,
-        "time_shift": time_shift,
-        "prefer": prefer_mode,
-        "schema": quarterly_path_panel_columns() if quarter else path_panel_columns(),
-        "ordered_quarters": ordered_quarters,
-    }
-    mismatched = [
-        key for key, value in expected.items()
-        if checkpoint.get(key) != value
-    ]
-    if mismatched:
-        raise ValueError(
-            "Path checkpoint is incompatible with the current build: "
-            f"{mismatched}. Remove {checkpoint_path} only if a fresh rebuild is intended."
-        )
-
-    completed = [str(value) for value in checkpoint.get("completed_quarters", [])]
-    if completed != ordered_quarters[: len(completed)]:
-        raise ValueError("Path checkpoint completed quarters are not a chronological prefix.")
-
-    saved_sizes = checkpoint.get("file_sizes", {})
-    saved_rows = checkpoint.get("output_rows", {})
-    headers_written: dict[tuple[str, int], bool] = {}
-    output_rows: dict[tuple[str, int], int] = {}
-    for key, path in output_paths.items():
-        expected_size = int(saved_sizes.get(path.name, 0))
+def restore_checkpoint_outputs(
+    tracked_paths: dict[str, Path],
+    saved_sizes: dict[str, object],
+    saved_rows: dict[str, object],
+    validate_only: bool = False,
+) -> tuple[dict[str, bool], dict[str, int]]:
+    """Roll tracked files back to checkpoint sizes and restore row counters."""
+    headers: dict[str, bool] = {}
+    rows: dict[str, int] = {}
+    for label, path in tracked_paths.items():
+        if label not in saved_sizes or label not in saved_rows:
+            raise ValueError(f"Checkpoint is missing size or row count for {path}.")
+        expected_size = int(saved_sizes.get(label, 0))
         actual_size = path.stat().st_size if path.exists() else 0
         if actual_size < expected_size:
             raise ValueError(
                 f"Output {path} is smaller than its checkpoint size "
                 f"({actual_size:,} < {expected_size:,})."
             )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("r+b" if path.exists() else "wb") as output_file:
-            output_file.truncate(expected_size)
-        headers_written[key] = expected_size > 0
-        output_rows[key] = int(saved_rows.get(path.name, 0))
-    return completed, headers_written, output_rows
+        headers[label] = expected_size > 0
+        rows[label] = int(saved_rows.get(label, 0))
+    # Validate every file before rolling back any partially written output.
+    if not validate_only:
+        for label, path in tracked_paths.items():
+            expected_size = int(saved_sizes[label])
+            actual_size = path.stat().st_size if path.exists() else 0
+            if path.exists() and actual_size == expected_size:
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("r+b" if path.exists() else "wb") as output_file:
+                output_file.truncate(expected_size)
+    return headers, rows
+
+
+def validate_completed_quarters(
+    completed: list[str], ordered: list[str], label: str,
+) -> None:
+    """Require one output's committed quarters to be a chronological prefix."""
+    if completed != ordered[: len(completed)]:
+        raise ValueError(f"{label} completed quarters are not a chronological prefix.")
+
+
+def initialize_path_outputs(
+    checkpoint_path: Path,
+    ordered_quarters: list[str],
+    output_paths: dict[tuple[str, int], Path],
+    average_output_paths: dict[tuple[str, int], Path],
+    spec: AnalysisSpec,
+    time_shift: int,
+    quarter: int = 0,
+    prefer_mode: int = 0,
+    path_sample_fraction: float = 1.0,
+    path_sample_seed: int = 0,
+    path_average: int = 0,
+    validate_only: bool = False,
+) -> tuple[
+    list[str],
+    list[str],
+    dict[tuple[str, int], bool],
+    dict[tuple[str, int], int],
+    dict[tuple[str, int], bool],
+    dict[tuple[str, int], int],
+]:
+    """Start fresh or roll partial output back to the last completed quarter."""
+    if not checkpoint_path.exists():
+        if not validate_only:
+            for path in tracked_path_outputs(output_paths, average_output_paths).values():
+                prepare_output_path(path)
+        return (
+            [],
+            [],
+            {key: False for key in output_paths},
+            {key: 0 for key in output_paths},
+            {key: False for key in average_output_paths},
+            {key: 0 for key in average_output_paths},
+        )
+
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    migrate_legacy = bool(average_output_paths) and checkpoint.get("version") == 3
+    checkpoint_average_paths = {} if migrate_legacy else average_output_paths
+    expected = {
+        "version": 3 if migrate_legacy else (4 if average_output_paths else 3),
+        "level": spec.level,
+        "time_shift": time_shift,
+        "prefer": prefer_mode,
+        "path_sample_fraction": path_sample_fraction,
+        "path_sample_seed": path_sample_seed,
+        "schemas": path_output_schemas(
+            output_paths, checkpoint_average_paths, quarter
+        ),
+        "ordered_quarters": ordered_quarters,
+    }
+    if path_average and not migrate_legacy:
+        expected["path_average"] = path_average
+    mismatched = [
+        key for key, value in expected.items()
+        if key != "schemas" and checkpoint.get(key) != value
+    ]
+    saved_schemas = checkpoint.get("schemas", {})
+    expected_schemas = expected["schemas"]
+    # A v3 build may include cohorts with no treated firms in the current run.
+    # Keep their files intact; require every active output's columns to match.
+    schemas_match = isinstance(saved_schemas, dict) and (
+        all(saved_schemas.get(name) == columns for name, columns in expected_schemas.items())
+        if migrate_legacy
+        else saved_schemas == expected_schemas
+    )
+    if not schemas_match:
+        mismatched.append("schemas")
+    if mismatched:
+        raise ValueError(
+            "Path checkpoint is incompatible with the current build: "
+            f"{mismatched}. Remove {checkpoint_path} only if a fresh rebuild is intended."
+        )
+
+    for label, path in tracked_path_outputs(
+        output_paths, checkpoint_average_paths
+    ).items():
+        saved_size = int(checkpoint.get("file_sizes", {}).get(label, 0))
+        if saved_size > 0 and path.exists():
+            with path.open("r", encoding="utf-8-sig", newline="") as output_file:
+                header = output_file.readline().rstrip("\r\n").split(",")
+            if header != expected["schemas"][label]:
+                raise ValueError(f"Actual CSV header does not match checkpoint for {path}.")
+
+    saved_sizes = checkpoint.get("file_sizes", {})
+    saved_rows = checkpoint.get("output_rows", {})
+    if migrate_legacy:
+        path_completed = [
+            str(value) for value in checkpoint.get("completed_quarters", [])
+        ]
+        average_completed: list[str] = []
+        validate_completed_quarters(path_completed, ordered_quarters, "Path")
+        tracked_headers, tracked_rows = restore_checkpoint_outputs(
+            {path.name: path for path in output_paths.values()},
+            saved_sizes,
+            saved_rows,
+            validate_only,
+        )
+        if not validate_only:
+            for path in average_output_paths.values():
+                prepare_output_path(path)
+        path_prefix = ""
+    else:
+        if average_output_paths:
+            path_completed = [
+                str(value)
+                for value in checkpoint.get("path_completed_quarters", [])
+            ]
+            average_completed = [
+                str(value)
+                for value in checkpoint.get("average_completed_quarters", [])
+            ]
+        else:
+            path_completed = [
+                str(value) for value in checkpoint.get("completed_quarters", [])
+            ]
+            average_completed = []
+        validate_completed_quarters(path_completed, ordered_quarters, "Path")
+        validate_completed_quarters(average_completed, ordered_quarters, "Path-average")
+        tracked_headers, tracked_rows = restore_checkpoint_outputs(
+            tracked_path_outputs(output_paths, average_output_paths),
+            saved_sizes,
+            saved_rows,
+            validate_only,
+        )
+        path_prefix = "path/" if average_output_paths else ""
+
+    headers_written = {
+        key: tracked_headers[f"{path_prefix}{path.name}"]
+        for key, path in output_paths.items()
+    }
+    output_rows = {
+        key: tracked_rows[f"{path_prefix}{path.name}"]
+        for key, path in output_paths.items()
+    }
+    average_headers_written = {
+        key: (
+            False
+            if migrate_legacy
+            else tracked_headers[f"path_average/{path.name}"]
+        )
+        for key, path in average_output_paths.items()
+    }
+    average_output_rows = {
+        key: (
+            0
+            if migrate_legacy
+            else tracked_rows[f"path_average/{path.name}"]
+        )
+        for key, path in average_output_paths.items()
+    }
+    return (
+        path_completed,
+        average_completed,
+        headers_written,
+        output_rows,
+        average_headers_written,
+        average_output_rows,
+    )
 
 
 def analysis_spec(config: dict[str, object]) -> AnalysisSpec:
@@ -537,12 +735,15 @@ def analysis_spec(config: dict[str, object]) -> AnalysisSpec:
 
 def validate_config(
     config: dict[str, object],
-) -> tuple[AnalysisSpec, int, float, int, int, int, int, int, int]:
+) -> tuple[AnalysisSpec, int, float, int, float, int, int, int, int, int, int, int]:
     """Validate the small runtime configuration."""
     spec = analysis_spec(config)
     time_shift = int(str(config["formulary_time_shift_quarters"]))
     sample_fraction = float(str(config["sample_fraction"]))
     random_seed = int(str(config["random_seed"]))
+    path_average = int(str(config.get("path_average", 0)))
+    path_sample_fraction = float(str(config["path_sample_fraction"]))
+    path_sample_seed = int(str(config["path_sample_seed"]))
     path_weighted_mode = int(str(config["path_weighted_mode"]))
     chunksize = int(str(config["chunksize"]))
     max_expanded_rows = int(str(config["max_expanded_rows_per_batch"]))
@@ -556,14 +757,28 @@ def validate_config(
         )
     if prefer_mode not in {0, 1}:
         raise ValueError("prefer must be 0 or 1.")
+    if quarter and prefer_mode != 0:
+        raise ValueError(
+            "The compact quarterly path schema requires prefer=0."
+        )
     if time_shift not in {0, 1}:
         raise ValueError("formulary_time_shift_quarters must be 0 or 1.")
     if not 0 < sample_fraction <= 1:
         raise ValueError("sample_fraction must be greater than 0 and no greater than 1.")
     if random_seed < 0:
         raise ValueError("random_seed must be nonnegative.")
+    if not 0 < path_sample_fraction <= 1:
+        raise ValueError(
+            "path_sample_fraction must be greater than 0 and no greater than 1."
+        )
+    if path_sample_seed < 0:
+        raise ValueError("path_sample_seed must be nonnegative.")
     if path_weighted_mode not in {0, 1}:
         raise ValueError("path_weighted_mode must be 0 or 1.")
+    if path_average not in {0, 1}:
+        raise ValueError("path_average must be 0 or 1.")
+    if path_average and path_weighted_mode != 1:
+        raise ValueError("path_average=1 requires path_weighted_mode=1.")
     if chunksize < 1:
         raise ValueError("chunksize must be positive.")
     if max_expanded_rows < 1:
@@ -573,11 +788,14 @@ def validate_config(
         time_shift,
         sample_fraction,
         random_seed,
+        path_sample_fraction,
+        path_sample_seed,
         path_weighted_mode,
         chunksize,
         max_expanded_rows,
         quarter,
         prefer_mode,
+        path_average,
     )
 
 
@@ -1170,6 +1388,45 @@ def sample_plan_units(
     return sampled
 
 
+def sample_path_histories(
+    path_cohorts: dict[int, PathCohort],
+    samples: dict[tuple[str, int], CohortSample],
+    sample_fraction: float,
+    random_seed: int,
+) -> dict[tuple[str, int], frozenset[str]]:
+    """Sample complete paths reproducibly within each event-cohort output."""
+    sampled: dict[tuple[str, int], frozenset[str]] = {}
+    event_codes = {event_type: position for position, event_type in enumerate(EVENT_TYPES)}
+    for key in sorted(samples, key=lambda value: (value[1], value[0])):
+        event_type, cohort_year = key
+        path_cohort = path_cohorts[cohort_year]
+        history_ids = np.sort(
+            path_cohort.history_quarters["history_id"].dropna().unique()
+        )
+        history_count = len(history_ids)
+        if history_count == 0:
+            sampled[key] = frozenset()
+            continue
+        sample_count = min(
+            history_count,
+            max(1, int(np.ceil(history_count * sample_fraction))),
+        )
+        random_generator = np.random.default_rng(
+            np.random.SeedSequence(
+                [random_seed, event_codes[event_type], cohort_year]
+            )
+        )
+        positions = np.sort(
+            random_generator.choice(
+                history_count,
+                size=sample_count,
+                replace=False,
+            )
+        )
+        sampled[key] = frozenset(history_ids[positions].astype(str))
+    return sampled
+
+
 def build_path_cohorts(
     crosswalks: dict[str, pd.DataFrame],
     balanced_units: dict[int, pd.MultiIndex],
@@ -1564,17 +1821,35 @@ def build_formulary_tier_schedule(
     source_paths: dict[str, Path],
     path_cohorts: dict[int, PathCohort],
     chunksize: int,
-) -> pd.DataFrame:
-    """Read only active formulary tiers needed by the complete path cohorts."""
+    path_average: int = 0,
+) -> tuple[pd.DataFrame, dict[int, pd.DataFrame] | None]:
+    """Read active tiers and optionally find full-cohort included history-NDCs."""
     used_formularies: dict[str, set[str]] = {}
+    history_frames_by_quarter: dict[str, list[pd.DataFrame]] = {}
     for path_cohort in path_cohorts.values():
         for year_q, frame in path_cohort.history_quarters.groupby("year_q", sort=False):
             used_formularies.setdefault(str(year_q), set()).update(
                 frame["formulary_id"].dropna().astype(str)
             )
+            history_frames_by_quarter.setdefault(str(year_q), []).append(
+                frame[["history_id", "data_cohort", "formulary_id"]]
+            )
+
+    histories_by_quarter = {
+        year_q: pd.concat(frames, ignore_index=True)
+        for year_q, frames in history_frames_by_quarter.items()
+    }
 
     tier_frames: list[pd.DataFrame] = []
+    eligible: dict[int, pd.DataFrame | None] = {
+        cohort_year: None for cohort_year in path_cohorts
+    }
+    scanned_quarters: dict[int, list[str]] = {
+        cohort_year: [] for cohort_year in path_cohorts
+    }
     usecols = ["FORMULARY_ID", "tier_raw"]
+    if path_average:
+        usecols.extend(["NDC", "included"])
     source_progress = tqdm(
         sorted(source_paths.items(), key=lambda item: quarter_key(item[0])),
         desc="Reading formulary tier schedules",
@@ -1592,6 +1867,11 @@ def build_formulary_tier_schedule(
         }
         nonnumeric_formularies = formularies - {
             formulary_id for formulary_id in formularies if formulary_id.isdigit()
+        }
+        histories = histories_by_quarter[year_q]
+        included_parts: dict[int, list[pd.DataFrame]] = {
+            int(cohort_year): []
+            for cohort_year in histories["data_cohort"].unique()
         }
         reader = pd.read_csv(source_path, usecols=usecols, dtype="string", chunksize=chunksize)
         for chunk in tqdm(
@@ -1625,13 +1905,80 @@ def build_formulary_tier_schedule(
             current = current.loc[current["formulary_id"].isin(formularies)].copy()
             if current.empty:
                 continue
+            if path_average:
+                current["ndc"] = normalize_text(chunk.loc[current.index, "NDC"])
+                current["included"] = parse_numeric(
+                    chunk.loc[current.index, "included"],
+                    "included",
+                    source_path.name,
+                )
+                if current["ndc"].isna().any():
+                    examples = current.loc[current["ndc"].isna()].head(10)
+                    raise ValueError(
+                        f"{source_path.name} has missing NDC values. Examples:\n{examples}"
+                    )
+                if not current["included"].isin([0, 1]).all():
+                    raise ValueError(f"{source_path.name} has included values outside 0/1.")
+                current_included = current.loc[
+                    current["included"].eq(1), ["formulary_id", "ndc"]
+                ].drop_duplicates()
+                if not current_included.empty:
+                    included_histories = current_included.merge(
+                        histories,
+                        on="formulary_id",
+                        how="inner",
+                        validate="many_to_many",
+                    )
+                    for cohort_year, cohort_data in included_histories.groupby(
+                        "data_cohort", sort=False
+                    ):
+                        included_parts[int(cohort_year)].append(
+                            cohort_data[["history_id", "ndc"]].drop_duplicates()
+                        )
             current = add_tier_key(current, source_path.name)
             tier_frames.append(
                 current.loc[current["tier"].notna(), ["year_q", "formulary_id", "tier"]]
             )
+        if path_average:
+            for cohort_year, parts in included_parts.items():
+                current_eligible = (
+                    pd.concat(parts, ignore_index=True).drop_duplicates()
+                    if parts
+                    else pd.DataFrame(columns=["history_id", "ndc"])
+                )
+                previous_eligible = eligible[cohort_year]
+                eligible[cohort_year] = (
+                    current_eligible
+                    if previous_eligible is None
+                    else previous_eligible.merge(
+                        current_eligible,
+                        on=["history_id", "ndc"],
+                        how="inner",
+                        validate="one_to_one",
+                    )
+                )
+                scanned_quarters[cohort_year].append(year_q)
     if not tier_frames:
         raise ValueError("No active formulary tiers were found for the complete path cohorts.")
-    return pd.concat(tier_frames, ignore_index=True).drop_duplicates()
+    formulary_tiers = pd.concat(tier_frames, ignore_index=True).drop_duplicates()
+    if not path_average:
+        return formulary_tiers, None
+
+    eligible_histories: dict[int, pd.DataFrame] = {}
+    for cohort_year, path_cohort in path_cohorts.items():
+        if tuple(scanned_quarters[cohort_year]) != path_cohort.required_quarters:
+            raise ValueError(
+                f"Cohort {cohort_year} inclusion scan covered "
+                f"{scanned_quarters[cohort_year]}, expected "
+                f"{list(path_cohort.required_quarters)}."
+            )
+        cohort_eligible = eligible[cohort_year]
+        if cohort_eligible is None:
+            cohort_eligible = pd.DataFrame(columns=["history_id", "ndc"])
+        eligible_histories[cohort_year] = cohort_eligible.assign(
+            __path_average_eligible=True
+        )
+    return formulary_tiers, eligible_histories
 
 
 def build_benefit_path_features(
@@ -1895,8 +2242,20 @@ def path_panel_columns() -> list[str]:
     ]
 
 
-def quarterly_path_panel_columns() -> list[str]:
-    """Return the ID-based quarterly history-by-NDC output schema."""
+def quarterly_path_panel_columns(event_type: str) -> list[str]:
+    """Return the compact quarterly path schema used by the path do-files."""
+    if event_type not in EVENT_TYPES:
+        raise ValueError(f"Unsupported quarterly path event type: {event_type}")
+    other_event_columns = [
+        event_column(other_event, side)
+        for other_event in EVENT_TYPES
+        if other_event != event_type
+        for side in TREATMENT_GROUPS
+    ]
+    event_sharing_columns = [
+        f"{event_column(event_type, side)}_sharingATC3"
+        for side in TREATMENT_GROUPS
+    ]
     return [
         "history_id",
         "data_cohort_year",
@@ -1904,20 +2263,13 @@ def quarterly_path_panel_columns() -> list[str]:
         "data_cohort_qtime",
         "n_path",
         "n_path_copay",
-        "n_path_prefer",
-        "formulary_id",
         "ndc",
         "id",
-        "atc3",
         "included",
         "tier_raw",
-        "max_tier",
-        "tier_upgrade",
-        "tier_downgrade",
         "avg_copay_amt",
-        "prefer",
-        *EVENT_COLUMNS,
-        *SHARING_COLUMNS,
+        *other_event_columns,
+        *event_sharing_columns,
         "treated_a",
         "treated_b",
         "sample_a",
@@ -1925,6 +2277,144 @@ def quarterly_path_panel_columns() -> list[str]:
         "year",
         "quarter",
     ]
+
+
+def path_output_schemas(
+    output_paths: dict[tuple[str, int], Path],
+    average_output_paths: dict[tuple[str, int], Path],
+    quarter: int,
+) -> dict[str, list[str]]:
+    """Return the exact schema recorded for every path output file."""
+    normal = {
+        (f"path/{path.name}" if average_output_paths else path.name): (
+            quarterly_path_panel_columns(key[0])
+            if quarter
+            else path_panel_columns()
+        )
+        for key, path in output_paths.items()
+    }
+    if not average_output_paths:
+        return normal
+    return {
+        **normal,
+        **{
+            f"path_average/{path.name}": path_average_columns(key[0], quarter)
+            for key, path in average_output_paths.items()
+        },
+    }
+
+
+def tracked_path_outputs(
+    output_paths: dict[tuple[str, int], Path],
+    average_output_paths: dict[tuple[str, int], Path],
+) -> dict[str, Path]:
+    """Label normal and averaged files uniquely for checkpoint bookkeeping."""
+    if not average_output_paths:
+        return {path.name: path for path in output_paths.values()}
+    return {
+        **{
+            f"path/{path.name}": path
+            for path in output_paths.values()
+        },
+        **{
+            f"path_average/{path.name}": path
+            for path in average_output_paths.values()
+        },
+    }
+
+
+PATH_AVERAGE_WEIGHTS = {
+    "included": "n_path",
+    "tier_raw": "n_path",
+    "avg_copay_amt": "n_path_copay",
+}
+PATH_AVERAGE_INTENSIVE_OUTCOMES = {"tier_raw", "avg_copay_amt"}
+
+
+def path_average_columns(event_type: str, quarter: int) -> list[str]:
+    """Describe the NDC-company-quarter output after averaging complete paths."""
+    source = quarterly_path_panel_columns(event_type) if quarter else path_panel_columns()
+    retained = {
+        "data_cohort", "data_cohort_year", "data_cohort_quarter",
+        "data_cohort_qtime", "ndc", "id", "boardname", "year", "quarter",
+        "treated_a", "treated_b", "sample_a", "sample_b",
+        *PATH_AVERAGE_WEIGHTS,
+    }
+    return [column for column in source if column in retained or column.startswith("event_")]
+
+
+def reduce_path_average_totals(
+    data: pd.DataFrame, keys: list[str], constants: list[str],
+) -> pd.DataFrame:
+    """Sum sufficient statistics, rejecting inconsistent cohort/event/sample flags."""
+    grouped = data.groupby(keys, sort=False, dropna=False)
+    inconsistent = grouped[constants].nunique(dropna=False).gt(1)
+    if inconsistent.any().any():
+        examples = inconsistent.loc[inconsistent.any(axis=1)].head(5)
+        raise ValueError(f"Nonconstant fields across paths for NDC-company-quarter:\n{examples}")
+    totals = [column for column in data if column.startswith("__path_average_")]
+    return grouped[constants].first().join(grouped[totals].sum()).reset_index()
+
+
+def accumulate_path_average(
+    previous: pd.DataFrame | None,
+    data: pd.DataFrame,
+    columns: list[str],
+    quarter: int,
+) -> pd.DataFrame:
+    """Accumulate weighted sums across paths and CSV chunks without averaging means."""
+    keys = ["ndc", "id" if quarter else "boardname", "year", "quarter"]
+    constants = [
+        column for column in columns if column not in {*keys, *PATH_AVERAGE_WEIGHTS}
+    ]
+    values = data[[*keys, *constants]].copy()
+    for outcome, weight_column in PATH_AVERAGE_WEIGHTS.items():
+        weight = data[weight_column]
+        if weight.isna().any() or not np.isfinite(weight).all() or weight.lt(0).any():
+            raise ValueError(f"Invalid {weight_column} in path averaging.")
+        valid = data[outcome].notna() & weight.gt(0)
+        if outcome in PATH_AVERAGE_INTENSIVE_OUTCOMES:
+            eligible = data["__path_average_eligible"].eq(True)
+            unexpected_missing = eligible & weight.gt(0) & data[outcome].isna()
+            if unexpected_missing.any():
+                examples = data.loc[
+                    unexpected_missing,
+                    [
+                        "history_id",
+                        "data_cohort",
+                        "ndc",
+                        "year_q",
+                        outcome,
+                        weight_column,
+                    ],
+                ].head(10)
+                raise ValueError(
+                    f"Eligible path-average histories have missing {outcome}. "
+                    f"Examples:\n{examples}"
+                )
+            valid &= eligible
+        values[f"__path_average_{outcome}_numerator"] = (
+            data[outcome].where(valid, 0) * weight.where(valid, 0)
+        )
+        values[f"__path_average_{outcome}_denominator"] = weight.where(valid, 0)
+    current = reduce_path_average_totals(values, keys, constants)
+    if previous is None:
+        return current
+    return reduce_path_average_totals(
+        pd.concat([previous, current], ignore_index=True), keys, constants,
+    )
+
+
+def finish_path_average(totals: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Divide each outcome's weighted sum by its own nonmissing-value weight."""
+    result = totals.copy()
+    for outcome in PATH_AVERAGE_WEIGHTS:
+        denominator = result[f"__path_average_{outcome}_denominator"]
+        result[outcome] = (
+            result[f"__path_average_{outcome}_numerator"]
+            / denominator.where(denominator.gt(0))
+        )
+    return result[columns]
 
 
 def path_cohort_output_dir(spec: AnalysisSpec, time_shift: int, quarter: int = 0) -> Path:
@@ -2128,10 +2618,17 @@ def build_quarter_path_panel(
     benefit_values: pd.DataFrame,
     benefit_counts: pd.DataFrame,
     samples: dict[tuple[str, int], CohortSample],
+    sampled_histories: dict[tuple[str, int], frozenset[str]],
+    path_average_eligible: dict[int, pd.DataFrame] | None,
     output_paths: dict[tuple[str, int], Path],
     headers_written: dict[tuple[str, int], bool],
     output_rows: dict[tuple[str, int], int],
+    average_output_paths: dict[tuple[str, int], Path],
+    average_headers_written: dict[tuple[str, int], bool],
+    average_output_rows: dict[tuple[str, int], int],
     quarter: int = 0,
+    write_path_output: bool = True,
+    write_average_output: bool = False,
 ) -> tuple[int, pd.DataFrame]:
     """Write one raw formulary quarter directly at history-by-NDC level."""
     year_q = source_path.stem.removeprefix("formulary_panel_")
@@ -2159,6 +2656,7 @@ def build_quarter_path_panel(
     identity_lookup: pd.DataFrame | None = None
     expanded_rows = 0
     written_rows = 0
+    average_totals: dict[tuple[str, int], pd.DataFrame] = {}
     raw_columns = (
         QUARTER_RAW_FORMULARY_COLUMNS if quarter
         else ANNUAL_RAW_FORMULARY_COLUMNS
@@ -2220,22 +2718,64 @@ def build_quarter_path_panel(
         expanded_rows += len(expanded)
         for cohort_year in sorted(expanded["data_cohort"].unique()):
             cohort_data = expanded.loc[expanded["data_cohort"].eq(cohort_year)]
+            if write_average_output:
+                if path_average_eligible is None:
+                    raise ValueError("Path-average eligibility was not initialized.")
+                cohort_data = cohort_data.merge(
+                    path_average_eligible[int(cohort_year)],
+                    on=["history_id", "ndc"],
+                    how="left",
+                    validate="many_to_one",
+                )
+                cohort_data["__path_average_eligible"] = cohort_data[
+                    "__path_average_eligible"
+                ].fillna(False)
             for event_type in EVENT_TYPES:
                 key = (event_type, int(cohort_year))
                 if key not in output_paths:
                     continue
-                selected = add_sample_columns(cohort_data, samples[key], quarter)
+                selected_source = (
+                    cohort_data
+                    if write_average_output
+                    else cohort_data.loc[
+                        cohort_data["history_id"].isin(sampled_histories[key])
+                    ]
+                )
+                if selected_source.empty:
+                    continue
+                selected = add_sample_columns(selected_source, samples[key], quarter)
                 if selected.empty:
                     continue
-                selected[quarterly_path_panel_columns() if quarter else path_panel_columns()].to_csv(
+                if write_average_output:
+                    average_totals[key] = accumulate_path_average(
+                        average_totals.get(key), selected,
+                        path_average_columns(event_type, quarter), quarter,
+                    )
+                if not write_path_output:
+                    continue
+                sampled = (
+                    selected.loc[
+                        selected["history_id"].isin(sampled_histories[key])
+                    ]
+                    if write_average_output
+                    else selected
+                )
+                if sampled.empty:
+                    continue
+                output_columns = (
+                    quarterly_path_panel_columns(event_type)
+                    if quarter
+                    else path_panel_columns()
+                )
+                sampled[output_columns].to_csv(
                     output_paths[key],
                     mode="a",
                     index=False,
                     header=not headers_written[key],
                 )
                 headers_written[key] = True
-                output_rows[key] += len(selected)
-                written_rows += len(selected)
+                output_rows[key] += len(sampled)
+                written_rows += len(sampled)
         print(
             f"[path] {year_q} chunk {chunk_number}: "
             f"path_rows={expanded_rows:,}, written={written_rows:,}",
@@ -2255,6 +2795,17 @@ def build_quarter_path_panel(
                 f"{source_path.name} maps NDCs to multiple {identity_column} "
                 f"values. Examples:\n{examples}"
             )
+    for key, totals in average_totals.items():
+        averaged = finish_path_average(totals, path_average_columns(key[0], quarter))
+        averaged.to_csv(
+            average_output_paths[key],
+            mode="a",
+            index=False,
+            header=not average_headers_written[key],
+        )
+        average_headers_written[key] = True
+        average_output_rows[key] += len(averaged)
+        print(f"[path average] {year_q} {key}: wrote {len(averaged):,} rows", flush=True)
     lookup_keys = ["previous_formulary_id", "ndc"]
     current_lookup = pd.concat(tier_parts, ignore_index=True).drop_duplicates(
         lookup_keys,
@@ -2299,6 +2850,28 @@ def load_quarter_tier_lookup(source_path: Path, chunksize: int) -> pd.DataFrame:
     )
 
 
+def path_build_output_paths(
+    samples: dict[tuple[str, int], CohortSample],
+    spec: AnalysisSpec,
+    time_shift: int,
+    quarter: int,
+    path_average: int,
+) -> tuple[dict[tuple[str, int], Path], dict[tuple[str, int], Path]]:
+    """Resolve active event-cohort outputs for preflight and actual building."""
+    output_paths = {
+        key: path_cohort_output_path(spec, time_shift, *key, quarter)
+        for key, sample in samples.items()
+        if not quarter or sample.treated_a or sample.treated_b
+    }
+    if not output_paths:
+        raise ValueError("No active event cohorts have treated firms.")
+    average_paths = {
+        key: path.parent / "path_average" / path.name
+        for key, path in output_paths.items()
+    } if path_average else {}
+    return output_paths, average_paths
+
+
 def build_path_weighted_panels(
     spec: AnalysisSpec,
     time_shift: int,
@@ -2311,8 +2884,98 @@ def build_path_weighted_panels(
     samples: dict[tuple[str, int], CohortSample],
     quarter: int = 0,
     prefer_mode: int = 0,
+    path_sample_fraction: float = 1.0,
+    path_sample_seed: int = 0,
+    path_average: int = 0,
 ) -> None:
     """Build all event cohort panels from full CPS formulary paths."""
+    output_paths, average_output_paths = path_build_output_paths(
+        samples, spec, time_shift, quarter, path_average
+    )
+    ordered_quarters = sorted(source_paths, key=quarter_key)
+    output_dir = next(iter(output_paths.values())).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "_path_build_checkpoint.json"
+    build_log_path = output_dir / "_path_build.log"
+    checkpoint_existed = checkpoint_path.exists()
+    checkpoint_was_legacy = False
+    if checkpoint_existed and average_output_paths:
+        checkpoint_was_legacy = (
+            json.loads(checkpoint_path.read_text(encoding="utf-8")).get("version") == 3
+        )
+    (
+        path_completed_quarters,
+        average_completed_quarters,
+        headers_written,
+        output_rows,
+        average_headers_written,
+        average_output_rows,
+    ) = initialize_path_outputs(
+        checkpoint_path,
+        ordered_quarters,
+        output_paths,
+        average_output_paths,
+        spec,
+        time_shift,
+        quarter,
+        prefer_mode,
+        path_sample_fraction,
+        path_sample_seed,
+        path_average,
+    )
+    if not checkpoint_existed or checkpoint_was_legacy:
+        write_path_checkpoint(
+            checkpoint_path,
+            path_completed_quarters,
+            average_completed_quarters,
+            ordered_quarters,
+            output_paths,
+            output_rows,
+            average_output_paths,
+            average_output_rows,
+            spec,
+            time_shift,
+            quarter,
+            prefer_mode,
+            path_sample_fraction,
+            path_sample_seed,
+            path_average,
+        )
+        log_message = (
+            "MIGRATE completed v3 path output; start path-average output"
+            if checkpoint_was_legacy
+            else "START fresh path-weighted build"
+        )
+        append_path_build_log(build_log_path, log_message)
+
+    jointly_completed_count = (
+        min(len(path_completed_quarters), len(average_completed_quarters))
+        if average_output_paths
+        else len(path_completed_quarters)
+    )
+    jointly_completed = ordered_quarters[:jointly_completed_count]
+    if path_completed_quarters:
+        print(
+            f"[path] Completed {len(path_completed_quarters)}/"
+            f"{len(ordered_quarters)} sampled-path quarters.",
+            flush=True,
+        )
+    if average_output_paths:
+        print(
+            f"[path average] Completed {len(average_completed_quarters)}/"
+            f"{len(ordered_quarters)} averaged quarters.",
+            flush=True,
+        )
+    if len(jointly_completed) == len(ordered_quarters):
+        print("[path] All requested outputs are already complete.", flush=True)
+        return
+    if jointly_completed:
+        append_path_build_log(
+            build_log_path,
+            f"RESUME joint output after {jointly_completed[-1]} "
+            f"({len(jointly_completed)}/{len(ordered_quarters)} quarters)",
+        )
+
     print("[path] Building complete CPS formulary histories...", flush=True)
     path_cohorts = build_path_cohorts(
         crosswalks,
@@ -2323,16 +2986,46 @@ def build_path_weighted_panels(
     )
     for cohort_year, path_cohort in sorted(path_cohorts.items()):
         history_count = path_cohort.history_quarters["history_id"].nunique()
-        cps_count = int(path_cohort.history_quarters["n_path"].sum() / len(path_cohort.required_quarters))
+        cps_count = int(
+            path_cohort.history_quarters["n_path"].sum()
+            / len(path_cohort.required_quarters)
+        )
         print(
-            f"[path] Cohort {cohort_year}: {cps_count:,} balanced CPS in {history_count:,} histories.",
+            f"[path] Cohort {cohort_year}: {cps_count:,} balanced CPS "
+            f"in {history_count:,} histories.",
+            flush=True,
+        )
+    path_pending = len(path_completed_quarters) < len(ordered_quarters)
+    sampled_histories = (
+        sample_path_histories(
+            path_cohorts,
+            samples,
+            path_sample_fraction,
+            path_sample_seed,
+        )
+        if path_pending
+        else {}
+    )
+    if path_pending:
+        print(
+            f"[path] Sampled {path_sample_fraction:.1%} of distinct histories "
+            f"within each event-cohort (seed={path_sample_seed}).",
+            flush=True,
+        )
+    average_pending = bool(average_output_paths) and (
+        len(average_completed_quarters) < len(ordered_quarters)
+    )
+    if average_pending:
+        print(
+            "[path average] The additional averages use all complete histories.",
             flush=True,
         )
     print("[path] Identifying active formulary tiers for benefit completeness...", flush=True)
-    formulary_tiers = build_formulary_tier_schedule(
+    formulary_tiers, path_average_eligible = build_formulary_tier_schedule(
         source_paths,
         path_cohorts,
         chunksize,
+        int(average_pending),
     )
     print("[path] Computing outcome-specific valid CPS counts and path-level means...", flush=True)
     benefit_values, benefit_counts = build_benefit_path_features(
@@ -2342,65 +3035,16 @@ def build_path_weighted_panels(
         spec,
     )
     print(
-        f"[path] Outcome-specific benefit features ready for {len(benefit_counts):,} histories; "
-        "writing path-by-NDC cohort panels...",
+        f"[path] Outcome-specific benefit features ready for "
+        f"{len(benefit_counts):,} histories; writing pending outputs...",
         flush=True,
     )
-    output_paths = {
-        (event_type, cohort_year): path_cohort_output_path(
-            spec,
-            time_shift,
-            event_type,
-            cohort_year,
-            quarter,
-        )
-        for event_type, cohort_year in samples
-        if not quarter or samples[(event_type, cohort_year)].treated_a or samples[(event_type, cohort_year)].treated_b
-    }
-    ordered_quarters = sorted(source_paths, key=quarter_key)
-    output_dir = next(iter(output_paths.values())).parent
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / "_path_build_checkpoint.json"
-    build_log_path = output_dir / "_path_build.log"
-    completed_quarters, headers_written, output_rows = initialize_path_outputs(
-        checkpoint_path,
-        ordered_quarters,
-        output_paths,
-        spec,
-        time_shift,
-        quarter,
-        prefer_mode,
-    )
-    if not checkpoint_path.exists():
-        write_path_checkpoint(
-            checkpoint_path,
-            completed_quarters,
-            ordered_quarters,
-            output_paths,
-            output_rows,
-            spec,
-            time_shift,
-            quarter,
-            prefer_mode,
-        )
-        append_path_build_log(build_log_path, "START fresh path-weighted build")
-    if completed_quarters:
-        print(
-            f"[path] Resuming after {completed_quarters[-1]}: "
-            f"{len(completed_quarters)}/{len(ordered_quarters)} quarters committed.",
-            flush=True,
-        )
-        append_path_build_log(
-            build_log_path,
-            f"RESUME after {completed_quarters[-1]} "
-            f"({len(completed_quarters)}/{len(ordered_quarters)} quarters)",
-        )
 
     previous_lookup: pd.DataFrame | None = None
     previous_output_quarter: str | None = None
-    if completed_quarters and len(completed_quarters) < len(ordered_quarters):
-        previous_output_quarter = completed_quarters[-1]
-        next_quarter = ordered_quarters[len(completed_quarters)]
+    if jointly_completed and len(jointly_completed) < len(ordered_quarters):
+        previous_output_quarter = jointly_completed[-1]
+        next_quarter = ordered_quarters[len(jointly_completed)]
         if previous_output_quarter == previous_year_q(next_quarter):
             print(
                 f"[path] Rebuilding {previous_output_quarter} tier lookup for resume...",
@@ -2412,7 +3056,12 @@ def build_path_weighted_panels(
             )
 
     for quarter_position, year_q in enumerate(ordered_quarters, start=1):
-        if year_q in completed_quarters:
+        write_path_output = year_q not in path_completed_quarters
+        write_average_output = (
+            bool(average_output_paths)
+            and year_q not in average_completed_quarters
+        )
+        if not write_path_output and not write_average_output:
             continue
         print(
             f"[path] START quarter {quarter_position}/{len(ordered_quarters)}: {year_q}",
@@ -2433,10 +3082,17 @@ def build_path_weighted_panels(
                 benefit_values,
                 benefit_counts,
                 samples,
+                sampled_histories,
+                path_average_eligible,
                 output_paths,
                 headers_written,
                 output_rows,
+                average_output_paths,
+                average_headers_written,
+                average_output_rows,
                 quarter,
+                write_path_output,
+                write_average_output,
             )
         except BaseException:
             append_path_build_log(
@@ -2451,17 +3107,26 @@ def build_path_weighted_panels(
             raise
         previous_lookup = current_lookup
         previous_output_quarter = year_q
-        completed_quarters.append(year_q)
+        if write_path_output:
+            path_completed_quarters.append(year_q)
+        if write_average_output:
+            average_completed_quarters.append(year_q)
         write_path_checkpoint(
             checkpoint_path,
-            completed_quarters,
+            path_completed_quarters,
+            average_completed_quarters,
             ordered_quarters,
             output_paths,
             output_rows,
+            average_output_paths,
+            average_output_rows,
             spec,
             time_shift,
             quarter,
             prefer_mode,
+            path_sample_fraction,
+            path_sample_seed,
+            path_average,
         )
         print(
             f"[path] COMMITTED quarter {quarter_position}/{len(ordered_quarters)}: {year_q}",
@@ -2475,10 +3140,18 @@ def build_path_weighted_panels(
     empty = [key for key, wrote in headers_written.items() if not wrote]
     if empty:
         raise ValueError(f"No path-weighted cohort rows were written for: {empty}")
+    average_empty = [
+        key for key, wrote in average_headers_written.items() if not wrote
+    ]
+    if average_empty:
+        raise ValueError(f"No path-average cohort rows were written for: {average_empty}")
     append_path_build_log(build_log_path, "COMPLETE all path-weighted quarters")
     for path in sorted(output_paths.values()):
         size_gb = path.stat().st_size / (1024**3)
         print(f"Wrote path panel ({size_gb:.2f} GB): {path}")
+    for path in sorted(average_output_paths.values()):
+        size_gb = path.stat().st_size / (1024**3)
+        print(f"Wrote path-average panel ({size_gb:.2f} GB): {path}")
 
 
 # ========================== OUTPUT DISPATCH ==========================
@@ -2491,11 +3164,14 @@ def main() -> None:
         time_shift,
         sample_fraction,
         random_seed,
+        path_sample_fraction,
+        path_sample_seed,
         path_weighted_mode,
         chunksize,
         max_expanded_rows,
         quarter,
         prefer_mode,
+        path_average,
     ) = validate_config(RUN_CONFIG)
     if quarter and path_weighted_mode != 1:
         raise ValueError("Quarterly event cohorts require path_weighted_mode=1")
@@ -2521,6 +3197,31 @@ def main() -> None:
         }
     target_quarters = set(source_paths)
     source_quarters = {shift_year_q(year_q, -time_shift) for year_q in target_quarters}
+    samples = build_samples(cohort_windows, quarter, quarter_sources)
+
+    if path_weighted_mode == 1:
+        output_paths, average_paths = path_build_output_paths(
+            samples, spec, time_shift, quarter, path_average
+        )
+        checkpoint_path = (
+            next(iter(output_paths.values())).parent / "_path_build_checkpoint.json"
+        )
+        print("[path] Checking checkpoint and existing output headers...", flush=True)
+        initialize_path_outputs(
+            checkpoint_path,
+            sorted(source_paths, key=quarter_key),
+            output_paths,
+            average_paths,
+            spec,
+            time_shift,
+            quarter,
+            prefer_mode,
+            path_sample_fraction,
+            path_sample_seed,
+            path_average,
+            validate_only=True,
+        )
+        print("[path] Checkpoint validation passed.", flush=True)
 
     if path_weighted_mode == 1:
         print("[path] Loading complete CPS-quarter-formulary crosswalk...", flush=True)
@@ -2561,7 +3262,6 @@ def main() -> None:
         spec,
         formulary_availability=formulary_availability,
     )
-    samples = build_samples(cohort_windows, quarter, quarter_sources)
     prefer = load_prefer_lookup(time_shift) if prefer_mode else None
     plan_tier = combine_plan_tier_features(copay, prefer)
     if path_weighted_mode == 1:
@@ -2577,6 +3277,9 @@ def main() -> None:
             samples,
             quarter,
             prefer_mode,
+            path_sample_fraction,
+            path_sample_seed,
+            path_average,
         )
         return
 

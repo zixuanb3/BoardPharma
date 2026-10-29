@@ -76,9 +76,9 @@ INTERLOCK_REQUIRED_COLUMNS = {
 
 
 RUN_CONFIG = {
-    "quarter": 0,  # 0: annual; 1: formulary quarters only.
+    "quarter": 1,  # 0: annual; 1: formulary quarters only.
     "large_sample": 1,  # Ignored when quarter=1.
-    "formulary": 0,
+    "formulary": 1,
     "personnel_definition": "narrow",
 }
 

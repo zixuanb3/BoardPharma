@@ -49,8 +49,8 @@ local outlier_treatment "winsorize"
 local outlier_treatment_percentile "p95"
 local events interlock_dissolution to_B_still_in_A to_B_not_in_A
 local controls not
-local targets price1
-*price0
+local targets price0 quantity revenue
+*price1
 local standardize_types log_transform
 local event_types event
 local reqs 2
@@ -63,9 +63,8 @@ local fe_levels 1
 local cluster_levels firm
 
 * The current upstream cohort inputs already contain the narrow sample.
-local roster_variants imputed_yearquarter
-* drop_sentinel_yearquarter
-
+local roster_mode dropp
+* imputed
 * Four upstream parameters: 2 x 2 x 2 x 2 = 16 settings per roster.
 local late_values 3
 * 0
@@ -286,69 +285,69 @@ local coh_d_l0_ro_so_ho_B_diss ""
 local coh_d_l0_ro_so_ho_B_not ""
 local coh_d_l0_ro_so_ho_B_still ""
 
-* drop_sentinel_yearquarter | late=3 | req1=new | stay=new | share_time=new
-local coh_d_l3_rn_sn_hn_A_diss ""
-local coh_d_l3_rn_sn_hn_A_not ""
-local coh_d_l3_rn_sn_hn_A_still ""
-local coh_d_l3_rn_sn_hn_B_diss ""
-local coh_d_l3_rn_sn_hn_B_not ""
-local coh_d_l3_rn_sn_hn_B_still ""
+* drop | late=3 | req1=new | stay=new | share_time=new
+local coh_d_l3_rn_sn_hn_A_diss "2009q1 2009q2 2009q3 2010q1 2010q2 2010q3 2010q4 2011q1 2011q2 2011q3 2011q4 2012q1 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_rn_sn_hn_A_not "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2011q3 2012q2 2012q3 2013q3 2014q3 2014q4 2015q2 2015q3 2016q1 2016q3 2016q4 2017q2"
+local coh_d_l3_rn_sn_hn_A_still "2009q1 2009q2 2010q1 2010q3 2011q1 2011q4 2012q1 2012q2 2012q3 2013q1 2014q1 2014q2 2015q1 2016q1 2016q3 2017q1 2018q1"
+local coh_d_l3_rn_sn_hn_B_diss "2009q1 2009q2 2009q3 2009q4 2010q1 2010q2 2010q4 2011q1 2011q2 2012q1 2012q2 2012q3 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2015q4 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_rn_sn_hn_B_not "2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
+local coh_d_l3_rn_sn_hn_B_still "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
 
-* drop_sentinel_yearquarter | late=3 | req1=new | stay=new | share_time=origin
-local coh_d_l3_rn_sn_ho_A_diss ""
-local coh_d_l3_rn_sn_ho_A_not ""
-local coh_d_l3_rn_sn_ho_A_still ""
-local coh_d_l3_rn_sn_ho_B_diss ""
-local coh_d_l3_rn_sn_ho_B_not ""
-local coh_d_l3_rn_sn_ho_B_still ""
+* drop | late=3 | req1=new | stay=new | share_time=origin
+local coh_d_l3_rn_sn_ho_A_diss "2009q1 2009q2 2009q3 2010q1 2010q2 2010q3 2010q4 2011q1 2011q2 2011q3 2011q4 2012q1 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_rn_sn_ho_A_not "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2011q3 2012q2 2012q3 2013q3 2014q3 2014q4 2015q2 2015q3 2016q1 2016q3 2016q4 2017q2"
+local coh_d_l3_rn_sn_ho_A_still "2009q1 2009q2 2010q1 2010q3 2011q1 2011q4 2012q1 2012q2 2012q3 2013q1 2014q1 2014q2 2015q1 2016q1 2016q3 2017q1 2018q1"
+local coh_d_l3_rn_sn_ho_B_diss "2009q1 2009q2 2009q3 2009q4 2010q1 2010q2 2010q4 2011q1 2011q2 2012q1 2012q2 2012q3 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2015q4 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_rn_sn_ho_B_not "2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
+local coh_d_l3_rn_sn_ho_B_still "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
 
-* drop_sentinel_yearquarter | late=3 | req1=new | stay=origin | share_time=new
-local coh_d_l3_rn_so_hn_A_diss ""
-local coh_d_l3_rn_so_hn_A_not ""
-local coh_d_l3_rn_so_hn_A_still ""
-local coh_d_l3_rn_so_hn_B_diss ""
-local coh_d_l3_rn_so_hn_B_not ""
-local coh_d_l3_rn_so_hn_B_still ""
+* drop | late=3 | req1=new | stay=origin | share_time=new
+local coh_d_l3_rn_so_hn_A_diss "2009q1 2009q2 2009q3 2010q1 2010q3 2010q4 2011q1 2011q2 2011q3 2011q4 2012q1 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_rn_so_hn_A_not "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2011q3 2012q2 2012q3 2013q3 2014q3 2014q4 2015q2 2015q3 2016q1 2016q3 2016q4 2017q2"
+local coh_d_l3_rn_so_hn_A_still "2009q1 2009q2 2010q1 2010q3 2011q1 2011q4 2012q1 2012q2 2012q3 2013q1 2014q1 2014q2 2015q1 2016q1 2016q3 2017q1 2018q1"
+local coh_d_l3_rn_so_hn_B_diss "2009q1 2009q2 2009q3 2009q4 2010q1 2010q4 2011q1 2011q2 2012q1 2012q2 2012q3 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2015q4 2016q1 2016q3 2016q4 2017q1 2017q3 2017q4 2018q1"
+local coh_d_l3_rn_so_hn_B_not "2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
+local coh_d_l3_rn_so_hn_B_still "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
 
-* drop_sentinel_yearquarter | late=3 | req1=new | stay=origin | share_time=origin
-local coh_d_l3_rn_so_ho_A_diss ""
-local coh_d_l3_rn_so_ho_A_not ""
-local coh_d_l3_rn_so_ho_A_still ""
-local coh_d_l3_rn_so_ho_B_diss ""
-local coh_d_l3_rn_so_ho_B_not ""
-local coh_d_l3_rn_so_ho_B_still ""
+* drop | late=3 | req1=new | stay=origin | share_time=origin
+local coh_d_l3_rn_so_ho_A_diss "2009q1 2009q2 2009q3 2010q1 2010q3 2010q4 2011q1 2011q2 2011q3 2011q4 2012q1 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_rn_so_ho_A_not "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2011q3 2012q2 2012q3 2013q3 2014q3 2014q4 2015q2 2015q3 2016q1 2016q3 2016q4 2017q2"
+local coh_d_l3_rn_so_ho_A_still "2009q1 2009q2 2010q1 2010q3 2011q1 2011q4 2012q1 2012q2 2012q3 2013q1 2014q1 2014q2 2015q1 2016q1 2016q3 2017q1 2018q1"
+local coh_d_l3_rn_so_ho_B_diss "2009q1 2009q2 2009q3 2009q4 2010q1 2010q4 2011q1 2011q2 2012q1 2012q2 2012q3 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2015q4 2016q1 2016q3 2016q4 2017q1 2017q3 2017q4 2018q1"
+local coh_d_l3_rn_so_ho_B_not "2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
+local coh_d_l3_rn_so_ho_B_still "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
 
-* drop_sentinel_yearquarter | late=3 | req1=origin | stay=new | share_time=new
-local coh_d_l3_ro_sn_hn_A_diss ""
-local coh_d_l3_ro_sn_hn_A_not ""
-local coh_d_l3_ro_sn_hn_A_still ""
-local coh_d_l3_ro_sn_hn_B_diss ""
-local coh_d_l3_ro_sn_hn_B_not ""
-local coh_d_l3_ro_sn_hn_B_still ""
+* drop | late=3 | req1=origin | stay=new | share_time=new
+local coh_d_l3_ro_sn_hn_A_diss "2009q1 2009q2 2009q3 2010q1 2010q2 2010q3 2010q4 2011q1 2011q2 2011q3 2011q4 2012q1 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_ro_sn_hn_A_not "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2011q3 2012q2 2012q3 2013q3 2014q3 2014q4 2015q2 2015q3 2016q1 2016q3 2016q4 2017q2"
+local coh_d_l3_ro_sn_hn_A_still "2009q1 2009q2 2010q1 2010q3 2011q1 2011q4 2012q1 2012q2 2012q3 2013q1 2014q1 2014q2 2015q1 2016q1 2016q3 2017q1 2018q1"
+local coh_d_l3_ro_sn_hn_B_diss "2009q1 2009q2 2009q3 2009q4 2010q1 2010q2 2010q4 2011q1 2011q2 2012q1 2012q2 2012q3 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2015q4 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_ro_sn_hn_B_not "2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
+local coh_d_l3_ro_sn_hn_B_still "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
 
-* drop_sentinel_yearquarter | late=3 | req1=origin | stay=new | share_time=origin
-local coh_d_l3_ro_sn_ho_A_diss ""
-local coh_d_l3_ro_sn_ho_A_not ""
-local coh_d_l3_ro_sn_ho_A_still ""
-local coh_d_l3_ro_sn_ho_B_diss ""
-local coh_d_l3_ro_sn_ho_B_not ""
-local coh_d_l3_ro_sn_ho_B_still ""
+* drop | late=3 | req1=origin | stay=new | share_time=origin
+local coh_d_l3_ro_sn_ho_A_diss "2009q1 2009q2 2009q3 2010q1 2010q2 2010q3 2010q4 2011q1 2011q2 2011q3 2011q4 2012q1 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_ro_sn_ho_A_not "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2011q3 2012q2 2012q3 2013q3 2014q3 2014q4 2015q2 2015q3 2016q1 2016q3 2016q4 2017q2"
+local coh_d_l3_ro_sn_ho_A_still "2009q1 2009q2 2010q1 2010q3 2011q1 2011q4 2012q1 2012q2 2012q3 2013q1 2014q1 2014q2 2015q1 2016q1 2016q3 2017q1 2018q1"
+local coh_d_l3_ro_sn_ho_B_diss "2009q1 2009q2 2009q3 2009q4 2010q1 2010q2 2010q4 2011q1 2011q2 2012q1 2012q2 2012q3 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2015q4 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_ro_sn_ho_B_not "2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
+local coh_d_l3_ro_sn_ho_B_still "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
 
-* drop_sentinel_yearquarter | late=3 | req1=origin | stay=origin | share_time=new
-local coh_d_l3_ro_so_hn_A_diss ""
-local coh_d_l3_ro_so_hn_A_not ""
-local coh_d_l3_ro_so_hn_A_still ""
-local coh_d_l3_ro_so_hn_B_diss ""
-local coh_d_l3_ro_so_hn_B_not ""
-local coh_d_l3_ro_so_hn_B_still ""
+* drop | late=3 | req1=origin | stay=origin | share_time=new
+local coh_d_l3_ro_so_hn_A_diss "2009q1 2009q2 2009q3 2010q1 2010q3 2010q4 2011q1 2011q2 2011q3 2011q4 2012q1 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_ro_so_hn_A_not "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2011q3 2012q2 2012q3 2013q3 2014q3 2014q4 2015q2 2015q3 2016q1 2016q3 2016q4 2017q2"
+local coh_d_l3_ro_so_hn_A_still "2009q1 2009q2 2010q1 2010q3 2011q1 2011q4 2012q1 2012q2 2012q3 2013q1 2014q1 2014q2 2015q1 2016q1 2016q3 2017q1 2018q1"
+local coh_d_l3_ro_so_hn_B_diss "2009q1 2009q2 2009q3 2009q4 2010q1 2010q4 2011q1 2011q2 2012q1 2012q2 2012q3 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2015q4 2016q1 2016q3 2016q4 2017q1 2017q3 2017q4 2018q1"
+local coh_d_l3_ro_so_hn_B_not "2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
+local coh_d_l3_ro_so_hn_B_still "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
 
-* drop_sentinel_yearquarter | late=3 | req1=origin | stay=origin | share_time=origin
-local coh_d_l3_ro_so_ho_A_diss ""
-local coh_d_l3_ro_so_ho_A_not ""
-local coh_d_l3_ro_so_ho_A_still ""
-local coh_d_l3_ro_so_ho_B_diss ""
-local coh_d_l3_ro_so_ho_B_not ""
-local coh_d_l3_ro_so_ho_B_still ""
+* drop | late=3 | req1=origin | stay=origin | share_time=origin
+local coh_d_l3_ro_so_ho_A_diss "2009q1 2009q2 2009q3 2010q1 2010q3 2010q4 2011q1 2011q2 2011q3 2011q4 2012q1 2012q4 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2016q1 2016q2 2016q3 2016q4 2017q1 2017q2 2017q3 2017q4 2018q1"
+local coh_d_l3_ro_so_ho_A_not "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2011q3 2012q2 2012q3 2013q3 2014q3 2014q4 2015q2 2015q3 2016q1 2016q3 2016q4 2017q2"
+local coh_d_l3_ro_so_ho_A_still "2009q1 2009q2 2010q1 2010q3 2011q1 2011q4 2012q1 2012q2 2012q3 2013q1 2014q1 2014q2 2015q1 2016q1 2016q3 2017q1 2018q1"
+local coh_d_l3_ro_so_ho_B_diss "2009q1 2009q2 2009q3 2009q4 2010q1 2010q4 2011q1 2011q2 2012q1 2012q2 2012q3 2013q1 2013q3 2013q4 2014q1 2014q2 2014q3 2014q4 2015q2 2015q3 2015q4 2016q1 2016q3 2016q4 2017q1 2017q3 2017q4 2018q1"
+local coh_d_l3_ro_so_ho_B_not "2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
+local coh_d_l3_ro_so_ho_B_still "2009q1 2009q2 2009q3 2010q1 2010q4 2011q1 2012q1 2013q1 2014q1 2015q1 2016q1 2017q1 2018q1"
 
 
 * ================= paths =================
@@ -382,9 +381,13 @@ cap mkdir "`project_path'/logs/ssrquarter"
 local movement_output_suffix "_lsn"
 
 * ================= input specification loops =================
-foreach roster_variant of local roster_variants {
+foreach roster_mode_value of local roster_mode {
+    local roster_variant "imputed_yearquarter"
     local variant_code i
-    if "`roster_variant'" == "drop_sentinel_yearquarter" local variant_code d
+    if "`roster_mode_value'" == "dropp" {
+        local roster_variant "drop_sentinel_yearquarter"
+        local variant_code d
+    }
     foreach late of local late_values {
         foreach req1_spec of local req1_specs {
             local req1_code = substr("`req1_spec'", 1, 1)
@@ -580,6 +583,15 @@ foreach treatment_group of local treatment_groups {
                                 local atc_tag "_atc`control_atc'"
                                 local file_stub "`event_type'_`control_fname'_`std_tag'_`mode_file_tag'`control_var_tag'`kappa_tag'`atc_tag'"
 
+                                * Resume safely: keep completed CSV/figure pairs unchanged.
+                                capture confirm file "`event_csv_path'/`file_stub'.csv"
+                                local completed_csv = (_rc == 0)
+                                capture confirm file "`event_fig_path'/`file_stub'.png"
+                                local completed_figure = (_rc == 0)
+                                if `completed_csv' & `completed_figure' {
+                                    continue
+                                }
+
                                 cap log close
                                 log using "`event_log_path'/`file_stub'.log", text replace
 
@@ -592,7 +604,8 @@ foreach treatment_group of local treatment_groups {
                                         di as error "Invalid manual cohort token: `cohort'. Use YYYYqQ."
                                         exit 198
                                     }
-                                    import delimited "`data_file'", clear
+                                    import delimited "`data_file'", clear favorstrfixed
+                                    replace boardname = upper(strtrim(boardname))
                                     confirm variable atc3_sharing
                                     gen byte atc_sharing = atc3_sharing
 
@@ -638,8 +651,9 @@ foreach treatment_group of local treatment_groups {
 
                                 if "`control_kappa'" != "none" {
                                     preserve
-                                    import delimited "`kappa_file'", clear
+                                    import delimited "`kappa_file'", clear favorstrfixed
                                     rename firm boardname
+                                    replace boardname = upper(strtrim(boardname))
                                     keep year quarter boardname kappa_norm_mean kappa_mean
                                     isid year quarter boardname
                                     tempfile kappa_controls

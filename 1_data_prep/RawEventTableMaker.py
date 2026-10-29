@@ -27,7 +27,11 @@ Input:
 - InterimData/boardex_pharma.dta when quarter=0 and large_sample=0
 - InterimData/ssr_company_roster.csv when quarter=0, large_sample=1, formulary=0
 - InterimData/formulary_company_roster.csv when quarter=0 and formulary=1
-- data/formulary_roster/formulary_roster_2019_2025.csv when quarter=1 and formulary=1
+- data/formulary_roster/formulary_roster_2018_2026.csv when quarter=1 and formulary=1
+- C:\\Users\\LENOVO\\Desktop\\BoardPharma\\data\\formulary_roster\\formulary_company_roster_imputed_yearquarter.csv
+  when quarter=1, formulary=1, and formulary_roster_type="imputed"
+- C:\\Users\\LENOVO\\Desktop\\BoardPharma\\data\\formulary_roster\\formulary_company_roster_drop_sentinel_yearquarter.csv
+  when quarter=1, formulary=1, and formulary_roster_type="drop"
 - InterimData/boardex_ssr_price_sample.csv (disabled independent interlock job)
 - InterimData/boardex_interlock_indirect_firmpair.dta (disabled independent interlock job)
 - InterimData/boardex_interlock_direct_firmpair.dta (disabled independent interlock job)
@@ -64,6 +68,14 @@ FORMULARY_ROSTER_PATH = INTERIM_DATA_PATH / "formulary_company_roster.csv"
 FORMULARY_QUARTER_ROSTER_PATH = (
     PROJECT_ROOT / "data" / "formulary_roster" / "formulary_roster_2018_2026.csv"
 )
+FORMULARY_QUARTER_IMPUTED_ROSTER_PATH = Path(
+    r"C:\Users\LENOVO\Desktop\BoardPharma\data\formulary_roster"
+    r"\formulary_company_roster_imputed_yearquarter.csv"
+)
+FORMULARY_QUARTER_DROP_ROSTER_PATH = Path(
+    r"C:\Users\LENOVO\Desktop\BoardPharma\data\formulary_roster"
+    r"\formulary_company_roster_drop_sentinel_yearquarter.csv"
+)
 SSR_SAMPLE_PATH = INTERIM_DATA_PATH / "boardex_ssr_price_sample.csv"
 INDIRECT_INPUT_PATH = INTERIM_DATA_PATH / "boardex_interlock_indirect_firmpair.dta"
 DIRECT_INPUT_PATH = INTERIM_DATA_PATH / "boardex_interlock_direct_firmpair.dta"
@@ -76,11 +88,12 @@ CounterpartLookup = dict[tuple[str, int], set[str]]
 
 # ========================== USER CONFIG ==========================
 RUN_CONFIG = {
-    "quarter": 0,  # 0: existing annual workflow; 1: formulary quarters only.
+    "quarter": 1,  # 0: existing annual workflow; 1: formulary quarters only.
     "stay_x_years": 2,
     "requirement2_window": (-1, 1),  # Annual mode only.
     "large_sample": 1,  # Ignored when quarter=1.
-    "formulary": 0,
+    "formulary": 1,
+    "formulary_roster_type": "drop",  # Effective only when quarter=1 and formulary=1.
     "personnel_definition": "narrow",
 }
 # ===============================================================
@@ -629,6 +642,7 @@ def main() -> None:
     # Build and save movement-side raw tables first.
     large_sample = 0 if quarter else int(RUN_CONFIG["large_sample"])
     formulary = int(RUN_CONFIG["formulary"])
+    formulary_roster_type = str(RUN_CONFIG["formulary_roster_type"])
     personnel_definition = str(RUN_CONFIG["personnel_definition"])
     if formulary not in {0, 1}:
         raise ValueError("formulary must be 0 or 1")
@@ -638,7 +652,16 @@ def main() -> None:
         raise ValueError("formulary requires large_sample == 1")
 
     if quarter:
-        movement_input_path = FORMULARY_QUARTER_ROSTER_PATH
+        quarter_roster_paths = {
+            "origin": FORMULARY_QUARTER_ROSTER_PATH,
+            "imputed": FORMULARY_QUARTER_IMPUTED_ROSTER_PATH,
+            "drop": FORMULARY_QUARTER_DROP_ROSTER_PATH,
+        }
+        if formulary_roster_type not in quarter_roster_paths:
+            raise ValueError(
+                "formulary_roster_type must be one of: origin, imputed, drop"
+            )
+        movement_input_path = quarter_roster_paths[formulary_roster_type]
         movement_output_suffix = "_formulary_quarter_narrow"
     elif formulary == 1:
         movement_input_path = FORMULARY_ROSTER_PATH
