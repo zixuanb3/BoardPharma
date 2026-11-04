@@ -54,11 +54,11 @@ cap mkdir "`project_path'/csv"
 cap mkdir "`project_path'/logs"
 local failure_log_path "`project_path'/logs/did_imputation_event_study_failure.log"
 
-local events interlock_dissolution to_B_still_in_A to_B_not_in_A
+local events interlock_dissolution to_B_not_in_A to_B_still_in_A
 *direct_interlock indirect_interlock to_B_still_in_A to_B_not_in_A
 local controls not 
 * notyet purecontrol not
-local targets price0 price
+local targets price0 revenue quantity
 *revenue quantity price0 price
 local standardize_types log_transform
 * log_transform standardize normalize
@@ -452,6 +452,7 @@ foreach treatment_group of local treatment_groups {
                                     local data_file "`data_path'/`event_type'/req`req'/`control_folder'/`event'_quarter_cohort_`cohort'`suffix'_balanced`movement_suffix'_`atc'.csv"
 
                                     import delimited "`data_file'", clear
+                                    replace boardname = upper(strtrim(boardname))
                                     
                                     local event_anchor_q = yq(`cohort', 1)
                                     gen rel_quarter_all = yq(year, quarter) - `event_anchor_q'
@@ -509,6 +510,7 @@ foreach treatment_group of local treatment_groups {
                                 preserve
                                 import delimited "`project_path'/data/kappa/ssr_kappa_firm_level_v5.csv", clear
                                 rename firm boardname
+                                replace boardname = upper(strtrim(boardname))
                                 keep year quarter boardname kappa_norm_mean kappa_mean
                                 isid year quarter boardname
                                 tempfile kappa_controls

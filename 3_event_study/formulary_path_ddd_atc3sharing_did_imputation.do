@@ -40,13 +40,9 @@ set trace off
 local events to_B_still_in_A to_B_not_in_A interlock_dissolution
 local treatment_groups B A
 local targets included tier_raw avg_copay_amt
-* tier_upgrade tier_downgrade
 * The quarterly path panel stores copay as avg_copay_amt. tierA is not emitted
-* by PlanPanelMaker's quarterly path schema, and prefer is disabled in this run.
-* Uniformly sample this fraction of distinct history_id paths inside each cohort.
-* Sampling is independent of n_path; 1 keeps every path and 0 keeps none.
-local path_sample_fraction 0.1
-local path_sample_seed 20260818
+* by PlanPanelMaker's compact quarterly path schema. Distinct history_id paths
+* are sampled upstream with path_sample_fraction/path_sample_seed.
 * 1 uses event-quarter cohorts; 0 retains the event-year cohort design.
 local quarter_event 1
 local outlier_treatment winsorize
@@ -64,6 +60,13 @@ local atc atc3
 local fe_level 1
 local cluster_level firm
 local exposure none
+
+foreach target of local targets {
+    if !inlist("`target'", "included", "tier_raw", "avg_copay_amt") {
+        di as error "Compact quarterly path files support included, tier_raw, and avg_copay_amt."
+        exit 198
+    }
+}
 
 if `large_sample' != 1 | "`personnel_definition'" != "narrow" {
     di as error "Formulary regressions require large_sample=1 and personnel_definition=narrow."
@@ -95,10 +98,6 @@ if "`exposure'" != "none" {
     di as error "The formulary DDD specification does not use exposure."
     exit 198
 }
-if !inrange(`path_sample_fraction', 0, 1) {
-    di as error "path_sample_fraction must be between 0 and 1."
-    exit 198
-}
 if !inlist(`quarter_event', 0, 1) {
     di as error "quarter_event must be 0 or 1."
     exit 198
@@ -120,16 +119,12 @@ local panel_label "planpath_ndc"
 local panel_level "quarter_planpath"
 local unit_label "Unique Formulary-Path-NDC-Cohorts"
 local import_stringcols "1 6/9"
-if `quarter_event' == 1 local import_stringcols "1 8/11"
+if `quarter_event' == 1 local import_stringcols "1 7"
 local sample_spec "baseline"
 if `formulary_time_shift_quarters' != 0 | `first_seen_year_offset' != 0 | `first_seen_quarter' != 1 {
     local seen_offset "`first_seen_year_offset'"
     if `first_seen_year_offset' >= 0 local seen_offset "+`first_seen_year_offset'"
     local sample_spec "shift_q`formulary_time_shift_quarters'_seen_y`seen_offset'_q`first_seen_quarter'"
-}
-if `path_sample_fraction' < 1 {
-    local path_sample_label = subinstr("`path_sample_fraction'", ".", "p", .)
-    local sample_spec "`sample_spec'_pathsample`path_sample_label'"
 }
 if `quarter_event' == 1 local sample_spec "`sample_spec'_quarter_event"
 local spec_folder "req1_not_wsp95_fe`fe_level'_firm`panel_suffix'"
@@ -183,11 +178,6 @@ keep ndc first_seen_qtime
 tempfile first_seen_metadata
 save `first_seen_metadata', replace
 
-local panel_event_vars ///
-    event_to_b_not_in_a_a event_to_b_not_in_a_b ///
-    event_to_b_still_in_a_a event_to_b_still_in_a_b ///
-    event_interlock_dissolution_a event_interlock_dissolution_b
-
 capture program drop _post_planpath_ddd_estimates
 program define _post_planpath_ddd_estimates, eclass
     args bmat vmat obs
@@ -196,7 +186,7 @@ program define _post_planpath_ddd_estimates, eclass
 end
 
 * ================= estimation loop =================
-local retained_outcomes included tier_upgrade tier_downgrade prefer `targets'
+local retained_outcomes `targets'
 local retained_outcomes : list uniq retained_outcomes
 local cohort_required_vars "data_cohort"
 local source_company_var "boardname"
@@ -204,7 +194,6 @@ if `quarter_event' == 1 {
     local cohort_required_vars "data_cohort_year data_cohort_quarter data_cohort_qtime"
     local source_company_var "id"
 }
-set seed `path_sample_seed'
 foreach event of local events {
     local cohort_list "2020 2021 2022 2023 2024"
     if `quarter_event' == 1 {
@@ -257,9 +246,10 @@ foreach event of local events {
         }
         import delimited "`data_file'", clear varnames(1) case(lower) ///
             stringcols(`import_stringcols')
-        foreach variable in history_id n_path n_path_copay n_path_prefer ndc `source_company_var' ///
+        foreach variable in history_id n_path n_path_copay ndc `source_company_var' ///
             year quarter `cohort_required_vars' treated_a treated_b sample_a sample_b ///
-            `panel_event_vars' `imported_share_a' `imported_share_b' `retained_outcomes' {
+            `other_event_list_a' `other_event_list_b' ///
+            `imported_share_a' `imported_share_b' `retained_outcomes' {
             capture confirm variable `variable'
             if _rc {
                 di as error "Missing variable `variable' in `data_file'"
@@ -283,23 +273,20 @@ foreach event of local events {
             gen byte data_cohort_quarter = 1
             gen long data_cohort_qtime = data_cohort * 4 + 1
         }
-        foreach variable in year quarter data_cohort data_cohort_year data_cohort_quarter data_cohort_qtime n_path n_path_copay n_path_prefer ///
-            treated_a treated_b sample_a sample_b `panel_event_vars' ///
+        foreach variable in year quarter data_cohort data_cohort_year data_cohort_quarter data_cohort_qtime n_path n_path_copay ///
+            treated_a treated_b sample_a sample_b ///
+            `other_event_list_a' `other_event_list_b' ///
             cohort_sharing_a cohort_sharing_b `retained_outcomes' {
             capture confirm numeric variable `variable'
             if _rc destring `variable', replace
         }
         foreach variable in included treated_a treated_b sample_a sample_b ///
-            `panel_event_vars' cohort_sharing_a cohort_sharing_b {
+            `other_event_list_a' `other_event_list_b' ///
+            cohort_sharing_a cohort_sharing_b {
             assert inlist(`variable', 0, 1)
         }
-        foreach variable in tier_upgrade tier_downgrade {
-            assert inlist(`variable', 0, 1) if !missing(`variable')
-        }
-        assert inrange(prefer, 0, 1) if !missing(prefer)
         assert n_path > 0 & n_path == floor(n_path)
         assert n_path_copay >= 0 & n_path_copay <= n_path & n_path_copay == floor(n_path_copay)
-        assert n_path_prefer >= 0 & n_path_prefer <= n_path & n_path_prefer == floor(n_path_prefer)
         if `quarter_event' == 1 {
             assert data_cohort_year == real(substr("`cohort'", 1, 4))
             assert data_cohort_quarter == real(substr("`cohort'", 6, 1))
@@ -308,24 +295,10 @@ foreach event of local events {
         }
         else assert data_cohort == `cohort'
 
-        * Draw paths uniformly within the cohort.  Every NDC and quarter on a
-        * selected path is retained; n_path never affects the draw.
-        if `path_sample_fraction' < 1 {
-            sort history_id ndc year quarter
-            by history_id: gen byte __path_tag = _n == 1
-            gen double __path_draw = runiform() if __path_tag
-            egen long __path_rank = rank(__path_draw), unique
-            egen long __path_count = total(__path_tag)
-            gen byte __path_selected = __path_tag & ///
-                __path_rank <= ceil(`path_sample_fraction' * __path_count)
-            by history_id: egen byte __path_selected_all = max(__path_selected)
-            keep if __path_selected_all == 1
-            drop __path_tag __path_draw __path_rank __path_count ///
-                __path_selected __path_selected_all
-        }
-        keep history_id n_path n_path_copay n_path_prefer ndc companyid ///
+        keep history_id n_path n_path_copay ndc companyid ///
             year quarter data_cohort data_cohort_year data_cohort_quarter data_cohort_qtime treated_a treated_b sample_a sample_b ///
-            `panel_event_vars' cohort_sharing_a cohort_sharing_b `retained_outcomes'
+            `other_event_list_a' `other_event_list_b' ///
+            cohort_sharing_a cohort_sharing_b `retained_outcomes'
         if `first' {
             tempfile event_master
             save `event_master', replace
@@ -404,15 +377,7 @@ foreach event of local events {
             }
             else {
                 use `event_master_always_included', clear
-                if inlist("`target'", "tier_upgrade", "tier_downgrade") {
-                    sort history_id ndc data_cohort year quarter
-                    by history_id ndc data_cohort: gen byte __first_window_quarter = _n == 1
-                    assert !missing(`target') | __first_window_quarter
-                    replace `target' = 0 if missing(`target') & __first_window_quarter
-                    assert !missing(`target')
-                    drop __first_window_quarter
-                }
-                * Coverage alone does not guarantee complete copay/prefer data.
+                * Coverage alone does not guarantee complete copay data.
                 * Balance the path-NDC panel separately for the current outcome.
                 bysort history_id ndc data_cohort: egen byte __target_complete = ///
                     min(!missing(`target'))
@@ -424,10 +389,6 @@ foreach event of local events {
             if "`target'" == "avg_copay_amt" {
                 local weight_var n_path_copay
                 keep if n_path_copay > 0
-            }
-            else if "`target'" == "prefer" {
-                local weight_var n_path_prefer
-                keep if n_path_prefer > 0
             }
             keep if `sample_var' == 1
             gen byte treat = `treated_var'

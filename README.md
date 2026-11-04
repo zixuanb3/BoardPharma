@@ -13,6 +13,7 @@ Both pipelines construct event-level data from BoardEx director-board affiliatio
 BoardPharma/
 ├── codes/
 │   ├── 02_code/          Upstream formulary, ATC, expansion, and copay preparation
+│   ├── 1.1_ssrquarter/   Quarterly SSR roster, event, cohort, diagnostic, and estimation workflow
 │   ├── 1_data_prep/       Event, panel, and cohort construction
 │   ├── 2_stats/           Descriptive statistics and diagnostics
 │   └── 3_event_study/     Stata estimation and inference programs
@@ -85,6 +86,28 @@ The principal movement events are `to_B_not_in_A`, `to_B_still_in_A`, and `inter
 ## Personnel-Cohort Extension
 
 `1_data_prep/build_personnel_panels.py` creates personnel-based firm-pair-year movement and cohort panels. `PersonnelCohortQuarterPanelMaker.py` converts these to product-quarter regression panels. `PersonnelCohortIdGroupCounter.py` reports sample counts, and `personnel_did_imputation_event_study.do` estimates the associated event studies.
+
+## Dedicated Quarterly SSR Workflow
+
+`1.1_ssrquarter/` is a self-contained quarterly robustness branch of the SSR pipeline. It rebuilds two quarterly board-roster variants, derives quarter-specific movement events, merges req2-qualified events into SSR firm-product outcomes, constructs balanced event-quarter cohorts with ATC3-sharing classifications, produces cohort diagnostics, and estimates stacked `did_imputation` event studies.
+
+```text
+BoardEx BP + IE/OC records and SSR name mappings
+        ↓
+two quarterly SSR board rosters
+        ↓
+quarterly movement candidates and firm interlocks
+        ↓
+firm-quarter req0/req1/req2 movement tables
+        ↓
+SSR firm-product-quarter event panels
+        ↓
+balanced T-4 through T+7 req2/Not cohorts with ATC3 sharing
+        ↓
+cohort-distribution diagnostics and did_imputation estimation
+```
+
+The branch preserves the full specification path in every output: roster variant, late-entry rule, req1 rule, stay rule, ATC-sharing time rule, treatment side, and event type. See [`1.1_ssrquarter/README.md`](1.1_ssrquarter/README.md) for the run order, parameter definitions, directory structure, and output paths.
 
 # Formulary Pipeline
 
