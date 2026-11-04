@@ -538,6 +538,12 @@ class CohortPanelMaker:
                 & treated[balance_col].eq(1)
             ].copy()
 
+        # A possible event is not evidence of an untreated window. Exclude
+        # uncertain firms from controls at the firm-window level only.
+        if "event_uncertain" in df_window:
+            uncertain_firms = set(df_window.loc[df_window["event_uncertain"].eq(1), "BoardName"])
+            control_candidate_firms -= uncertain_firms
+
         no_pure_event = df_window.groupby(id_cols)["pure_event"].max()
         valid_control_units = no_pure_event[no_pure_event.eq(0)].index
         controls = df_window[

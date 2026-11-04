@@ -122,7 +122,7 @@ Within each variant/tier directory:
 Distribution plots/tables use matching mode-specific directories. Alternative
 regression result/log filenames end in `_atc3_<mode>`. Every mode has its own
 versioned Stata cache, and mode metadata is checked before estimation. Cache
-version `atc3v4treated` prevents reuse of older overlap stacks. Historical cohorts
+version `atc3v6eventbounds` prevents reuse of older overlap stacks. Historical cohorts
 without mode metadata remain readable only under `event_quarter`.
 
 The earlier `event_year`, `event_year_all`, and `event_year_any` names are no
@@ -141,7 +141,12 @@ its controls are excluded as well. This rule applies to all four overlap modes.
 
 Both Stata templates independently recheck treated presence after applying the
 window and after loading any cached stack, before pooled P95 winsorization.
-The versioned cache name is `atc3v4treated`. Exported `n_cohorts` is recomputed
+The versioned cache name is `atc3v6eventbounds`. Exported `n_cohorts` is recomputed
 from distinct retained cohort labels, including when a stack is loaded from cache.
 Reestimate the regressions after this selection change because pooled price
 thresholds and estimation sample sizes can change.
+
+
+The added event_specific date policy and its certainty-based event/control rules
+are documented in README_event_specific.md. It adds annual and quarterly rosters
+without changing the four overlap definitions or their full-SSR comparison universe.

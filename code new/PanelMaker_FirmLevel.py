@@ -439,6 +439,21 @@ class EventStudyPanelSSR:
                 frame["_time_id"] = frame["year"].astype(int) * 4 + frame["quarter"].astype(int) - 1
             return frame
 
+        # Unknown base events cannot supply untreated comparison observations.
+        # Annual evidence uses the same documented Q1 event anchor as confirmed events.
+        panel["event_uncertain"] = np.int8(0)
+        if get_variant(self.roster_variant).get("date_rule") == "event_specific":
+            evidence_path = personnel_output_dir(self.roster_variant, self.personnel_definition) / "event_tables/firm_event_evidence.csv"
+            evidence = pd.read_csv(evidence_path)
+            evidence = evidence.loc[evidence["event_type"].eq(self.event_type)
+                                    & evidence["firm_type"].eq(self.treatment_group)
+                                    & evidence["base_state"].eq(-1)].copy()
+            if self.panel_level == "quarter" and "quarter" not in evidence:
+                evidence["quarter"] = np.int8(1)
+            uncertain = evidence[merge_keys].drop_duplicates().assign(_uncertain=np.int8(1))
+            panel = panel.merge(uncertain, on=merge_keys, how="left")
+            panel["event_uncertain"] = panel.pop("_uncertain").fillna(0).astype(np.int8)
+
         panel = add_time_id(panel)
         pure_events = add_time_id(pure_events)
         stay_events = add_time_id(stay_events)

@@ -54,7 +54,7 @@ if `"`kappa_variant_data_root'"' == "" local kappa_variant_data_root "`variant_d
 local price_sample "D:/Dropbox/BoardPharma/InterimData/boardex_ssr_price_sample.csv"
 local state_file "C:/Users/12150/Documents/GitHub/Grad-IO/outputs/ssr_states/ssr_134_company_states_size.csv"
 
-local roster_variants imputed_year imputed_yearquarter drop_sentinel_year drop_sentinel_yearquarter
+local roster_variants imputed_year imputed_yearquarter drop_sentinel_year drop_sentinel_yearquarter event_specific_year event_specific_yearquarter
 local personnel_definitions narrow medium broad
 args requested_roster_variant requested_personnel_definition requested_req requested_fe requested_target requested_window_event_control requested_treatment_group requested_event requested_control requested_kappa requested_atc3_overlap_mode
 
@@ -248,7 +248,7 @@ foreach roster_variant of local roster_variants {
                                     // Stata writes to the same stacked-price file.
                                     local cache_namespace : environment BOARDPHARMA_CACHE_NAMESPACE
                                     if `"`cache_namespace'"' == "" local cache_namespace "default"
-                                    local cache_namespace "`cache_namespace'_atc3v4treated_`atc3_overlap_mode'"
+                                    local cache_namespace "`cache_namespace'_atc3v6eventbounds_`atc3_overlap_mode'"
                                     local cache_root "`variant_root'/cache_`cache_namespace'"
                                     cap mkdir "`cache_root'"
                                     local cache_file "`cache_root'/`panel_group_folder'_`event'_req`req'_`control_name'_cohort_atc3_stacked.dta"

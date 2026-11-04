@@ -142,6 +142,12 @@ class MovementEventBuilder:
 
     def build(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Return movement candidates and membership-derived firm-interlock edges."""
+        # Event-specific rosters carry possible and certain memberships.
+        # Their event inference must never treat an uncertain row as a zero.
+        if self.input_path.stem.startswith("ssr_company_roster_event_specific_"):
+            from event_specific_policy import build_movement
+            return build_movement(self)
+
         # 1) Load one of the four standardized roster universes.
         usecols = [
             "DirectorID",

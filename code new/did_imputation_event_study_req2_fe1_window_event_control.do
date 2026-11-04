@@ -56,7 +56,7 @@ if `"`cache_namespace'"' == "" local cache_namespace "default"
 local price_sample "D:/Dropbox/BoardPharma/InterimData/boardex_ssr_price_sample.csv"
 local state_file "C:/Users/12150/Documents/GitHub/Grad-IO/outputs/ssr_states/ssr_134_company_states_size.csv"
 
-local roster_variants imputed_year imputed_yearquarter drop_sentinel_year drop_sentinel_yearquarter
+local roster_variants imputed_year imputed_yearquarter drop_sentinel_year drop_sentinel_yearquarter event_specific_year event_specific_yearquarter
 local personnel_definitions narrow medium broad
 args requested_roster_variant requested_personnel_definition requested_req requested_fe requested_target requested_window_event_control requested_treatment_group requested_event requested_control requested_kappa requested_atc3_overlap_mode
 
@@ -74,7 +74,7 @@ if "`atc3_overlap_mode'" != "event_quarter" {
     local cohort_data_folder "cohort_data_atc3_`atc3_overlap_mode'"
     local overlap_suffix "_atc3_`atc3_overlap_mode'"
 }
-local cache_namespace "`cache_namespace'_atc3v4treated_`atc3_overlap_mode'"
+local cache_namespace "`cache_namespace'_atc3v6eventbounds_`atc3_overlap_mode'"
 if `"`requested_roster_variant'"' != "" & `"`requested_roster_variant'"' != "all" local roster_variants `requested_roster_variant'
 if `"`requested_personnel_definition'"' != "" & `"`requested_personnel_definition'"' != "all" local personnel_definitions `requested_personnel_definition'
 local atc_levels atc3

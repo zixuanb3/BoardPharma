@@ -86,6 +86,15 @@ ROSTER_VARIANTS = {
     },
 }
 
+# Event-specific membership retains explicit certainty at each time frequency.
+for _suffix, _level in [("year", "year"), ("yearquarter", "quarter")]:
+    _name = f"event_specific_{_suffix}"
+    ROSTER_VARIANTS[_name] = {
+        "path": ROSTER_ROOT / f"ssr_company_roster_{_name}.csv",
+        "panel_level": _level, "regression_panel_level": "quarter",
+        "date_rule": "event_specific",
+    }
+
 
 def get_variant(variant: str) -> dict[str, object]:
     """Return validated metadata for one roster variant."""

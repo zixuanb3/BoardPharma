@@ -1056,7 +1056,8 @@ def build(args) -> None:
     raw["source_ie"] = raw.source_dataset.eq("IE").astype(int)
     raw["source_oc"] = raw.source_dataset.eq("OC").astype(int)
     audit, verification = [], []
-    for mode in ["imputed", "drop"]:
+    legacy_modes = ["imputed", "drop"] if args.date_policy == "all" else ([args.date_policy] if args.date_policy != "event_specific" else [])
+    for mode in legacy_modes:
         resolved = resolve_dates(raw, bounds, mode)
         resolved.to_parquet(OUTPUT_DIR / f"{mode}_date_rule_records.parquet", index=False)
         selected = resolved[resolved.date_rule_keep.eq(1)].copy()
@@ -1101,13 +1102,18 @@ def build(args) -> None:
             if args.compare_rosters:
                 verification.append(compare_saved_roster(stem, args.compare_rosters))
                 print(f"Full-column CSV comparison and CSV/DTA validation passed: {variant}", flush=True)
+    if args.date_policy in {"all", "event_specific"}:
+        from event_specific_policy import build_rosters
+        import sys
+        audit.extend(build_rosters(raw, bp, display, info, sys.modules[__name__], OUTPUT_DIR))
+
     # Ensure the raw inputs were not replaced or changed during the build.
     for name, path in inputs.items():
         assert source_fingerprint(path, name not in {"ie", "oc"}) == fingerprints[name]
     write_audit(pd.DataFrame(audit), "t2_roster_build_audit.csv")
     if verification:
         write_audit(pd.DataFrame(verification), "t2_reference_verification.csv")
-    manifest = {"experiment": "T2", "cutoff": "2026q3",
+    manifest = {"experiment": "T2", "cutoff": "2026q3", "requested_date_policy": args.date_policy,
                 "initial_names": len(names), "current_company_ids": len(ids),
                 "historical_id_or_alias_discovery": False,
                 "baseline_policy": "Usable IE/OC pairs use all-role coverage; annual board status labels covered periods only; annual-only pairs cover all four quarters",
@@ -1132,6 +1138,8 @@ def main() -> None:
     parser.add_argument("--interim-dir", type=Path, default=INTERIM_DIR)
     parser.add_argument("--raw-na-dir", type=Path, default=RAW_NA_DIR)
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--date-policy", choices=["all", "imputed", "drop", "event_specific"], default="all",
+                        help="Select record-date processing; all also builds event-specific variants.")
     parser.add_argument("--compare-rosters", type=Path, default=None,
                         help="Optional existing T2 folder for exact all-column CSV comparison.")
     args = parser.parse_args()
