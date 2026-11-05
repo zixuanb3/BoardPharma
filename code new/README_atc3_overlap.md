@@ -1,5 +1,12 @@
 # ATC3 overlap over the complete T2 event window
 
+## Imputed/Drop annual-board update (2026-11-04)
+
+For Imputed and Drop only, BoardEx Pharma and IE/OC are matched by director,
+company and year. Shared years follow IE/OC's quarterly coverage. Additional
+annual BoardEx Pharma years contribute all four quarters. Event-specific is
+unchanged, including its existing annual-board certainty and coverage rules.
+
 `CohortPanelMaker.py` accepts `atc3_overlap_mode` in its configuration,
 `--atc3-overlap-mode` on the command line, or the shared environment variable
 `BOARDPHARMA_ATC3_OVERLAP_MODE`. The command-line argument overrides the

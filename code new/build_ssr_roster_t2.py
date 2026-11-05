@@ -25,9 +25,10 @@ Policy:
     IE board flags Yes/Inside/Outside, OC board seniority, and current role
     keywords remain active. This script implements T2 only, without T1 or T3.
     Known person-company pairs use the union of all usable IE/OC role intervals.
-    Annual board evidence labels covered periods without extending employment.
-    Pairs without usable IE/OC dates retain four quarters per baseline year.
-    Existing role dates are preserved; gaps between observed spells remain gaps.
+    Imputed/Drop match annual board evidence on person, company and year.
+    Shared years follow the union of usable IE/OC quarters; extra baseline years
+    contribute all four quarters. Gaps within shared years remain unchanged.
+    Event-specific retains its existing covered-period certainty policy.
 """
 
 from __future__ import annotations
@@ -855,24 +856,29 @@ def employment_roster(spells: pd.DataFrame, bp, display, info, frequency: str) -
 
 def append_baseline(current: pd.DataFrame, bp, display, info, frequency: str,
                     employment: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Use IE/OC coverage for known pairs; expand annual-only pairs to four quarters."""
+    """Use IE/OC quarters in shared years and full years in baseline-only years.
+
+    This merger is used by Imputed/Drop only. A year absent from usable IE/OC
+    coverage is an additional observed board year even if the pair has usable
+    roles in other years. Event-specific is built by its separate unchanged
+    implementation and does not call this function.
+    """
     board = build_board_candidates(bp, employment, display, info, frequency)
     board = board[board.year.between(SAMPLE_START, CUTOFF_YEAR)].copy()
     if frequency == "quarter":
         board = board[(board.year * 4 + board.quarter - 1).le(CUTOFF_PERIOD)].copy()
     key = time_key(frequency)
     board = board.drop_duplicates(key)
-    pair = ["DirectorID", "company_key"]
-    known_pairs = employment.attrs.get("employment_pairs", employment[pair].drop_duplicates())
-    has_usable_roles = pd.MultiIndex.from_frame(board[pair]).isin(
-        pd.MultiIndex.from_frame(known_pairs)
+    annual_key = ["DirectorID", "company_key", "year"]
+    has_usable_year = pd.MultiIndex.from_frame(board[annual_key]).isin(
+        pd.MultiIndex.from_frame(employment[annual_key].drop_duplicates())
     )
     covered = pd.MultiIndex.from_frame(board[key]).isin(
         pd.MultiIndex.from_frame(employment[key])
     )
-    # For any pair with usable IE/OC dates, annual board evidence may label
-    # covered periods only. Entirely annual-only pairs retain all four quarters.
-    board = board.loc[~has_usable_roles | covered].copy().reset_index(drop=True)
+    # A shared director-company-year follows IE/OC's specific quarters. An
+    # additional board year contributes Q1-Q4 without borrowing role dates.
+    board = board.loc[~has_usable_year | covered].copy().reset_index(drop=True)
     # Baseline role enrichment uses the current same-period record only.
     # It never attaches a first role from another year or another quarter.
     enrich = employment[key + TRACE + ["RawCompanyID"]]
@@ -1116,7 +1122,8 @@ def build(args) -> None:
     manifest = {"experiment": "T2", "cutoff": "2026q3", "requested_date_policy": args.date_policy,
                 "initial_names": len(names), "current_company_ids": len(ids),
                 "historical_id_or_alias_discovery": False,
-                "baseline_policy": "Usable IE/OC pairs use all-role coverage; annual board status labels covered periods only; annual-only pairs cover all four quarters",
+                "baseline_policy": {"imputed_drop": "Match director-company-year: shared years use IE/OC quarter coverage; additional annual board years cover Q1-Q4",
+                                    "event_specific": "Unchanged: usable pairs use possible IE/OC coverage; annual-only pairs have possible quarterly membership"},
                 "date_policy": {"75_80_imputed": "company earliest/latest valid endpoint quarter; flag40 company ends at cutoff",
                                 "75_80_drop": "exclude raw row", "start_30_imputed": "known year Q1",
                                 "end_25_imputed": "known year Q4", "25_30_drop": "exclude raw row",
