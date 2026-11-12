@@ -13,9 +13,10 @@ Process:
        set difference, and retain treated companies with other window events.
     3. Select ATC partners from individual candidates satisfying stay==1 AND
        the treated side's requirement1_A/B==1, including dissolution, matching
-       the current 1.1 req2 definition. Match the treated product's ATC3 at T
-       against every partner's full SSR portfolio: share_time_spec=new uses T;
-       origin pools T-2, T-1, T, T+1, including quarters across calendar years.
+       the current 1.1 req2 definition. With dynamic_share=0, match the treated
+       product's ATC3 at T against every partner's full SSR portfolio at T
+       (new), or pooled across T-2 to T+1 (origin). With dynamic_share=1,
+       match both portfolios in each observation quarter using the same partners.
     4. Preserve input columns and code new's row/column order and additional
        window_other_event, atc3_sharing, other_event_*, and ever_* indicators.
        Basic-event flags are temporary, not restored to saved CSVs. Preserve
@@ -32,14 +33,20 @@ Input:
 
 Output:
     data/ssrquarter/cohort_data/<variant>/late_<late>/req1_<req1_spec>/
-        stay_<stay_spec>/share_time_<share_time_spec>/
+        stay_<stay_spec>/share_time_<share_time_spec>[_ds1]/
         quarter-level_<side>_without_<other>/event/req2/Not/
         <event>_quarter_cohort_<year>q<quarter>_balanced.csv
-    Include 2009Q1-2018Q4; skip cohort periods without upstream event/balance
-    columns, exactly as code new does. Only cohort panel CSVs are generated;
+    Include 2009Q1-2018Q4; skip cohorts without balanced treated rows or without
+    upstream event/balance columns. The optional dissolution restriction writes
+    under dai1 and applies after constructing the original treated and control
+    groups. The earlier same-pair still event must satisfy req2 and occur in
+    2009Q1 or later.
+    Only cohort panel CSVs are generated;
     no distribution tables, figures, or first_event cohort files are produced.
-    --all-configurations runs late={0,3} and req1_spec/stay_spec/share_time_spec
-    ={new,origin}: 16 settings, each for both variants, three events and A/B.
+    --all-configurations runs late={0,3}, req1_spec={new,origin}, and
+    stay_spec={new,origin,pre2}.
+    It runs both share_time_spec values in static mode and only new in dynamic
+    mode. Each setting covers three events and A/B for the selected variants.
     Existing output files are never overwritten. Input/output roots may be
     overridden on the command line. No sharing_pair_spec is used.
 """
@@ -54,18 +61,33 @@ import re
 import pandas as pd
 
 
+# ========================== USER CONFIG ==========================
+# Select membership policies.
+# Input/output roots and the existing statistical settings are configured below.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SSR_INPUT = PROJECT_ROOT / "InterimData" / "boardex_ssr_price_sample.csv"
 PANEL_DIR = PROJECT_ROOT / "data" / "ssrquarter" / "firm_panels"
 EVENT_DIR = PROJECT_ROOT / "data" / "ssrquarter" / "event_tables"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "ssrquarter" / "cohort_data"
-VARIANTS = ("imputed_yearquarter", "drop_sentinel_yearquarter")
+# Select roster variants for a no-argument run; --variant selects one explicitly.
+VARIANTS = ("drop_sentinel_yearquarter",)
 RUN_CONFIG = {
+    "ever_board": 1,  # 0: legacy roster, 1: all-role continuity.
+    "ieoc_ref": 1,  # 0: baseline BP expansion, 1: use IE/OC coverage.
+    # Nonnegative years used by upstream event files.
     "late": 3,
+    # Upstream req1 rule: new or origin. Upstream stay: new, origin, or pre2.
     "req1_spec": "new",
     "stay_spec": "new",
+    # Static sharing partner portfolios: new uses T, origin pools T-2 to T+1.
     "share_time_spec": "new",
+    # 0: static sharing. 1: update sharing every quarter, requires new.
+    "dynamic_share": 0,
+    # 1: require an earlier req2-qualified still event for the same pair since 2009Q1.
+    "dissolution_after_interlock": 1,
 }
+# Fixed cohort definitions and observation range.
+STAY_SPECS = ("new", "origin", "pre2")
 EVENT_CONFIGS = {
     "to_B_not_in_A": ("to_B_not_in_A", "other_event_not", "ever_not"),
     "to_B_still_in_A": ("to_B_still_in_A", "other_event_still", "ever_still"),
@@ -76,10 +98,13 @@ EVENT_CONFIGS = {
     ),
 }
 TREATMENT_GROUPS = ("B", "A")
+COHORT_START_YEAR = 2009
 PERIODS = tuple(
-    (year, quarter) for year in range(2009, 2019) for quarter in range(1, 5)
+    (year, quarter) for year in range(COHORT_START_YEAR, 2019) for quarter in range(1, 5)
 )
 ID_COLUMNS = ["BoardName", "product"]
+DISSOLUTION_EVENT = "interlock_dissolution"
+# ================================================================
 
 
 @dataclass(frozen=True)
@@ -90,6 +115,12 @@ class Specification:
     req1_spec: str
     stay_spec: str
     share_time_spec: str
+    dynamic_share: int = 0
+    dissolution_after_interlock: int = 0
+
+    @property
+    def output_events(self) -> tuple[str, ...]:
+        return (DISSOLUTION_EVENT,) if self.dissolution_after_interlock else tuple(EVENT_CONFIGS)
 
     def upstream_dir(self, root: Path, variant: str) -> Path:
         return (
@@ -101,7 +132,9 @@ class Specification:
         )
 
     def output_dir(self, root: Path, variant: str) -> Path:
-        return self.upstream_dir(root, variant) / f"share_time_{self.share_time_spec}"
+        suffix = "_ds1" if self.dynamic_share else ""
+        path = self.upstream_dir(root, variant) / f"share_time_{self.share_time_spec}{suffix}"
+        return path / "dai1" if self.dissolution_after_interlock else path
 
 
 def normalize_key(value: object) -> str:
@@ -215,6 +248,7 @@ class CohortPanelMaker:
         self.panels: dict[tuple[str, str], pd.DataFrame] = {}
         self.event_timing: dict[tuple[str, str], pd.DataFrame] = {}
         self.partner_indices: dict[tuple[str, str], dict] = {}
+        self.dissolution_partners: dict[str, dict[int, dict[str, set[str]]]] = {}
 
     def panel_path(self, event: str, side: str) -> Path:
         return (
@@ -350,8 +384,9 @@ class CohortPanelMaker:
         side: str,
         cohort_time: int,
         event_col: str,
+        partners: dict[tuple[int, str], set[str]] | None = None,
     ) -> pd.DataFrame:
-        """Freeze each treated product's overlap at T across its cohort window."""
+        """Label treated products using fixed event partners and the selected time rule."""
         result = frame.copy()
         result["atc3_sharing"] = pd.Series(0, index=result.index, dtype="int8")
         treated_firms = set(
@@ -363,48 +398,43 @@ class CohortPanelMaker:
         treated_keys = {normalize_key(value) for value in treated_firms}
         if not treated_keys:
             return result
-        partners = self.partner_index(event, side)
+        if partners is None:
+            partners = self.partner_index(event, side)
         result["_cohort_firm_key"] = result["BoardName"].map(normalize_key)
         result["_product_key"] = result["product"].map(normalize_key)
-        event_products = (
-            result.loc[
-                result["_time_id"].eq(cohort_time)
-                & result[event_col].eq(1)
-                & result["_cohort_firm_key"].isin(treated_keys),
-                ["_cohort_firm_key", "_product_key"],
-            ]
-            .dropna()
-            .drop_duplicates()
+        treated = result[event_col].eq(1) & result["_cohort_firm_key"].isin(treated_keys)
+        result["_sharing_time"] = (
+            result["_time_id"] if self.specification.dynamic_share else cohort_time
         )
-        partner_periods = (
-            (cohort_time,)
-            if self.specification.share_time_spec == "new"
-            else range(cohort_time - 2, cohort_time + 2)
-        )
-        sharing_pairs = set()
-        for firm_key, product_key in event_products.itertuples(index=False, name=None):
+        source_rows = treated
+        if not self.specification.dynamic_share:
+            source_rows = treated & result["_time_id"].eq(cohort_time)
+        match_columns = ["_sharing_time", "_cohort_firm_key", "_product_key"]
+        products = result.loc[source_rows, match_columns].dropna().drop_duplicates()
+        sharing_keys: set[tuple[int, str, str]] = set()
+        for period, firm_key, product_key in products.itertuples(index=False, name=None):
             own_classes = self.product_atc3.get(
-                (cohort_time, firm_key, product_key), set()
+                (period, firm_key, product_key), set()
+            )
+            partner_periods = (
+                (period,)
+                if self.specification.share_time_spec == "new"
+                else range(cohort_time - 2, cohort_time + 2)
             )
             partner_classes: set[str] = set()
             for partner in partners.get((cohort_time, firm_key), set()):
-                for period in partner_periods:
+                for partner_period in partner_periods:
                     partner_classes.update(
-                        self.partner_atc3.get((period, partner), set())
+                        self.partner_atc3.get((partner_period, partner), set())
                     )
             if own_classes.intersection(partner_classes):
-                sharing_pairs.add((firm_key, product_key))
-        if sharing_pairs:
-            row_index = pd.MultiIndex.from_frame(
-                result[["_cohort_firm_key", "_product_key"]]
-            )
-            sharing_index = pd.MultiIndex.from_tuples(
-                sharing_pairs,
-                names=["_cohort_firm_key", "_product_key"],
-            )
-            result.loc[row_index.isin(sharing_index), "atc3_sharing"] = 1
-        result.loc[~result[event_col].eq(1), "atc3_sharing"] = 0
-        return result.drop(columns=["_cohort_firm_key", "_product_key"])
+                sharing_keys.add((period, firm_key, product_key))
+        if sharing_keys:
+            row_index = pd.MultiIndex.from_frame(result[match_columns])
+            result.loc[
+                result[event_col].eq(1) & row_index.isin(sharing_keys), "atc3_sharing"
+            ] = 1
+        return result.drop(columns=match_columns)
 
     def add_other_and_ever_events(
         self,
@@ -495,12 +525,67 @@ class CohortPanelMaker:
         cohort = self.add_other_and_ever_events(cohort, event, side, cohort_time)
         return cohort.drop(columns=["pure_event"])
 
+    def restricted_partners(self, side: str) -> dict[int, dict[str, set[str]]]:
+        """Index qualified partners with a prior req2 still event since 2009Q1."""
+        if side in self.dissolution_partners:
+            return self.dissolution_partners[side]
+        first_still: dict[tuple[str, ...], int] = {}
+        still = self.candidates.loc[
+            self.candidates["event_type"].eq("to_B_still_in_A")
+            & self.candidates["FirmA_event_time_id"].ge(COHORT_START_YEAR * 4)
+            & self.candidates[self.stay_column].eq(1)
+            & self.candidates["requirement1_A"].eq(1)
+            & self.candidates["requirement1_B"].eq(1),
+            ["FirmA", "FirmB", "FirmA_event_time_id"],
+        ].dropna()
+        for a, b, time in still.itertuples(index=False, name=None):
+            pair = tuple(sorted((a, b)))
+            first_still[pair] = min(time, first_still.get(pair, time))
+
+        result: dict[int, dict[str, set[str]]] = {}
+        other = "B" if side == "A" else "A"
+        candidates = self.eligible_candidates(DISSOLUTION_EVENT, side)
+        columns = [f"Firm{side}", f"Firm{other}", f"Firm{side}_event_time_id"]
+        for firm, partner, time in candidates[columns].dropna().itertuples(index=False, name=None):
+            prior = first_still.get(tuple(sorted((firm, partner))))
+            if prior is not None and prior < time:
+                result.setdefault(time, {}).setdefault(firm, set()).add(partner)
+        self.dissolution_partners[side] = result
+        return result
+
+    def restrict_dissolution_cohort(
+        self, cohort: pd.DataFrame, side: str, year: int, quarter: int,
+    ) -> pd.DataFrame:
+        """Drop noneligible treated windows and update sharing for retained treatments."""
+        cohort_time = year * 4 + quarter - 1
+        event_col = f"event_{year}q{quarter}"
+        partners = self.restricted_partners(side).get(cohort_time, {})
+        treated = cohort[event_col].eq(1)
+        retained_treated = treated & cohort["BoardName"].isin(partners)
+        result = cohort.loc[~treated | retained_treated].copy()
+        if retained_treated.any():
+            sharing_partners = {
+                (cohort_time, normalize_key(firm)): {normalize_key(partner) for partner in others}
+                for firm, others in partners.items()
+            }
+            sharing = self.add_atc3_sharing(
+                cohort.loc[retained_treated], DISSOLUTION_EVENT, side, cohort_time,
+                event_col, partners=sharing_partners,
+            )
+            result.loc[sharing.index, "atc3_sharing"] = sharing["atc3_sharing"]
+        return result
+
     def run(self, output_root: Path) -> int:
         """Write only cohort panels, preserving the original cohort loop order."""
         cohort_count = 0
         for side in TREATMENT_GROUPS:
-            for event in EVENT_CONFIGS:
+            for event in self.specification.output_events:
                 frame = self.load_panel(event, side)
+                if self.specification.dissolution_after_interlock:
+                    year, quarter = PERIODS[0]
+                    cohort_path(output_root, side, event, year, quarter).parent.mkdir(
+                        parents=True, exist_ok=True,
+                    )
                 for year, quarter in PERIODS:
                     label = f"{year}q{quarter}"
                     columns = (f"event_{label}", f"balance_panel_{label}")
@@ -511,6 +596,10 @@ class CohortPanelMaker:
                             frame[column], errors="raise"
                         ).astype("int8")
                     cohort = self.build_one_cohort(frame, event, side, year, quarter)
+                    if self.specification.dissolution_after_interlock:
+                        cohort = self.restrict_dissolution_cohort(cohort, side, year, quarter)
+                    if not cohort[f"event_{label}"].eq(1).any():
+                        continue
                     path = cohort_path(output_root, side, event, year, quarter)
                     path.parent.mkdir(parents=True, exist_ok=True)
                     cohort.to_csv(path, index=False, mode="x")
@@ -523,7 +612,7 @@ def preflight(args: argparse.Namespace, specifications: list[Specification]) -> 
     if not args.ssr_input.is_file():
         raise FileNotFoundError(args.ssr_input)
     for spec in specifications:
-        for variant in VARIANTS:
+        for variant in args.variants:
             event_root = spec.upstream_dir(args.event_dir, variant)
             panel_root = spec.upstream_dir(args.panel_dir, variant)
             inputs = [
@@ -549,7 +638,7 @@ def preflight(args: argparse.Namespace, specifications: list[Specification]) -> 
                     quarter,
                 )
                 for side in TREATMENT_GROUPS
-                for event in EVENT_CONFIGS
+                for event in spec.output_events
                 for year, quarter in PERIODS
             ]
             for path in outputs:
@@ -560,7 +649,7 @@ def preflight(args: argparse.Namespace, specifications: list[Specification]) -> 
 
 
 def main() -> None:
-    """Run the selected configuration or all sixteen without overwriting files."""
+    """Run the selected settings without overwriting existing cohort files."""
     parser = argparse.ArgumentParser(
         description="Build quarterly event/req2/Not SSR cohorts."
     )
@@ -568,6 +657,10 @@ def main() -> None:
     parser.add_argument("--panel-dir", type=Path, default=PANEL_DIR)
     parser.add_argument("--event-dir", type=Path, default=EVENT_DIR)
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument(
+        "--variant", choices=("imputed_yearquarter", "drop_sentinel_yearquarter"),
+        help="Run just one roster variant.",
+    )
     parser.add_argument("--late", type=int, default=RUN_CONFIG["late"])
     parser.add_argument(
         "--req1-spec",
@@ -576,7 +669,7 @@ def main() -> None:
         default=RUN_CONFIG["req1_spec"],
     )
     parser.add_argument(
-        "--stay-spec", choices=("new", "origin"), default=RUN_CONFIG["stay_spec"]
+        "--stay-spec", choices=STAY_SPECS, default=RUN_CONFIG["stay_spec"]
     )
     parser.add_argument(
         "--share-time-spec",
@@ -584,24 +677,56 @@ def main() -> None:
         default=RUN_CONFIG["share_time_spec"],
     )
     parser.add_argument(
+        "--dynamic-share", "--dynamic_share", type=int, choices=(0, 1),
+        default=RUN_CONFIG["dynamic_share"],
+        help="Use each observation quarter for ATC3 overlap (requires share-time-spec=new).",
+    )
+    parser.add_argument(
+        "--dissolution-after-interlock", type=int, choices=(0, 1),
+        default=RUN_CONFIG["dissolution_after_interlock"],
+    )
+    parser.add_argument(
         "--all-configurations",
         action="store_true",
-        help="Run all 16 settings for both variants.",
+        help="Run all 16 static settings or all 8 dynamic settings per selected variant.",
     )
+    from ever_board_config import (
+        membership_path,
+        validate_policies,
+    )
+
+    parser.add_argument("--ever-board", "--ever_board", type=int, choices=(0, 1), default=RUN_CONFIG["ever_board"])
+    parser.add_argument("--ieoc-ref", "--ieoc_ref", type=int, choices=(0, 1), default=RUN_CONFIG["ieoc_ref"])
     args = parser.parse_args()
+    args.variants = (args.variant,) if args.variant else VARIANTS
+    try:
+        validate_policies(args.ever_board, args.ieoc_ref)
+    except ValueError as error:
+        parser.error(str(error))
+    args.panel_dir = membership_path(args.panel_dir, args.ever_board, args.ieoc_ref)
+    args.event_dir = membership_path(args.event_dir, args.ever_board, args.ieoc_ref)
+    args.output_dir = membership_path(args.output_dir, args.ever_board, args.ieoc_ref)
     if args.late < 0:
         parser.error("--late must be non-negative")
+    if args.dynamic_share and args.share_time_spec != "new":
+        parser.error("--dynamic-share 1 requires --share-time-spec new")
+    share_time_specs = ("new",) if args.dynamic_share else ("new", "origin")
     specifications = (
         [
-            Specification(*values)
+            Specification(
+                *values, dynamic_share=args.dynamic_share,
+                dissolution_after_interlock=args.dissolution_after_interlock,
+            )
             for values in product(
-                (0, 3), ("new", "origin"), ("new", "origin"), ("new", "origin")
+                (0, 3), ("new", "origin"), STAY_SPECS, share_time_specs
             )
         ]
         if args.all_configurations
         else [
             Specification(
-                args.late, args.req1_spec, args.stay_spec, args.share_time_spec
+                args.late, args.req1_spec, args.stay_spec, args.share_time_spec,
+                args.dynamic_share,
+                args.dissolution_after_interlock,
             )
         ]
     )
@@ -609,7 +734,7 @@ def main() -> None:
     indices = load_atc3_indices(args.ssr_input)
     total_cohorts = 0
     for spec in specifications:
-        for variant in VARIANTS:
+        for variant in args.variants:
             maker = CohortPanelMaker(
                 spec, variant, args.panel_dir, args.event_dir, indices
             )
@@ -617,7 +742,8 @@ def main() -> None:
             total_cohorts += cohorts
             print(
                 f"{variant} | late={spec.late} req1={spec.req1_spec} stay={spec.stay_spec} "
-                f"share_time={spec.share_time_spec}: {cohorts} cohort CSVs",
+                f"share_time={spec.share_time_spec} dynamic_share={spec.dynamic_share}: "
+                f"{cohorts} cohort CSVs",
                 flush=True,
             )
     print(f"Finished: {total_cohorts} cohort CSVs.", flush=True)

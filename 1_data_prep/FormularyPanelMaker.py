@@ -9,7 +9,8 @@ direction-specific ATC3 sharing indicators are stored in one panel.
 Process:
 1. Read FORMULARY_ID only, split complete formularies into fixed blocks, then
    route the raw CSV into disk-backed staging blocks in one additional pass.
-   During that routing pass, record each NDC's first quarter with included=1.
+   During that routing pass, record each NDC's first and last quarters with
+   included=1.
 2. Process one complete formulary block at a time: in annual mode, place
    event flags in Q1; in quarterly mode, place them in their event quarter.
    Add calendar-year balance flags, tierA, and ATC sharing outcomes using
@@ -30,12 +31,14 @@ Input:
 Output:
 - quarter=0: data/formulary_panel/shift_q1/formulary_panel_1.csv through
   formulary_panel_{n_formulary_blocks}.csv; metadata:
-  data/formulary_metadata/ndc_first_seen_shift_q1.csv; temporary files:
+  data/formulary_metadata/ndc_first_seen_shift_q1.csv and
+  ndc_last_seen_shift_q1.csv; temporary files:
   D:/pharma/formulary/formulary_panel_staging/narrow_req1_shift_q1/.
 - quarter=1: data/formulary_panel_quarter/shift_q1/formulary_panel_1.csv
   through formulary_panel_{n_formulary_blocks}.csv; metadata:
-  data/formulary_metadata/ndc_first_seen_quarter_shift_q1.csv; temporary
-  files: D:/pharma/formulary/formulary_panel_staging_quarter/
+  data/formulary_metadata/ndc_first_seen_quarter_shift_q1.csv and
+  ndc_last_seen_quarter_shift_q1.csv; temporary files:
+  D:/pharma/formulary/formulary_panel_staging_quarter/
   narrow_req1_shift_q1/.
 """
 
@@ -56,6 +59,7 @@ CURRENT_PATH = Path(__file__).parent.resolve()
 PROJECT_ROOT = CURRENT_PATH.parent.parent
 OUTPUT_BASE_PATH = PROJECT_ROOT / "data" / "formulary_panel"
 FIRST_SEEN_PATH = PROJECT_ROOT / "data" / "formulary_metadata" / "ndc_first_seen.csv"
+LAST_SEEN_PATH = PROJECT_ROOT / "data" / "formulary_metadata" / "ndc_last_seen.csv"
 EVENT_TABLE_DIR = PROJECT_ROOT / "data" / "event_tables"
 
 RAW_FORMULARY_PATH = Path(r"D:\pharma\formulary\task1_expanded_brand_panel.csv")
@@ -242,6 +246,18 @@ def first_seen_path(shift_quarters: int, quarter: int = 0) -> Path:
     return base.with_name(f"{base.stem}_{shift_label(shift_quarters)}.csv")
 
 
+def last_seen_path(shift_quarters: int, quarter: int = 0) -> Path:
+    """Return the NDC last-seen path for one timing specification."""
+    base = (
+        LAST_SEEN_PATH.with_name("ndc_last_seen_quarter.csv")
+        if quarter
+        else LAST_SEEN_PATH
+    )
+    if shift_quarters == 0:
+        return base
+    return base.with_name(f"{base.stem}_{shift_label(shift_quarters)}.csv")
+
+
 def validate_config(config: dict[str, object]) -> tuple[
     list[str], list[str], int, tuple[int, int], int, str, tuple[int, ...], int, int, int, int
 ]:
@@ -399,11 +415,18 @@ def validate_event_quarter(values: pd.Series, source_name: str) -> pd.Series:
     return numeric.astype("int8")
 
 
-def candidate_condition(data: pd.DataFrame, req: int, side: str, stay_column: str) -> pd.Series:
+def candidate_condition(
+    data: pd.DataFrame,
+    req: int,
+    side: str,
+    stay_column: str,
+    quarter: int = 0,
+) -> pd.Series:
     """Return the candidate-level condition that exactly corresponds to req0/1/2."""
     condition = data[stay_column].eq(1)
     if req >= 1:
-        condition &= data["requirement1"].eq(1)
+        requirement_column = f"requirement1_{side}" if quarter else "requirement1"
+        condition &= data[requirement_column].eq(1)
     if req == 2:
         condition &= data[f"requirement2_{side}"].eq(1)
     return condition
@@ -428,63 +451,75 @@ def load_candidate_pairs(
     source_a, source_b = ("idA", "idB") if quarter else ("FirmA", "FirmB")
     firm_column = "id" if quarter else "BoardName"
     pair_column = "idPair" if quarter else "BoardNamePair"
-    required = {
-        "event_type",
-        "event_year",
-        source_a,
-        source_b,
-        stay_column,
-        "requirement1",
-    }
+    required = {"event_type", source_a, source_b, stay_column}
     if quarter:
-        required.add("event_quarter")
+        required.update(
+            (
+                "idA_event_time_id",
+                "idB_event_time_id",
+                "requirement1_A",
+                "requirement1_B",
+            )
+        )
     else:
-        required.update(("requirement2_A", "requirement2_B"))
+        required.update(
+            ("event_year", "requirement1", "requirement2_A", "requirement2_B")
+        )
     missing = sorted(required - set(candidates.columns))
     if missing:
         raise KeyError(f"{path.name} is missing columns: {missing}")
 
     candidates["event_type"] = clean_string(candidates["event_type"])
-    candidates["event_year"] = pd.to_numeric(candidates["event_year"], errors="raise").astype("int16")
     if quarter:
-        candidates["event_quarter"] = validate_event_quarter(candidates["event_quarter"], path.name)
+        for column in ("idA_event_time_id", "idB_event_time_id"):
+            candidates[column] = pd.to_numeric(
+                candidates[column], errors="raise"
+            ).astype("int64")
+    else:
+        candidates["event_year"] = pd.to_numeric(
+            candidates["event_year"], errors="raise"
+        ).astype("int16")
     for column in (source_a, source_b):
         if quarter:
             candidates[column] = validate_company_id(candidates[column], path.name)
         else:
             candidates[column] = clean_string(candidates[column], uppercase=True)
-    condition_columns = (stay_column, "requirement1") if quarter else (
-        stay_column, "requirement1", "requirement2_A", "requirement2_B"
+    condition_columns = (
+        (stay_column, "requirement1_A", "requirement1_B")
+        if quarter
+        else (stay_column, "requirement1", "requirement2_A", "requirement2_B")
     )
     for column in condition_columns:
         candidates[column] = pd.to_numeric(candidates[column], errors="raise").astype("int8")
 
     pairs_by_event: dict[str, pd.DataFrame] = {}
     keys = [firm_column, "year", "quarter"] if quarter else [firm_column, "year"]
-    candidate_columns = ["event_year", "event_quarter"] if quarter else ["event_year"]
     for event_type in event_types:
         for side in treatment_groups:
             column = event_column(event_type, side)
+            time_column = f"id{side}_event_time_id" if quarter else "event_year"
             subset = candidates.loc[
                 candidates["event_type"].eq(event_type)
-                & candidate_condition(candidates, req, side, stay_column),
-                [*candidate_columns, source_a, source_b],
+                & candidate_condition(candidates, req, side, stay_column, quarter),
+                [time_column, source_a, source_b],
             ].dropna()
 
             if side == "A":
                 pairs = subset.rename(columns={
-                    "event_year": "year",
+                    time_column: "year",
                     source_a: firm_column,
                     source_b: pair_column,
                 })
             else:
                 pairs = subset.rename(columns={
-                    "event_year": "year",
+                    time_column: "year",
                     source_b: firm_column,
                     source_a: pair_column,
                 })
             if quarter:
-                pairs = pairs.rename(columns={"event_quarter": "quarter"})
+                time_ids = pairs["year"].astype("int64")
+                pairs["year"] = (time_ids // 4).astype("int16")
+                pairs["quarter"] = (time_ids % 4 + 1).astype("int8")
             pairs = pairs.drop_duplicates().reset_index(drop=True)
 
             event_keys = event_flags.loc[event_flags[column].eq(1), keys].drop_duplicates()
@@ -555,13 +590,14 @@ def stage_paths(stage_dir: Path, n_blocks: int) -> dict[int, Path]:
     return {block: stage_dir / f"formulary_stage_{block}.csv" for block in range(1, n_blocks + 1)}
 
 
-def update_first_seen_lookup(
+def update_seen_lookups(
     chunk: pd.DataFrame,
     first_seen_qtime: dict[str, int],
+    last_seen_qtime: dict[str, int],
     observed_ndcs: set[str],
     included_ndcs_by_quarter: dict[int, set[str]] | None = None,
 ) -> None:
-    """Update the earliest included quarter for every NDC in one raw chunk."""
+    """Update the earliest and latest included quarters for each NDC in a chunk."""
     chunk["NDC"] = clean_string(chunk["NDC"])
     if chunk["NDC"].isna().any():
         raise ValueError("Raw formulary data contain missing NDC values.")
@@ -581,10 +617,15 @@ def update_first_seen_lookup(
     if included_ndcs_by_quarter is not None:
         for qtime, group in actual.groupby("qtime"):
             included_ndcs_by_quarter.setdefault(int(qtime), set()).update(group["NDC"].astype(str).unique())
-    chunk_minimums = actual.groupby("NDC")["qtime"].min()
-    for ndc, qtime in chunk_minimums.items():
+    chunk_extrema = actual.groupby("NDC")["qtime"].agg(["min", "max"])
+    for ndc, first_qtime, last_qtime in chunk_extrema.itertuples():
         key = str(ndc)
-        first_seen_qtime[key] = min(first_seen_qtime.get(key, int(qtime)), int(qtime))
+        first_seen_qtime[key] = min(
+            first_seen_qtime.get(key, int(first_qtime)), int(first_qtime)
+        )
+        last_seen_qtime[key] = max(
+            last_seen_qtime.get(key, int(last_qtime)), int(last_qtime)
+        )
 
 
 def first_seen_frame(first_seen_qtime: dict[str, int]) -> pd.DataFrame:
@@ -615,6 +656,40 @@ def save_first_seen_lookup(first_seen_qtime: dict[str, int], output_path: Path) 
     first_seen_frame(first_seen_qtime).to_csv(output_path, index=False)
 
 
+def last_seen_frame(last_seen_qtime: dict[str, int]) -> pd.DataFrame:
+    """Return a readable, chronologically encoded NDC last-seen table."""
+    result = pd.DataFrame(
+        sorted(last_seen_qtime.items()),
+        columns=["NDC", "last_seen_qtime"],
+    )
+    result["last_seen_year"] = ((result["last_seen_qtime"] - 1) // 4).astype("int16")
+    result["last_seen_quarter"] = (
+        result["last_seen_qtime"] - result["last_seen_year"].astype("int32") * 4
+    ).astype("int8")
+    result["last_seen_YEAR_Q"] = (
+        result["last_seen_year"].astype("string")
+        + " Q"
+        + result["last_seen_quarter"].astype("string")
+    )
+    return result[
+        [
+            "NDC",
+            "last_seen_YEAR_Q",
+            "last_seen_year",
+            "last_seen_quarter",
+            "last_seen_qtime",
+        ]
+    ]
+
+
+def save_last_seen_lookup(last_seen_qtime: dict[str, int], output_path: Path) -> None:
+    """Save the compact NDC last-seen lookup, replacing prior output."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
+    last_seen_frame(last_seen_qtime).to_csv(output_path, index=False)
+
+
 def create_staging_blocks(
     block_lookup: dict[str, int],
     n_blocks: int,
@@ -622,8 +697,8 @@ def create_staging_blocks(
     stage_dir: Path,
     shift_quarters: int,
     quarter: int = 0,
-) -> tuple[dict[int, Path], dict[str, int], dict[int, set[str]]]:
-    """Route raw rows to staging files and collect NDC first-seen quarters."""
+) -> tuple[dict[int, Path], dict[str, int], dict[str, int], dict[int, set[str]]]:
+    """Route raw rows to staging files and collect NDC first/last-seen quarters."""
     stage_dir.mkdir(parents=True, exist_ok=True)
     paths = stage_paths(stage_dir, n_blocks)
     for path in paths.values():
@@ -632,6 +707,7 @@ def create_staging_blocks(
 
     headers_written = {block: False for block in paths}
     first_seen_qtime: dict[str, int] = {}
+    last_seen_qtime: dict[str, int] = {}
     included_ndcs_by_quarter: dict[int, set[str]] = {}
     observed_ndcs: set[str] = set()
     reader = pd.read_csv(RAW_FORMULARY_PATH, dtype="string", chunksize=chunksize)
@@ -642,8 +718,8 @@ def create_staging_blocks(
         }
         for chunk in tqdm(reader, desc="Pass 2/2: routing formulary chunks", unit="chunk"):
             chunk = apply_quarter_shift(chunk, shift_quarters, RAW_FORMULARY_PATH.name)
-            update_first_seen_lookup(
-                chunk, first_seen_qtime, observed_ndcs,
+            update_seen_lookups(
+                chunk, first_seen_qtime, last_seen_qtime, observed_ndcs,
                 included_ndcs_by_quarter if quarter else None,
             )
             chunk["FORMULARY_ID"] = clean_string(chunk["FORMULARY_ID"])
@@ -676,7 +752,9 @@ def create_staging_blocks(
         )
     if not first_seen_qtime:
         raise ValueError("No included NDC rows were found while building the first-seen lookup.")
-    return paths, first_seen_qtime, included_ndcs_by_quarter
+    if set(first_seen_qtime) != set(last_seen_qtime):
+        raise RuntimeError("NDC coverage differs between first-seen and last-seen lookups.")
+    return paths, first_seen_qtime, last_seen_qtime, included_ndcs_by_quarter
 
 
 # ========================== PANEL CONSTRUCTION ==========================
@@ -1115,16 +1193,18 @@ def main() -> None:
     )
     block_lookup = build_formulary_blocks(n_blocks, chunksize)
     stage_dir = staging_directory(personnel_definition, req, time_shift, quarter)
-    paths, first_seen_qtime, included_ndcs_by_quarter = create_staging_blocks(
-        block_lookup,
-        n_blocks,
-        chunksize,
-        stage_dir,
-        time_shift,
-        quarter,
+    (
+        paths,
+        first_seen_qtime,
+        last_seen_qtime,
+        included_ndcs_by_quarter,
+    ) = create_staging_blocks(
+        block_lookup, n_blocks, chunksize, stage_dir, time_shift, quarter
     )
     first_seen_output_path = first_seen_path(time_shift, quarter)
     save_first_seen_lookup(first_seen_qtime, first_seen_output_path)
+    last_seen_output_path = last_seen_path(time_shift, quarter)
+    save_last_seen_lookup(last_seen_qtime, last_seen_output_path)
 
     panel_output_dir = output_base_path(time_shift, quarter)
     panel_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1157,6 +1237,7 @@ def main() -> None:
         pass
     print(f"Saved {n_blocks} formulary panel blocks to: {panel_output_dir}")
     print(f"Saved NDC first-seen lookup to: {first_seen_output_path}")
+    print(f"Saved NDC last-seen lookup to: {last_seen_output_path}")
 
 
 if __name__ == "__main__":

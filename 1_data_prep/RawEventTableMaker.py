@@ -10,6 +10,8 @@ Process:
    the audited quarterly roster with personnel_definition="narrow".
 2. Deduplicate memberships, complete director-period histories, and compare
    adjacent years or quarters to identify the three movement event types.
+   Quarterly to_B_not_in_A may pair an A departure with the first new B entry
+   in the departure quarter or up to ``late`` quarters afterward.
    Quarterly mode identifies firms by mapping id and outputs idA/idB; annual
    mode continues to identify firms by BoardName and outputs FirmA/FirmB.
 3. Derive firm-interlock edges from all selected directors' memberships and
@@ -20,7 +22,8 @@ Process:
    for dissolution. Skip requirement2 and its window truncation.
 5. Write the interlock panel and movement candidates to data/event_tables.
    Quarterly panels add quarter; candidates add event_quarter and use
-   stay_8_quarters at the default two-year setting.
+   stay_8_quarters at the default two-year setting. A and B retain their own
+   event times and requirement1 flags because delayed entries occur later.
 6. The separate direct/indirect interlock candidate job remains disabled.
 
 Input:
@@ -90,6 +93,7 @@ CounterpartLookup = dict[tuple[str, int], set[str]]
 RUN_CONFIG = {
     "quarter": 1,  # 0: existing annual workflow; 1: formulary quarters only.
     "stay_x_years": 2,
+    "late": 3,  # Quarterly to_B_not_in_A only; 0 requires a same-quarter move.
     "requirement2_window": (-1, 1),  # Annual mode only.
     "large_sample": 1,  # Ignored when quarter=1.
     "formulary": 1,
@@ -137,12 +141,15 @@ class MovementEventBuilder:
         large_sample: int = 0,
         personnel_definition: str = "narrow",
         quarter: int = 0,
+        late: int = 0,
     ) -> None:
         """Store movement-event configuration and derive stay-window lengths."""
         if quarter not in {0, 1}:
             raise ValueError("quarter must be 0 or 1")
         if stay_x_years < 1:
             raise ValueError("stay_x_years must be >= 1")
+        if isinstance(late, bool) or not isinstance(late, int) or late < 0:
+            raise ValueError("late must be a non-negative integer")
         if quarter and personnel_definition != "narrow":
             raise ValueError("Quarterly formulary roster supports narrow personnel only")
         if not quarter and large_sample not in {0, 1}:
@@ -156,6 +163,7 @@ class MovementEventBuilder:
         self.large_sample = large_sample
         self.personnel_definition = personnel_definition
         self.quarter = quarter
+        self.late = late if quarter else 0
         if quarter:
             self.stay_col = f"stay_{stay_x_years * 4}_quarters"
             self.forward_stay_periods = stay_x_years * 4
@@ -296,6 +304,65 @@ class MovementEventBuilder:
             ("idA", "idB") if self.quarter else ("FirmA", "FirmB")
         )
         movement_rows: list[dict[str, object]] = []
+
+        def pair_status(firm_a: object, firm_b: object, period: int) -> tuple[int, int]:
+            """Return pair-interlock indicators for period t-1 and t."""
+            firm_low, firm_high = sorted((firm_a, firm_b))
+            return (
+                int((firm_low, firm_high, period - 1) in pair_period_set),
+                int((firm_low, firm_high, period) in pair_period_set),
+            )
+
+        def append_candidate(
+            event_type: str,
+            director_id: object,
+            firm_a: object,
+            firm_b: object,
+            a_period: int,
+            b_period: int,
+            stay: int,
+            requirement_at_previous_period: bool,
+        ) -> None:
+            """Append one candidate, retaining side-specific quarterly timing."""
+            pair_a_tm1, pair_a_t = pair_status(firm_a, firm_b, a_period)
+            pair_b_tm1, pair_b_t = pair_status(firm_a, firm_b, b_period)
+            requirement_a = int(
+                (pair_a_tm1 if requirement_at_previous_period else pair_a_t) == 0
+            )
+            requirement_b = int(
+                (pair_b_tm1 if requirement_at_previous_period else pair_b_t) == 0
+            )
+            row: dict[str, object] = {
+                "event_type": event_type,
+                "DirectorID": director_id,
+                "event_period": a_period,
+                candidate_a_col: firm_a,
+                candidate_b_col: firm_b,
+                self.stay_col: stay,
+            }
+            if self.quarter:
+                row.update(
+                    {
+                        "requirement1_A": requirement_a,
+                        "requirement1_B": requirement_b,
+                        "idA_event_period": a_period,
+                        "idB_event_period": b_period,
+                        "pair_interlock_A_t-1": pair_a_tm1,
+                        "pair_interlock_A_t": pair_a_t,
+                        "pair_interlock_B_t-1": pair_b_tm1,
+                        "pair_interlock_B_t": pair_b_t,
+                    }
+                )
+            else:
+                row.update(
+                    {
+                        "requirement1": requirement_a,
+                        "pair_interlock_t-1": pair_a_tm1,
+                        "pair_interlock_t": pair_a_t,
+                    }
+                )
+            movement_rows.append(row)
+
         for director_id, director_panel in complete_history.groupby("DirectorID", sort=False):
             period_board_pairs = list(
                 director_panel.sort_values("period")[["period", "board_list"]].itertuples(
@@ -325,111 +392,131 @@ class MovementEventBuilder:
                 # to_B_still_in_A: director stays on A and newly joins B.
                 for firm_a in sorted(stayed_boards):
                     for firm_b in sorted(new_boards):
-                        firm_low, firm_high = sorted((firm_a, firm_b))
-                        pair_tm1 = int((firm_low, firm_high, event_period - 1) in pair_period_set)
-                        pair_t = int((firm_low, firm_high, event_period) in pair_period_set)
                         stay = int(
                             all(
                                 firm_b in board_history.get(period, set())
                                 for period in range(event_period, event_period + self.forward_stay_periods)
                             )
                         )
-                        movement_rows.append(
-                            {
-                                "event_type": "to_B_still_in_A",
-                                "DirectorID": director_id,
-                                "event_period": event_period,
-                                candidate_a_col: firm_a,
-                                candidate_b_col: firm_b,
-                                self.stay_col: stay,
-                                "requirement1": int(pair_tm1 == 0),
-                                "pair_interlock_t-1": pair_tm1,
-                                "pair_interlock_t": pair_t,
-                            }
+                        append_candidate(
+                            "to_B_still_in_A",
+                            director_id,
+                            firm_a,
+                            firm_b,
+                            event_period,
+                            event_period,
+                            stay,
+                            requirement_at_previous_period=True,
                         )
 
-                # to_B_not_in_A: director leaves A and newly joins B.
-                for firm_a in sorted(left_boards):
-                    for firm_b in sorted(new_boards):
-                        firm_low, firm_high = sorted((firm_a, firm_b))
-                        pair_tm1 = int((firm_low, firm_high, event_period - 1) in pair_period_set)
-                        pair_t = int((firm_low, firm_high, event_period) in pair_period_set)
-                        stay = int(
-                            all(
-                                firm_b in board_history.get(period, set())
-                                for period in range(event_period, event_period + self.forward_stay_periods)
+                # to_B_not_in_A: A departure may precede the first new B entry.
+                if left_boards:
+                    entries = {
+                        firm_b: event_period for firm_b in sorted(new_boards)
+                    }
+                    if self.quarter:
+                        seen_boards = set(current_boards)
+                        for lag in range(1, self.late + 1):
+                            future_boards = board_history.get(event_period + lag, set())
+                            for firm_b in sorted(
+                                future_boards - previous_boards - seen_boards
+                            ):
+                                entries.setdefault(firm_b, event_period + lag)
+                            seen_boards.update(future_boards)
+
+                    for firm_a in sorted(left_boards):
+                        for firm_b, b_period in sorted(entries.items()):
+                            stay = int(
+                                all(
+                                    firm_b in board_history.get(period, set())
+                                    for period in range(
+                                        b_period, b_period + self.forward_stay_periods
+                                    )
+                                )
                             )
-                        )
-                        movement_rows.append(
-                            {
-                                "event_type": "to_B_not_in_A",
-                                "DirectorID": director_id,
-                                "event_period": event_period,
-                                candidate_a_col: firm_a,
-                                candidate_b_col: firm_b,
-                                self.stay_col: stay,
-                                "requirement1": int(pair_t == 0),
-                                "pair_interlock_t-1": pair_tm1,
-                                "pair_interlock_t": pair_t,
-                            }
-                        )
+                            append_candidate(
+                                "to_B_not_in_A",
+                                director_id,
+                                firm_a,
+                                firm_b,
+                                event_period,
+                                b_period,
+                                stay,
+                                requirement_at_previous_period=False,
+                            )
 
                 # interlock_dissolution: departing B paired with remaining/other prior boards.
                 for firm_b in sorted(left_boards):
                     for firm_a in sorted(stayed_boards | (left_boards - {firm_b})):
-                        firm_low, firm_high = sorted((firm_a, firm_b))
-                        pair_tm1 = int((firm_low, firm_high, event_period - 1) in pair_period_set)
-                        pair_t = int((firm_low, firm_high, event_period) in pair_period_set)
                         stay = int(
                             all(
                                 {firm_a, firm_b}.issubset(board_history.get(period, set()))
                                 for period in range(event_period - self.backward_stay_periods, event_period)
                             )
                         )
-                        movement_rows.append(
-                            {
-                                "event_type": "interlock_dissolution",
-                                "DirectorID": director_id,
-                                "event_period": event_period,
-                                candidate_a_col: firm_a,
-                                candidate_b_col: firm_b,
-                                self.stay_col: stay,
-                                "requirement1": int(pair_t == 0),
-                                "pair_interlock_t-1": pair_tm1,
-                                "pair_interlock_t": pair_t,
-                            }
-            )
+                        append_candidate(
+                            "interlock_dissolution",
+                            director_id,
+                            firm_a,
+                            firm_b,
+                            event_period,
+                            event_period,
+                            stay,
+                            requirement_at_previous_period=False,
+                        )
 
-        movement_columns = [
-            "event_type",
-            "DirectorID",
-            "event_period",
-            candidate_a_col,
-            candidate_b_col,
-            self.stay_col,
-            "requirement1",
-            "pair_interlock_t-1",
-            "pair_interlock_t",
-        ]
+        movement_columns = (
+            [
+                "event_type",
+                "DirectorID",
+                "event_period",
+                candidate_a_col,
+                candidate_b_col,
+                self.stay_col,
+                "requirement1_A",
+                "requirement1_B",
+                "idA_event_period",
+                "idB_event_period",
+                "pair_interlock_A_t-1",
+                "pair_interlock_A_t",
+                "pair_interlock_B_t-1",
+                "pair_interlock_B_t",
+            ]
+            if self.quarter
+            else [
+                "event_type",
+                "DirectorID",
+                "event_period",
+                candidate_a_col,
+                candidate_b_col,
+                self.stay_col,
+                "requirement1",
+                "pair_interlock_t-1",
+                "pair_interlock_t",
+            ]
+        )
         # Deduplicate exact director-firm-pair candidates after all director-period transitions are scanned.
         movement_candidates = (
             pd.DataFrame(movement_rows, columns=movement_columns)
             if movement_rows
             else pd.DataFrame(columns=movement_columns)
         )
+        deduplication_columns = [
+            "event_type",
+            "DirectorID",
+            "event_period",
+            candidate_a_col,
+            candidate_b_col,
+        ]
+        sort_columns = list(deduplication_columns)
+        if self.quarter:
+            deduplication_columns.append("idB_event_period")
+            sort_columns.append("idB_event_period")
         movement_candidates = (
             movement_candidates.drop_duplicates(
-                subset=[
-                    "event_type",
-                    "DirectorID",
-                    "event_period",
-                    candidate_a_col,
-                    candidate_b_col,
-                ]
+                subset=deduplication_columns
             )
-            .sort_values(
-                ["event_type", "DirectorID", "event_period", candidate_a_col, candidate_b_col]
-            )
+            .sort_values(sort_columns)
             .reset_index(drop=True)
         )
 
@@ -508,6 +595,17 @@ class MovementEventBuilder:
         candidates = candidates.rename(columns={"event_period": "event_year"})
         edges = edges.rename(columns={"period": "year"})
         if self.quarter:
+            candidates = candidates.rename(
+                columns={
+                    "idA_event_period": "idA_event_time_id",
+                    "idB_event_period": "idB_event_time_id",
+                }
+            )
+            for column in ("idA_event_time_id", "idB_event_time_id"):
+                candidates[column] = (
+                    pd.to_numeric(candidates[column], errors="raise").astype("int64")
+                    + 1960 * 4
+                )
             for frame, year_col, quarter_col in (
                 (candidates, "event_year", "event_quarter"),
                 (edges, "year", "quarter"),
@@ -628,6 +726,7 @@ class InterlockEventBuilder:
 def main() -> None:
     """Run the raw event-table pipeline and write CSV outputs."""
     stay_x_years = int(RUN_CONFIG["stay_x_years"])
+    late = RUN_CONFIG["late"]
     quarter = int(RUN_CONFIG["quarter"])
     if quarter not in {0, 1}:
         raise ValueError("quarter must be 0 or 1")
@@ -681,6 +780,7 @@ def main() -> None:
         large_sample=large_sample,
         personnel_definition=personnel_definition,
         quarter=quarter,
+        late=late,
     ).build()
     firm_interlock_edges.to_csv(firm_interlock_edges_path, index=False)
     movement_candidates.to_csv(movement_candidates_path, index=False)

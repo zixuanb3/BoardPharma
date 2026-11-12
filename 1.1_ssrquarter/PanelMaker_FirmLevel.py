@@ -30,8 +30,8 @@ Output:
         ssr_firm_panel_<event>_req2.csv
     Dissolution uses the stem interlock_dissolution_leave_B, as in code new.
     Existing outputs are not overwritten. --all-configurations processes
-    late={0,3} and req1_spec/stay_spec={new,origin}, for both quarterly variants,
-    three event types, and A/B identities: 96 files. Paths can be overridden.
+    late={0,3}, req1_spec={new,origin}, and stay_spec={new,origin,pre2}, for both
+    quarterly variants, three events, and A/B identities. Paths can be overridden.
 """
 
 from __future__ import annotations
@@ -44,12 +44,23 @@ import numpy as np
 import pandas as pd
 
 
+# ========================== USER CONFIG ==========================
+# Select membership policies.
+# Input/output roots and the existing statistical settings are configured below.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SSR_INPUT = PROJECT_ROOT / "InterimData" / "boardex_ssr_price_sample.csv"
 EVENT_TABLE_DIR = PROJECT_ROOT / "data" / "ssrquarter" / "event_tables"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "ssrquarter" / "firm_panels"
-VARIANTS = ("imputed_yearquarter", "drop_sentinel_yearquarter")
-RUN_CONFIG = {"late": 3, "req1_spec": "new", "stay_spec": "new"}
+VARIANTS = ("drop_sentinel_yearquarter",)
+# Select the upstream stay rule: new, origin, or pre2.
+RUN_CONFIG = {
+    "ever_board": 1,  # 0: legacy roster, 1: all-role continuity.
+    "ieoc_ref": 1,  # 0: baseline BP expansion, 1: use IE/OC coverage.
+    "late": 3,
+    "req1_spec": "new",
+    "stay_spec": "pre2",
+}
+STAY_SPECS = ("new", "origin", "pre2")
 EVENT_TYPES = ("to_B_not_in_A", "to_B_still_in_A", "interlock_dissolution")
 TREATMENT_GROUPS = ("B", "A")
 BALANCE_WINDOW = (-4, 7)
@@ -212,17 +223,30 @@ def main() -> None:
         default=RUN_CONFIG["req1_spec"],
     )
     parser.add_argument(
-        "--stay-spec", choices=("new", "origin"), default=RUN_CONFIG["stay_spec"]
+        "--stay-spec", choices=STAY_SPECS, default=RUN_CONFIG["stay_spec"]
     )
     parser.add_argument(
         "--all-configurations", action="store_true",
-        help="Run late={0,3}, req1_spec/stay_spec={new,origin}.",
+        help="Run late={0,3}, req1_spec={new,origin}, stay_spec={new,origin,pre2}.",
     )
+    from ever_board_config import (
+        membership_path,
+        validate_policies,
+    )
+
+    parser.add_argument("--ever-board", "--ever_board", type=int, choices=(0, 1), default=RUN_CONFIG["ever_board"])
+    parser.add_argument("--ieoc-ref", "--ieoc_ref", type=int, choices=(0, 1), default=RUN_CONFIG["ieoc_ref"])
     args = parser.parse_args()
+    try:
+        validate_policies(args.ever_board, args.ieoc_ref)
+    except ValueError as error:
+        parser.error(str(error))
+    args.input_dir = membership_path(args.input_dir, args.ever_board, args.ieoc_ref)
+    args.output_dir = membership_path(args.output_dir, args.ever_board, args.ieoc_ref)
     if args.late < 0:
         parser.error("--late must be non-negative")
     configurations = (
-        list(product((0, 3), ("new", "origin"), ("new", "origin")))
+        list(product((0, 3), ("new", "origin"), STAY_SPECS))
         if args.all_configurations
         else [(args.late, args.req1_spec, args.stay_spec)]
     )

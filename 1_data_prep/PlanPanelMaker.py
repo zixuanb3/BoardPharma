@@ -17,8 +17,8 @@ Process:
 3. Read quarterly formulary panels, attach outcomes and events, and compare raw
    tier with the immediately preceding calendar quarter.
 4. Apply req1/Not treated-control rules and stream sampled histories into cohort
-   CSVs. With path_average=1, also accumulate all-history weighted sums from the
-   same expanded data and write one NDC-company-quarter row per cohort.
+   CSVs. With path_average=1, also accumulate weighted and equal-path means from
+   the same expanded data and write one NDC-company-quarter row per cohort.
 
 Input:
 - D:/pharma/formulary/beneficiary_cost_with_copay.csv (quarterly mode)
@@ -143,11 +143,13 @@ COHORT_YEARS = (2020, 2021, 2022, 2023, 2024)
 #   and writes history-by-NDC panels with path counts as regression weights.
 # path_average:
 # - 0 preserves the path-weighted output and sampling behavior.
-# - 1 requires path_weighted_mode=1 and adds a full-history weighted-average
-#   output without replacing the sampled history-level path output. included
-#   uses every history; tier_raw and avg_copay_amt use only history-NDC pairs
-#   included in every required cohort quarter. tier_raw uses n_path and copay
-#   uses n_path_copay, whose zero weights naturally leave copay out of its mean.
+# - 1 requires path_weighted_mode=1 and adds a full-history average output
+#   without replacing the sampled history-level path output. Each outcome is
+#   written twice: *_wted uses the outcome-specific CPS count, while
+#   *_non_wted gives every eligible history_id equal weight. included uses every
+#   history; tier_raw and avg_copay_amt use only history-NDC pairs included in
+#   every required cohort quarter. tier_raw uses n_path and copay uses
+#   n_path_copay, whose zero weights naturally leave copay out of both means.
 #   Averaged files omit history_id and path weights and are written under the
 #   path_average subdirectory.
 # prefer:
@@ -842,8 +844,14 @@ def load_quarter_event_sources() -> QuarterEventSources:
         "id", "event_type", "firm_type", "year", "quarter", "req1"
     }
     candidate_required = {
-        "idA", "idB", "event_type", "event_year", "event_quarter",
-        stay_column, "requirement1",
+        "idA",
+        "idB",
+        "event_type",
+        "idA_event_time_id",
+        "idB_event_time_id",
+        stay_column,
+        "requirement1_A",
+        "requirement1_B",
     }
     for path, data, required in (
         (movement_path, movement, movement_required),
@@ -877,15 +885,14 @@ def load_quarter_event_sources() -> QuarterEventSources:
             candidates[column], candidate_path.name
         )
     candidates["event_type"] = normalize_text(candidates["event_type"])
-    candidates["event_year"] = pd.to_numeric(
-        candidates["event_year"], errors="raise"
-    ).astype("int16")
-    candidates["event_quarter"] = pd.to_numeric(
-        candidates["event_quarter"], errors="raise"
-    ).astype("int8")
-    if not candidates["event_quarter"].isin((1, 2, 3, 4)).all():
-        raise ValueError(f"{candidate_path.name} has invalid event quarters.")
-    for column in (stay_column, "requirement1"):
+    for side in TREATMENT_GROUPS:
+        time_column = f"id{side}_event_time_id"
+        time_ids = pd.to_numeric(
+            candidates[time_column], errors="raise"
+        ).astype("int64")
+        candidates[f"event_year_{side}"] = (time_ids // 4).astype("int16")
+        candidates[f"event_quarter_{side}"] = (time_ids % 4 + 1).astype("int8")
+    for column in (stay_column, "requirement1_A", "requirement1_B"):
         candidates[column] = pd.to_numeric(
             candidates[column], errors="raise"
         ).astype("int8")
@@ -1536,16 +1543,6 @@ def build_samples(
                     + "Q"
                     + movement["quarter"].astype(str)
                 )
-                counterpart_condition = (
-                    candidate["event_type"].eq(event_type)
-                    & candidate["event_year"].eq(cohort_year)
-                    & candidate["event_quarter"].eq(cohort_quarter)
-                    & candidate[stay_column].eq(1)
-                    & candidate["requirement1"].eq(1)
-                )
-                current_pairs = candidate.loc[counterpart_condition]
-                counterpart_a = set(current_pairs["idA"].dropna().astype(str))
-                counterpart_b = set(current_pairs["idB"].dropna().astype(str))
             for side in TREATMENT_GROUPS:
                 if quarter:
                     treated_condition = (
@@ -1565,6 +1562,20 @@ def build_samples(
                     )
                     pure_event = set(
                         movement.loc[pure_condition, "id"].dropna().astype(str)
+                    )
+                    counterpart_condition = (
+                        candidate["event_type"].eq(event_type)
+                        & candidate[f"event_year_{side}"].eq(cohort_year)
+                        & candidate[f"event_quarter_{side}"].eq(cohort_quarter)
+                        & candidate[stay_column].eq(1)
+                        & candidate[f"requirement1_{side}"].eq(1)
+                    )
+                    current_pairs = candidate.loc[counterpart_condition]
+                    counterpart_a = set(
+                        current_pairs["idA"].dropna().astype(str)
+                    )
+                    counterpart_b = set(
+                        current_pairs["idB"].dropna().astype(str)
                     )
                     counterpart_only = (
                         counterpart_b - counterpart_a
@@ -2329,18 +2340,29 @@ PATH_AVERAGE_WEIGHTS = {
     "avg_copay_amt": "n_path_copay",
 }
 PATH_AVERAGE_INTENSIVE_OUTCOMES = {"tier_raw", "avg_copay_amt"}
+PATH_AVERAGE_SUFFIXES = ("wted", "non_wted")
+
+
+def path_average_output_columns(outcome: str) -> list[str]:
+    """Return weighted and equal-path output columns for one outcome."""
+    return [f"{outcome}_{suffix}" for suffix in PATH_AVERAGE_SUFFIXES]
 
 
 def path_average_columns(event_type: str, quarter: int) -> list[str]:
-    """Describe the NDC-company-quarter output after averaging complete paths."""
+    """Describe weighted and equal-path NDC-company-quarter output columns."""
     source = quarterly_path_panel_columns(event_type) if quarter else path_panel_columns()
     retained = {
         "data_cohort", "data_cohort_year", "data_cohort_quarter",
         "data_cohort_qtime", "ndc", "id", "boardname", "year", "quarter",
         "treated_a", "treated_b", "sample_a", "sample_b",
-        *PATH_AVERAGE_WEIGHTS,
     }
-    return [column for column in source if column in retained or column.startswith("event_")]
+    columns: list[str] = []
+    for column in source:
+        if column in PATH_AVERAGE_WEIGHTS:
+            columns.extend(path_average_output_columns(column))
+        elif column in retained or column.startswith("event_"):
+            columns.append(column)
+    return columns
 
 
 def reduce_path_average_totals(
@@ -2362,10 +2384,15 @@ def accumulate_path_average(
     columns: list[str],
     quarter: int,
 ) -> pd.DataFrame:
-    """Accumulate weighted sums across paths and CSV chunks without averaging means."""
+    """Accumulate weighted and equal-path sums without averaging intermediate means."""
     keys = ["ndc", "id" if quarter else "boardname", "year", "quarter"]
+    outcome_columns = {
+        column
+        for outcome in PATH_AVERAGE_WEIGHTS
+        for column in path_average_output_columns(outcome)
+    }
     constants = [
-        column for column in columns if column not in {*keys, *PATH_AVERAGE_WEIGHTS}
+        column for column in columns if column not in {*keys, *outcome_columns}
     ]
     values = data[[*keys, *constants]].copy()
     for outcome, weight_column in PATH_AVERAGE_WEIGHTS.items():
@@ -2393,10 +2420,16 @@ def accumulate_path_average(
                     f"Examples:\n{examples}"
                 )
             valid &= eligible
-        values[f"__path_average_{outcome}_numerator"] = (
+        values[f"__path_average_{outcome}_wted_numerator"] = (
             data[outcome].where(valid, 0) * weight.where(valid, 0)
         )
-        values[f"__path_average_{outcome}_denominator"] = weight.where(valid, 0)
+        values[f"__path_average_{outcome}_wted_denominator"] = weight.where(valid, 0)
+        values[f"__path_average_{outcome}_non_wted_numerator"] = data[outcome].where(
+            valid, 0
+        )
+        values[f"__path_average_{outcome}_non_wted_denominator"] = valid.astype(
+            "int8"
+        )
     current = reduce_path_average_totals(values, keys, constants)
     if previous is None:
         return current
@@ -2406,14 +2439,17 @@ def accumulate_path_average(
 
 
 def finish_path_average(totals: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    """Divide each outcome's weighted sum by its own nonmissing-value weight."""
+    """Divide weighted and equal-path sums by their corresponding denominators."""
     result = totals.copy()
     for outcome in PATH_AVERAGE_WEIGHTS:
-        denominator = result[f"__path_average_{outcome}_denominator"]
-        result[outcome] = (
-            result[f"__path_average_{outcome}_numerator"]
-            / denominator.where(denominator.gt(0))
-        )
+        for suffix in PATH_AVERAGE_SUFFIXES:
+            denominator = result[
+                f"__path_average_{outcome}_{suffix}_denominator"
+            ]
+            result[f"{outcome}_{suffix}"] = (
+                result[f"__path_average_{outcome}_{suffix}_numerator"]
+                / denominator.where(denominator.gt(0))
+            )
     return result[columns]
 
 

@@ -45,6 +45,9 @@ from typing import Dict, Iterable, List, Mapping, Sequence, Set, Tuple
 import numpy as np
 import pandas as pd
 
+# ========================== USER CONFIG ==========================
+# Select membership switches; ieoc_ref=1 requires ever_board=1.
+# Input/output roots and the existing statistical settings are configured below.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 INTERIM_DIR = PROJECT_ROOT / "InterimData"
 RAW_NA_DIR = Path("D:/")
@@ -930,7 +933,7 @@ def consolidate(frame: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def expand(frame: pd.DataFrame) -> pd.DataFrame:
+def expand(frame: pd.DataFrame, ever_board: int = 0) -> pd.DataFrame:
     """Expand with vectorized repeats and a hard upper cutoff of 2026Q3."""
     frame = frame.copy()
     frame["leader_tier"] = [
@@ -939,7 +942,8 @@ def expand(frame: pd.DataFrame) -> pd.DataFrame:
             ["rolename", "brdposition", "seniority"]
         ].itertuples(index=False, name=None)
     ]
-    frame = frame[frame.leader_tier.ne("excluded") & frame.rolename.ne("")].copy()
+    if ever_board == 0:
+        frame = frame[frame.leader_tier.ne("excluded") & frame.rolename.ne("")].copy()
     frame["role_priority"] = frame.leader_tier.map(TIER_PRIORITY).astype(int)
     starts = np.maximum(frame.start_period, SAMPLE_START * 4)
     ends = np.minimum(frame.end_period, CUTOFF_PERIOD)
@@ -986,14 +990,23 @@ def finalize(candidates: pd.DataFrame, bp, display, info) -> pd.DataFrame:
 
 
 def append_baseline(
-    current: pd.DataFrame, bp, display, info
+    current: pd.DataFrame, bp, display, info, ieoc_ref: int = 0
 ) -> tuple[pd.DataFrame, int]:
-    """Append observed director-year membership without changing spell profiles."""
+    """Append annual BP evidence, optionally respecting IE/OC coverage by year."""
+    if ieoc_ref not in (0, 1):
+        raise ValueError("ieoc_ref must be 0 or 1")
     board = build_board_candidates(bp, current, display, info)
     board = board[board.year.between(SAMPLE_START, CUTOFF_YEAR)].copy()
     board = board[(board.year * 4 + board.quarter - 1).le(CUTOFF_PERIOD)].copy()
     key = time_key()
     board = board.drop_duplicates(key)
+    if ieoc_ref == 1:
+        year_key = ["DirectorID", "company_key", "year"]
+        ieoc_years = pd.MultiIndex.from_frame(current[year_key].drop_duplicates())
+        ieoc_quarters = pd.MultiIndex.from_frame(current[key].drop_duplicates())
+        has_ieoc_in_year = pd.MultiIndex.from_frame(board[year_key]).isin(ieoc_years)
+        covered_by_ieoc = pd.MultiIndex.from_frame(board[key]).isin(ieoc_quarters)
+        board = board.loc[~has_ieoc_in_year | covered_by_ieoc].copy()
     enrich = current[key + TRACE + ["RawCompanyID"]]
     board = board.merge(enrich, on=key, how="left", validate="one_to_one")
     board["RawCompanyID"] = board.RawCompanyID.fillna(board.CompanyID).astype(int)
@@ -1080,8 +1093,17 @@ def write_roster(roster: pd.DataFrame, stem: str, output_dir: Path) -> None:
     print(f"Saved {len(output):,} board-or-continuity rows: {path}", flush=True)
 
 
-def build(interim_dir: Path, raw_dir: Path, output_dir: Path) -> None:
+def build(
+    interim_dir: Path,
+    raw_dir: Path,
+    output_dir: Path,
+    ever_board: int = 0,
+    ieoc_ref: int = 0,
+) -> None:
     """Reproduce both complete T2 quarter pipelines before final projection."""
+    from ever_board_config import validate_policies
+
+    validate_policies(ever_board, ieoc_ref)
     bp = pd.read_stata(interim_dir / "boardex_pharma.dta")
     canonical, display, ids, info = build_company_info(bp)
     names, sources, _ = build_name_mapping(
@@ -1137,8 +1159,8 @@ def build(interim_dir: Path, raw_dir: Path, output_dir: Path) -> None:
             ).any()
         frequency_rows = selected[selected.quarter_interval_valid.eq(1)]
         spells = consolidate(frequency_rows)
-        current = current_roster(expand(spells), bp, display, info)
-        roster, baseline_rows = append_baseline(current, bp, display, info)
+        current = current_roster(expand(spells, ever_board), bp, display, info)
+        roster, baseline_rows = append_baseline(current, bp, display, info, ieoc_ref)
         validate_roster(roster, variant, len(canonical))
         assert roster.company_key.isin(canonical).all()
         key = time_key()
@@ -1169,10 +1191,23 @@ def main() -> None:
     parser.add_argument("--interim-dir", type=Path, default=INTERIM_DIR)
     parser.add_argument("--raw-na-dir", type=Path, default=RAW_NA_DIR)
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    from ever_board_config import (
+        EVER_BOARD_DEFAULT,
+        IEOC_REF_DEFAULT,
+        membership_path,
+        validate_policies,
+    )
+
+    parser.add_argument("--ever-board", "--ever_board", type=int, choices=(0, 1), default=EVER_BOARD_DEFAULT)
+    parser.add_argument("--ieoc-ref", "--ieoc_ref", type=int, choices=(0, 1), default=IEOC_REF_DEFAULT)
     args = parser.parse_args()
+    try:
+        validate_policies(args.ever_board, args.ieoc_ref)
+    except ValueError as error:
+        parser.error(str(error))
     interim_dir = args.interim_dir.resolve()
     raw_dir = args.raw_na_dir.resolve()
-    output_dir = args.output_dir.resolve()
+    output_dir = membership_path(args.output_dir.resolve(), args.ever_board, args.ieoc_ref)
     inputs = [
         interim_dir / "boardex_pharma.dta",
         interim_dir / "cro_bname_boardex_within.dta",
@@ -1186,7 +1221,7 @@ def main() -> None:
     if output_dir in {interim_dir, raw_dir}:
         parser.error("The output directory must differ from both input directories.")
     output_dir.mkdir(parents=True, exist_ok=True)
-    build(interim_dir, raw_dir, output_dir)
+    build(interim_dir, raw_dir, output_dir, args.ever_board, args.ieoc_ref)
 
 
 if __name__ == "__main__":

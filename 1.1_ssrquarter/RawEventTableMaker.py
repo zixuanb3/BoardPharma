@@ -14,7 +14,9 @@ Process:
        consecutive quarters for still, not, and dissolution candidates;
        allow not entries in the departure quarter or up to late quarters later.
     4. Calculate side-specific interlock conditions using req1_spec and stay
-       using stay_spec. Keep all candidates, including failed conditions,
+       using stay_spec. Dissolution requires the triggering director to serve
+       at both companies for 0, 4, or 8 prior quarters in new, origin, or pre2.
+       Keep all candidates, including failed conditions,
        deduplicate and sort, then write the eleven selected candidate columns.
 
 Input:
@@ -42,21 +44,25 @@ from pathlib import Path
 import pandas as pd
 
 
+# ========================== USER CONFIG ==========================
+# Select membership switches; ieoc_ref=1 requires ever_board=1.
+# Input/output roots and the existing statistical settings are configured below.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 INPUT_DIR = PROJECT_ROOT / "data" / "ssrquarter"
 OUTPUT_DIR = INPUT_DIR / "event_tables"
-VARIANTS = ("imputed_yearquarter", "drop_sentinel_yearquarter")
+VARIANTS = ("drop_sentinel_yearquarter",)
+# VARIANTS = ("imputed_yearquarter", "drop_sentinel_yearquarter")
 RUN_CONFIG = {
-    "stay_x_years": 2,
+    "ever_board": 1,  # 0: legacy roster, 1: all-role continuity.
+    "ieoc_ref": 1,  # 0: baseline BP expansion, 1: use IE/OC coverage.
     "late": 3,
-    "req1_spec": "new",
-    "stay_spec": "new",
+    "req1_spec": "new",  # Company-pair interlock rule: new or origin.
+    # Dissolution: new waives stay; origin/pre2 require 4/8 prior quarters.
+    "stay_spec": "pre2",
 }
-# Windows remain fixed at joins T..T+7 and origin dissolution T-4..T-1.
-# Changing stay_x_years requires editing these windows and the output column;
-# another value is rejected rather than silently changing the specified rules.
+# Joins use T..T+7. Dissolution looks back by the selected stay rule.
 FORWARD_QUARTERS = 8
-BACKWARD_QUARTERS = 4
+DISSOLUTION_STAY_QUARTERS = {"new": 0, "origin": 4, "pre2": 8}
 CANDIDATE_COLUMNS = [
     "event_type",
     "DirectorID",
@@ -147,8 +153,11 @@ def build_candidates(
     """Build the three event types with independent requirement/stay settings."""
     if isinstance(late, bool) or not isinstance(late, int) or late < 0:
         raise ValueError("late must be a non-negative integer")
-    if req1_spec not in {"new", "origin"} or stay_spec not in {"new", "origin"}:
-        raise ValueError("req1_spec and stay_spec must be new or origin")
+    if req1_spec not in {"new", "origin"}:
+        raise ValueError("req1_spec must be new or origin")
+    if stay_spec not in DISSOLUTION_STAY_QUARTERS:
+        raise ValueError("stay_spec must be new, origin, or pre2")
+    prior_quarters = DISSOLUTION_STAY_QUARTERS[stay_spec]
     rows: list[tuple[object, ...]] = []
 
     def flags(firm_a: str, firm_b: str, time: int) -> tuple[int, int, int]:
@@ -185,14 +194,11 @@ def build_candidates(
             )
 
         if event_type == "interlock_dissolution":
-            stay = (
-                1
-                if stay_spec == "new"
-                else int(
-                    all(
-                        {firm_a, firm_b}.issubset(history.get(time, set()))
-                        for time in range(a_time - BACKWARD_QUARTERS, a_time)
-                    )
+            # With no required quarters, new passes the stay condition.
+            stay = int(
+                all(
+                    {firm_a, firm_b}.issubset(history.get(time, set()))
+                    for time in range(a_time - prior_quarters, a_time)
                 )
             )
         else:
@@ -288,22 +294,32 @@ def main() -> None:
         default=RUN_CONFIG["req1_spec"],
     )
     parser.add_argument(
-        "--stay-spec", choices=("new", "origin"), default=RUN_CONFIG["stay_spec"]
+        "--stay-spec", choices=tuple(DISSOLUTION_STAY_QUARTERS),
+        default=RUN_CONFIG["stay_spec"],
     )
     parser.add_argument(
         "--all-configurations",
         action="store_true",
-        help="Run late={0,3}, req1_spec/stay_spec={new,origin}.",
+        help="Run late={0,3}, req1_spec={new,origin}, stay_spec={new,origin,pre2}.",
     )
+    from ever_board_config import (
+        membership_path,
+        validate_policies,
+    )
+
+    parser.add_argument("--ever-board", "--ever_board", type=int, choices=(0, 1), default=RUN_CONFIG["ever_board"])
+    parser.add_argument("--ieoc-ref", "--ieoc_ref", type=int, choices=(0, 1), default=RUN_CONFIG["ieoc_ref"])
     args = parser.parse_args()
-    if RUN_CONFIG["stay_x_years"] != 2:
-        raise ValueError(
-            "Changing stay_x_years requires changing the fixed windows and output column."
-        )
+    try:
+        validate_policies(args.ever_board, args.ieoc_ref)
+    except ValueError as error:
+        parser.error(str(error))
+    args.input_dir = membership_path(args.input_dir, args.ever_board, args.ieoc_ref)
+    args.output_dir = membership_path(args.output_dir, args.ever_board, args.ieoc_ref)
     if args.late < 0:
         parser.error("--late must be non-negative")
     configurations = (
-        list(product((0, 3), ("new", "origin"), ("new", "origin")))
+        list(product((0, 3), ("new", "origin"), DISSOLUTION_STAY_QUARTERS))
         if args.all_configurations
         else [(args.late, args.req1_spec, args.stay_spec)]
     )

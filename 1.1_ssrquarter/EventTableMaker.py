@@ -10,8 +10,8 @@ Process:
        own event time and requirement1_A or requirement1_B.
     3. Set req0=1, req1=(stay==1) for all three event types, and
        req2=(req1==1 AND the corresponding requirement1_A/B==1).
-       Dissolution also uses stay: upstream new sets it to 1; upstream origin
-       checks the triggering person's joint A/B service in T-4 through T-1.
+       Dissolution stay comes from upstream: new waives it, and origin/pre2
+       check the triggering person's joint A/B service over 4/8 prior quarters.
     4. Collapse records by company, year, quarter, event type, and A/B identity
        using max; preserve code new's output columns and sorting order.
 
@@ -26,7 +26,8 @@ Output:
         req1_<req1_spec>/stay_<stay_spec>/movement_table.csv
     Columns: BoardName, year, quarter, event_type, firm_type, req0, req1, req2.
     Existing output files are not overwritten. --all-configurations processes
-    late={0,3} and req1_spec/stay_spec={new,origin}, for both roster variants.
+    late={0,3}, req1_spec={new,origin}, and stay_spec={new,origin,pre2},
+    for both roster variants.
 """
 
 from __future__ import annotations
@@ -38,10 +39,21 @@ from pathlib import Path
 import pandas as pd
 
 
+# ========================== USER CONFIG ==========================
+# Select membership switches; ieoc_ref=1 requires ever_board=1.
+# Input/output roots and the existing statistical settings are configured below.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EVENT_TABLE_DIR = PROJECT_ROOT / "data" / "ssrquarter" / "event_tables"
-VARIANTS = ("imputed_yearquarter", "drop_sentinel_yearquarter")
-RUN_CONFIG = {"late": 3, "req1_spec": "new", "stay_spec": "new"}
+VARIANTS = ("drop_sentinel_yearquarter",)
+# Select the upstream stay rule: new, origin, or pre2.
+RUN_CONFIG = {
+    "ever_board": 1,  # 0: legacy roster, 1: all-role continuity.
+    "ieoc_ref": 1,  # 0: baseline BP expansion, 1: use IE/OC coverage.
+    "late": 3,
+    "req1_spec": "new",
+    "stay_spec": "new",
+}
+STAY_SPECS = ("new", "origin", "pre2")
 REQUIREMENT_COLUMNS = ["req0", "req1", "req2"]
 GROUP_COLUMNS = ["BoardName", "year", "quarter", "event_type", "firm_type"]
 SORT_COLUMNS = ["event_type", "firm_type", "BoardName", "year", "quarter"]
@@ -148,17 +160,30 @@ def main() -> None:
         default=RUN_CONFIG["req1_spec"],
     )
     parser.add_argument(
-        "--stay-spec", choices=("new", "origin"), default=RUN_CONFIG["stay_spec"]
+        "--stay-spec", choices=STAY_SPECS, default=RUN_CONFIG["stay_spec"]
     )
     parser.add_argument(
         "--all-configurations", action="store_true",
-        help="Run late={0,3}, req1_spec/stay_spec={new,origin}.",
+        help="Run late={0,3}, req1_spec={new,origin}, stay_spec={new,origin,pre2}.",
     )
+    from ever_board_config import (
+        membership_path,
+        validate_policies,
+    )
+
+    parser.add_argument("--ever-board", "--ever_board", type=int, choices=(0, 1), default=RUN_CONFIG["ever_board"])
+    parser.add_argument("--ieoc-ref", "--ieoc_ref", type=int, choices=(0, 1), default=RUN_CONFIG["ieoc_ref"])
     args = parser.parse_args()
+    try:
+        validate_policies(args.ever_board, args.ieoc_ref)
+    except ValueError as error:
+        parser.error(str(error))
+    args.input_dir = membership_path(args.input_dir, args.ever_board, args.ieoc_ref)
+    args.output_dir = membership_path(args.output_dir, args.ever_board, args.ieoc_ref)
     if args.late < 0:
         parser.error("--late must be non-negative")
     configurations = (
-        list(product((0, 3), ("new", "origin"), ("new", "origin")))
+        list(product((0, 3), ("new", "origin"), STAY_SPECS))
         if args.all_configurations
         else [(args.late, args.req1_spec, args.stay_spec)]
     )

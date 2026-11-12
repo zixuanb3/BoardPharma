@@ -11,8 +11,9 @@ Process:
 2. Read the stay and requirement flags already calculated by RawMaker.
    Interlock-based requirement1 is in the candidates, so this script does
    not reread firm_interlock_panel.
-3. Expand movement candidates to A-side and B-side firm records, retaining
-   event year and, in quarterly mode, event quarter.
+3. Expand movement candidates to A-side and B-side firm records. Quarterly
+   records use each side's own event time so delayed to_B_not_in_A entries put
+   A in the departure quarter and B in the actual entry quarter.
 4. Calculate req0=stay and req1=stay AND requirement1 at the candidate level.
    Annual mode also calculates req2; quarterly mode neither requires nor
    exports requirement2 or req2 fields.
@@ -137,30 +138,69 @@ def build_event_table(
     stay_column = stay_columns[0]
 
     if table_type == "movement":
-        required = set(MOVEMENT_REQUIRED_COLUMNS)
-        if quarter:
-            required -= {"FirmA", "FirmB", "requirement2_A", "requirement2_B"}
-            required.update({"idA", "idB", "event_quarter"})
+        required = (
+            {
+                "event_type",
+                "idA",
+                "idB",
+                "idA_event_time_id",
+                "idB_event_time_id",
+                "requirement1_A",
+                "requirement1_B",
+            }
+            if quarter
+            else set(MOVEMENT_REQUIRED_COLUMNS)
+        )
         missing = sorted({*required, stay_column} - set(candidates.columns))
         if missing:
             raise ValueError(f"{source_name} is missing columns: {missing}")
 
         # Keep only the three movement-style events.
         movement = candidates.loc[candidates["event_type"].isin(MOVEMENT_EVENT_TYPES)]
-        shared_columns = ["event_type", "event_year", stay_column, "requirement1"]
-        if quarter:
-            shared_columns.append("event_quarter")
         sides = []
         for side in ("A", "B"):
             firm_column = f"id{side}" if quarter else f"Firm{side}"
-            columns = [*shared_columns, firm_column]
-            if not quarter:
-                columns.append(f"requirement2_{side}")
-            rows = movement[columns].rename(columns={
-                "event_year": "year", "event_quarter": "quarter",
-                stay_column: "stay", firm_column: "id" if quarter else "BoardName",
-                f"requirement2_{side}": "requirement2",
-            })
+            if quarter:
+                time_column = f"id{side}_event_time_id"
+                rows = movement[
+                    [
+                        "event_type",
+                        stay_column,
+                        time_column,
+                        f"requirement1_{side}",
+                        firm_column,
+                    ]
+                ].rename(
+                    columns={
+                        stay_column: "stay",
+                        time_column: "time_id",
+                        f"requirement1_{side}": "requirement1",
+                        firm_column: "id",
+                    }
+                ).copy()
+                time_ids = pd.to_numeric(rows.pop("time_id"), errors="raise").astype(
+                    "int64"
+                )
+                rows["year"] = time_ids // 4
+                rows["quarter"] = time_ids % 4 + 1
+            else:
+                rows = movement[
+                    [
+                        "event_type",
+                        "event_year",
+                        stay_column,
+                        "requirement1",
+                        firm_column,
+                        f"requirement2_{side}",
+                    ]
+                ].rename(
+                    columns={
+                        "event_year": "year",
+                        stay_column: "stay",
+                        firm_column: "BoardName",
+                        f"requirement2_{side}": "requirement2",
+                    }
+                )
             rows["firm_type"] = side
             sides.append(rows)
 

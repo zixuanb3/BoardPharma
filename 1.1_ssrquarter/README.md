@@ -1,5 +1,35 @@
 # Quarterly SSR Workflow
 
+## Membership and regression-sample switches
+
+Every Python entry point accepts `--ever-board 0|1` and `--ieoc-ref 0|1`.
+`ever_board=1` expands all usable roles before forward board continuity.
+`ieoc_ref=1` requires `ever_board=1`: within a
+person-company-year with usable IE/OC coverage, BP labels covered quarters only;
+years without usable IE/OC retain all valid BP quarters.
+
+All Python outputs use only these membership policies, so event, balance,
+treatment, cohort, and ATC3-sharing definitions do not depend on regression
+outlier removal. The Stata entry point exposes `rule_outliers_out` and
+`ruleout_threshold`: each listed threshold is run separately. With
+`threshold_mode=price10`, each saved cohort uses
+`(price1 max/min)/(price0 max/min)`; with `threshold_mode=price1`, it uses only
+`price1 max/min`. Both scores are calculated by BoardName-product over that
+cohort file's complete observed period, and every row of a pair whose score
+exceeds the threshold is removed. A cohort with no treated observations after removal is
+not stacked. Each threshold's ruleout results are written below a separate
+`r1/threshold_<value>` results directory; cohort inputs always come from the
+unfiltered membership path. Price1-mode results add a
+`threshold_mode_price1` subdirectory, while the existing price10 paths remain
+unchanged. When `outlier_treatment=none`, results are placed
+one level lower under `outlier_none` so they cannot be mistaken for or skipped
+because of existing winsorized outputs. For the
+six-page reference comparison,
+`1107/ssr_event_study/_support/run_ever_board.py` runs all downstream configurations,
+prepares explicit treated-positive cohort lists, estimates the 96 quarterly
+price1 specifications, and reuses the original report layout and annual panels.
+Run `build_ssr_roster.py --ever-board 1` before that runner.
+
 This directory contains the dedicated quarterly SSR robustness workflow. It starts from BoardEx board, individual-employment, and organization-composition records; builds two alternative quarterly company rosters; reconstructs quarterly director-movement events; merges those events into SSR firm-product outcomes; and produces balanced cohort files, diagnostics, and `did_imputation` event-study results.
 
 The workflow is separate from the general annual/quarterly programs in `1_data_prep/`, `2_stats/`, and `3_event_study/`. All generated data and results are stored under an `ssrquarter` subtree so that the specification variants remain separate from the main SSR outputs.
@@ -59,7 +89,7 @@ Every output path records the choices that determine its sample and event defini
 | Roster variant | `imputed_yearquarter`, `drop_sentinel_yearquarter` | Retain the imputed quarterly date treatment or exclude records with the configured sentinel/year-only date flags. |
 | Late-entry rule | `late_0`, `late_3` | Allow a `to_B_not_in_A` entry only in the departure quarter or up to three quarters later. |
 | req1 rule | `req1_new`, `req1_origin` | Select the current or origin-side upstream requirement-1 construction. |
-| Stay rule | `stay_new`, `stay_origin` | Select the current or origin-based two-year persistence rule used by req1 and req2. |
+| Stay rule | `stay_new`, `stay_origin`, `stay_pre2` | For dissolution, `new` waives the stay check. `origin` and `pre2` require the triggering director to serve at both companies in each of the four or eight prior quarters, respectively. Both joining events use eight quarters at the destination, starting in the joining quarter. |
 | Sharing-time rule | `share_time_new`, `share_time_origin` | Compare ATC3 portfolios at the event quarter (`new`) or over T-2 through T+1 (`origin`). |
 | Treatment side | `A`, `B` | Assign treatment to the origin or destination side of the directional movement event. |
 | Event | `to_B_not_in_A`, `to_B_still_in_A`, `interlock_dissolution` | Select the quarterly director-movement event. |
@@ -94,20 +124,19 @@ The cohort builders cover 2009Q1 through 2018Q4. A cohort file is omitted when t
 
 ## 5. Run Order
 
-Run the Python programs from the repository's `codes` directory. `-B` prevents Python bytecode and `__pycache__` creation.
+Run these scripts in order from VS Code using the settings in each `USER CONFIG` block. The current settings reuse the existing drop-sentinel roster under `ever_board_1/ieoc1` and select `late_3 / req1_new / stay_pre2 / share_time_new`. `-B` prevents Python bytecode and `__pycache__` creation when running from the terminal.
 
 ```powershell
-python -B 1.1_ssrquarter/build_ssr_roster.py
-python -B 1.1_ssrquarter/RawEventTableMaker.py --all-configurations
-python -B 1.1_ssrquarter/EventTableMaker.py --all-configurations
-python -B 1.1_ssrquarter/PanelMaker_FirmLevel.py --all-configurations
-python -B 1.1_ssrquarter/CohortPanelMaker.py --all-configurations
+python -B 1.1_ssrquarter/RawEventTableMaker.py
+python -B 1.1_ssrquarter/EventTableMaker.py
+python -B 1.1_ssrquarter/PanelMaker_FirmLevel.py
+python -B 1.1_ssrquarter/CohortPanelMaker.py
 python -B 1.1_ssrquarter/CohortDistributionPlotter.py
 ```
 
 `build_ssr_roster.py` requires the BP and SSR name-mapping files under `InterimData/` and, by default, the IE and OC CSV files under `D:/`. Its command-line options can point to alternative input and output roots.
 
-The four middle Python programs process one default configuration unless `--all-configurations` is supplied. The distribution plotter uses the `RUN_CONFIG` block at the top of the file. The Stata program also uses explicit configuration locals and manually recorded cohort lists; review those settings before running it.
+The four middle Python programs process one default configuration unless `--all-configurations` is supplied. To generate `pre2` only, pass `--stay-spec pre2` to each of the four programs in order. The distribution plotter accepts the same option and selects the remaining settings from `RUN_CONFIG`. To select `pre2` in Stata, set `local stay_specs pre2` or pass `pre2` as the fourth do-file argument.
 
 Run `did_imputation_event_study.do` only after the selected cohort files exist and the required Stata packages are installed.
 
@@ -118,4 +147,4 @@ Run `did_imputation_event_study.do` only after the selected cohort files exist a
 - `PanelMaker_FirmLevel.py` uses the arithmetic means of the source `price1` and `price0` fields; it does not reconstruct prices from revenue and quantity.
 - `CohortPanelMaker.py` reads the current firm panels and movement-event files directly. It does not substitute previously saved cohort files.
 - `CohortDistributionPlotter.py` reports the definitions already stored in the cohorts. It does not recalculate treatment, balance, or ATC3-sharing status.
-- The Stata program estimates only the cohorts listed in its configuration block; it does not scan directories or silently substitute another cohort list.
+- Stata uses the recorded cohort list when one is provided. For `pre2` without a manual list, it uses saved 2009Q1–2018Q4 files in the selected `stay_pre2` directory and skips cohorts with no treated observations.

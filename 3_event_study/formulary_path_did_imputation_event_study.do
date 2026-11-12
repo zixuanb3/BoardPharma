@@ -1,69 +1,98 @@
-version 18.0
-clear all
-set more off
-set trace off
 // ================================================================
 // Purpose:
 // Estimate direction-specific formulary-by-drug did_imputation event studies
-// from either history-level path panels or path-averaged panels.
+// from complete-history path-average panels.
 //
 // Process:
-// 1. Read each event's selected cohort CSVs once, merge original-time NDC
-//    first-seen metadata, and apply the selected cohort-relative cutoff.
+// 1. Read each event-direction's selected cohort-average CSVs. First-seen
+//    eligibility has already been applied by PathAvgPanelMaker.py.
 // 2. Select A or B through sample_a/b and freeze event-specific ATC3 sharing
 //    at the cohort anchor quarter for the full stacked unit history.
 // 3. Build panel-specific NDC identifiers; winsorize average copay at p95.
 // 4. Run did_imputation with hetby(ATC3 sharing), firm clustering, horizons
-//    0/7, and three pretrend coefficients. Path panels use frequency weights;
-//    path-averaged panels are already aggregated and run without weights.
+//    0/7, and three pretrend coefficients. Upstream averages run without
+//    additional Stata weights.
 // 5. Export dynamic coefficients, autosample statistics, logs, and figures.
 //
 // Input:
-// - D:/BoardPharma/data/formulary_path_cohort_data/event/req1/Not/
-//   shift_q{0|1}/{plan|state|county}/
-//   {event}_path_quarter_cohort_{year}.csv
-// - quarter_event=1: data/formulary_path_cohort_data_quarter/event/req1/Not/
-//   shift_q{0|1}/{plan|state|county}/
+// - data/formulary_path_cohort_data_quarter/event/req1/Not/
+//   shift_q{0|1}/plan/seen_y{offset}_event_q/path_average/
 //   {event}_path_quarter_cohort_{year}Q{quarter}.csv
-//   panel=path_avg reads the matching files from the path_average subdirectory.
-// - data/formulary_metadata/ndc_first_seen[_quarter][_shift_q{N}].csv,
-//   matching the selected event mode and formulary time shift
+// - no_spillover=1 instead reads direction-specific files from
+//   seen_y{offset}_event_q/path_average_no_spillover/{A|B}/.
 //
 // Output:
 // - csv/formulary_path/es/{sample}/{spec}/dynamic.csv
 // - csv/formulary_path/es/{sample}/{spec}/samples.csv
+// - csv/formulary_path/es/{sample}/{spec}/cohort_samples.csv
 // - figures/formulary_path/es/{sample}/{spec}/{event}/{side}/{target}/plot.png
 // - logs/formulary_path/es/{sample}/{spec}/{event}/{side}/{target}/run.log
 // ================================================================
 
-* ================= user config =================
-local events to_B_still_in_A to_B_not_in_A
-* interlock_dissolution
+version 18.0
+clear all
+set more off
+set trace off
+
+* ========================== USER CONFIG ==========================
+* events:
+* - Movement-event families to estimate. Every name must match the upstream
+*   PathAvgPanelMaker filename and event-column conventions below.
+local events interlock_dissolution to_B_still_in_A to_B_not_in_A
+
+* treatment_groups:
+* - Directions to estimate and their order. Allowed values are A and B.
 local treatment_groups B A
-local targets included avg_copay_amt
-local panel path_avg
-* path path_avg
-* The quarterly path panel stores copay as avg_copay_amt. tierA is not emitted
-* by PlanPanelMaker's compact quarterly path schema. Distinct history_id paths
-* are sampled upstream; path_avg instead uses the corresponding mean panels.
-* 1 uses event-quarter cohorts; 0 retains the event-year cohort design.
-local quarter_event 1
-local outlier_treatment winsorize
-local outlier_percentile p95
+
+* targets:
+* - Any subset of the six upstream path-average outcomes is allowed:
+*   included, tier_raw, and avg_copay_amt, each with wted/non_wted versions.
+local targets included_wted included_non_wted tier_raw_wted tier_raw_non_wted avg_copay_amt_wted avg_copay_amt_non_wted
+
+* exclude:
+* - 0 keeps every upstream drug unit.
+* - 1, for included outcomes only, drops a company-NDC-cohort unit when its
+*   selected included outcome equals zero in any cohort-window quarter.
+local exclude 1
+
+* no_spillover:
+* - 0 reads the combined baseline path_average directory.
+* - 1 reads direction-specific A/B path_average_no_spillover directories.
+* - This switch is independent of exclude; all four combinations are valid.
+local no_spillover 1
+
+* Input-build identifiers:
+* - These settings select an existing PathAvgPanelMaker build. They do not
+*   recreate or re-filter the Python data inside Stata.
+* - analysis_level has only one allowed value: plan. State and county path
+*   averages are not implemented and will cause the validation below to stop.
+local analysis_level plan
+local formulary_time_shift_quarters 1
+local first_seen_year_offset -1
 local req 1
 local control not
 local include_eventpair 0
 local personnel_definition narrow
 local large_sample 1
-local analysis_level plan
-local formulary_time_shift_quarters 1
-local first_seen_year_offset -1
-local first_seen_quarter 1
+
+* Outcome transformation:
+* - Average copay is winsorized at its unweighted p95. The validation below
+*   currently requires this pair of settings.
+local outlier_treatment winsorize
+local outlier_percentile p95
+
+* Regression specification:
+* - atc, fe_level, and cluster_level are validated against the maintained
+*   design. did_horizons and did_pretrends determine reported event time.
 local atc atc3
 local fe_level 1
 local cluster_level firm
 local did_horizons 0/7
 local did_pretrends 3
+
+* Plotting and coefficient layout:
+* - If horizons or pretrends change, update coef_names, n_total, trimlead,
+*   trimlag, and xlabel_spec together.
 local coef_names pre_3 pre_2 pre_1 post_0 post_1 post_2 post_3 post_4 post_5 post_6 post_7
 local n_total 11
 local trimlead 3
@@ -73,16 +102,37 @@ local graph_width 3000
 local perturb_step 0.15
 local perturb_span 0.30
 
-foreach target of local targets {
-    if !inlist("`target'", "included", "tier_raw", "avg_copay_amt") {
-        di as error "Compact quarterly path files support included, tier_raw, and avg_copay_amt."
+* Optional command-line overrides:
+* - Running "do <this-file> 0 1" overrides no_spillover=0 and exclude=1.
+* - Omit both arguments to use the USER CONFIG values above.
+* - The first argument is no_spillover; the second argument is exclude.
+args no_spillover_override exclude_override
+if "`no_spillover_override'" != "" {
+    capture confirm number `no_spillover_override'
+    if _rc {
+        di as error "The no_spillover override must be numeric 0 or 1."
         exit 198
     }
+    local no_spillover = real("`no_spillover_override'")
 }
+if "`exclude_override'" != "" {
+    capture confirm number `exclude_override'
+    if _rc {
+        di as error "The exclude override must be numeric 0 or 1."
+        exit 198
+    }
+    local exclude = real("`exclude_override'")
+}
+* ================================================================
 
-if !inlist("`panel'", "path", "path_avg") {
-    di as error "panel must be path or path_avg."
-    exit 198
+foreach target of local targets {
+    if !inlist("`target'", ///
+        "included_wted", "included_non_wted", ///
+        "tier_raw_wted", "tier_raw_non_wted", ///
+        "avg_copay_amt_wted", "avg_copay_amt_non_wted") {
+        di as error "Path-average files require an outcome ending in _wted or _non_wted."
+        exit 198
+    }
 }
 
 if `large_sample' != 1 | "`personnel_definition'" != "narrow" {
@@ -93,34 +143,28 @@ if `req' != 1 | "`control'" != "not" | `include_eventpair' != 0 {
     di as error "Formulary regressions require req1, Not controls, and include_eventpair=0."
     exit 198
 }
-if !inlist("`analysis_level'", "plan", "state", "county") {
-    di as error "analysis_level must be plan, state, or county."
-    exit 198
-}
-if !((`first_seen_year_offset' == -1 & `first_seen_quarter' == 1) | ///
-    (`first_seen_year_offset' == 0 & `first_seen_quarter' == 1) | ///
-    (`first_seen_year_offset' == 1 & `first_seen_quarter' == 4)) {
-    di as error "First-seen cutoff must be y-1 Q1, y Q1, or y+1 Q4."
+if "`analysis_level'" != "plan" {
+    di as error "PathAvgPanelMaker outputs require analysis_level=plan."
     exit 198
 }
 if "`outlier_treatment'" != "winsorize" | "`outlier_percentile'" != "p95" {
     di as error "Average copay requires upper-tail p95 winsorization."
     exit 198
 }
-if !inlist(`fe_level', 1, 2) | "`cluster_level'" != "firm" | "`atc'" != "atc3" {
-    di as error "This do-file requires FE1/FE2, firm clustering, and ATC3 sharing."
+if `fe_level' != 1 | "`cluster_level'" != "firm" | "`atc'" != "atc3" {
+    di as error "This do-file requires FE1, firm clustering, and ATC3 sharing."
     exit 198
 }
-if !inlist(`quarter_event', 0, 1) {
-    di as error "quarter_event must be 0 or 1."
+if !inlist(`exclude', 0, 1) {
+    di as error "exclude must be 0 or 1."
     exit 198
 }
-if "`panel'" == "path_avg" & (`quarter_event' != 1 | `fe_level' != 1) {
-    di as error "panel=path_avg requires quarter_event=1 and fe_level=1."
+if !inlist(`no_spillover', 0, 1) {
+    di as error "no_spillover must be 0 or 1."
     exit 198
 }
-if "`panel'" == "path_avg" & "`analysis_level'" != "plan" {
-    di as error "panel=path_avg requires analysis_level=plan."
+if !inlist(`first_seen_year_offset', -1, 0, 1) {
+    di as error "first_seen_year_offset must identify the upstream rule."
     exit 198
 }
 
@@ -130,37 +174,58 @@ local parent_path = regexr("`code_path'", "[/\\][^/\\]+$", "")
 local project_path = regexr("`parent_path'", "[/\\][^/\\]+$", "")
 local project_path = subinstr("`project_path'", "\", "/", .)
 
-local path_data_root "D:/BoardPharma/data"
-local data_path "`path_data_root'/formulary_path_cohort_data/event/req1/Not/shift_q`formulary_time_shift_quarters'/`analysis_level'"
-if `quarter_event' == 1 {
-    local data_path "`project_path'/data/formulary_path_cohort_data_quarter/event/req1/Not/shift_q`formulary_time_shift_quarters'/`analysis_level'"
+local seen_offset "`first_seen_year_offset'"
+if `first_seen_year_offset' >= 0 {
+    local seen_offset "+`first_seen_year_offset'"
 }
-local panel_suffix "_path_`analysis_level'"
-local panel_label "`analysis_level'_path_ndc"
-local panel_title "raw"
-local import_stringcols "1 6/9"
-if `quarter_event' == 1 local import_stringcols "1 7"
-local panel_input_vars "history_id n_path n_path_copay"
-local panel_numeric_vars "n_path n_path_copay"
-if "`panel'" == "path_avg" {
-    local data_path "`data_path'/path_average"
-    local panel_suffix "_path_avg_`analysis_level'"
-    local panel_label "`analysis_level'_path_avg_ndc"
-    local panel_title "mean"
-    local import_stringcols "4"
-    local panel_input_vars ""
-    local panel_numeric_vars ""
+local first_seen_label "seen_y`seen_offset'_event_q"
+local data_root "`project_path'/data/formulary_path_cohort_data_quarter/event/req1/Not/shift_q`formulary_time_shift_quarters'/`analysis_level'/`first_seen_label'"
+local data_path "`data_root'/path_average"
+if `no_spillover' == 1 {
+    local data_path "`data_root'/path_average_no_spillover"
 }
-local sample_spec "baseline"
-if `formulary_time_shift_quarters' != 0 | `first_seen_year_offset' != 0 | `first_seen_quarter' != 1 {
-    local seen_offset "`first_seen_year_offset'"
-    if `first_seen_year_offset' >= 0 {
-        local seen_offset "+`first_seen_year_offset'"
+local panel_suffix "_path_avg_`analysis_level'"
+local panel_label "`analysis_level'_path_avg_ndc"
+local panel_title "mean"
+local import_stringcols "4"
+
+* Do not estimate while PathAvgPanelMaker is still appending quarters.
+* A new START after an older COMPLETE resets completion status.
+local path_build_log "`data_path'/_path_avg_build.log"
+capture confirm file "`path_build_log'"
+if _rc {
+    di as error "Missing path-average build log: `path_build_log'"
+    exit 601
+}
+tempname path_build_handle
+file open `path_build_handle' using "`path_build_log'", read text
+local path_build_complete 0
+file read `path_build_handle' path_build_line
+while r(eof) == 0 {
+    if strpos("`path_build_line'", "START fresh path-average build") {
+        local path_build_complete 0
     }
-    local sample_spec "shift_q`formulary_time_shift_quarters'_seen_y`seen_offset'_q`first_seen_quarter'"
+    if strpos("`path_build_line'", "COMPLETE all path-average quarters") {
+        local path_build_complete 1
+    }
+    file read `path_build_handle' path_build_line
 }
-if `quarter_event' == 1 local sample_spec "`sample_spec'_quarter_event"
+file close `path_build_handle'
+if `path_build_complete' != 1 {
+    di as error "Path-average build is incomplete: `path_build_log'"
+    exit 459
+}
+
+* First-seen eligibility is fixed upstream in PathAvgPanelMaker.py for both
+* treated-share pool construction and final NDC output. Do not re-filter here.
+local sample_spec "shift_q`formulary_time_shift_quarters'_`first_seen_label'_quarter_event"
 local spec_folder "req1_not_wsp95_fe`fe_level'_firm`panel_suffix'"
+if `no_spillover' == 1 {
+    local spec_folder "`spec_folder'_no_spillover"
+}
+if `exclude' == 1 {
+    local spec_folder "`spec_folder'_exclude_anyzero"
+}
 local csv_root "`project_path'/csv/formulary_path/es"
 local figure_root "`project_path'/figures/formulary_path/es"
 local log_root "`project_path'/logs/formulary_path/es"
@@ -194,39 +259,8 @@ if _rc {
     exit 199
 }
 
-* Use the first-seen lookup written for the same event mode and time shift.
-local first_seen_stem "ndc_first_seen"
-if `quarter_event' == 1 local first_seen_stem "ndc_first_seen_quarter"
-if `formulary_time_shift_quarters' != 0 {
-    local first_seen_stem "`first_seen_stem'_shift_q`formulary_time_shift_quarters'"
-}
-local first_seen_file "`project_path'/data/formulary_metadata/`first_seen_stem'.csv"
-capture confirm file "`first_seen_file'"
-if _rc {
-    di as error "Missing first-seen metadata: `first_seen_file'"
-    exit 601
-}
-import delimited "`first_seen_file'", clear varnames(1) case(lower) ///
-    stringcols(1 2)
-foreach required in ndc first_seen_qtime {
-    capture confirm variable `required'
-    if _rc {
-        di as error "Missing variable `required' in `first_seen_file'"
-        exit 111
-    }
-}
-capture confirm numeric variable first_seen_qtime
-if _rc {
-    destring first_seen_qtime, replace
-}
-assert !missing(ndc) & !missing(first_seen_qtime)
-isid ndc
-keep ndc first_seen_qtime
-tempfile first_seen_metadata
-save `first_seen_metadata', replace
-
-tempname coefficient_post sample_post
-tempfile coefficient_data sample_data
+tempname coefficient_post sample_post cohort_sample_post
+tempfile coefficient_data sample_data cohort_sample_data
 postfile `coefficient_post' ///
     str32 event str1 direction str24 target byte sharing ///
     int rel_quarter double estimate std_error ci_low ci_high ///
@@ -238,51 +272,18 @@ postfile `sample_post' ///
     long firms_control firms_treated_notshare firms_treated_share ///
     double premean_notshare premean_share ///
     using `sample_data', replace
+postfile `cohort_sample_post' ///
+    str32 event str1 direction str24 target str12 scope str6 cohort ///
+    long obs_total obs_control obs_treated obs_treated_notshare obs_treated_share ///
+    long ids_total ids_control ids_treated ids_treated_notshare ids_treated_share ///
+    using `cohort_sample_data', replace
 
 * ================= estimation loop =================
 local retained_outcomes `targets'
 local retained_outcomes : list uniq retained_outcomes
-local cohort_required_vars "data_cohort"
-local source_company_var "boardname"
-if `quarter_event' == 1 {
-    local cohort_required_vars "data_cohort_year data_cohort_quarter data_cohort_qtime"
-    local source_company_var "id"
-}
+local cohort_required_vars "data_cohort_year data_cohort_quarter data_cohort_qtime"
+local source_company_var "id"
 foreach event of local events {
-    local cohort_list ""
-    if "`panel'" == "path_avg" {
-        * Mean panels are compact, so stack every cohort file for this event.
-        local cohort_files : dir "`data_path'" files ///
-            "`event'_path_quarter_cohort_*.csv"
-        foreach cohort_file of local cohort_files {
-            if regexm("`cohort_file'", ///
-                "_cohort_([0-9][0-9][0-9][0-9][Qq][1-4])[.]csv$") {
-                local cohort_tag = upper(regexs(1))
-                local cohort_list "`cohort_list' `cohort_tag'"
-            }
-        }
-    }
-    else if `quarter_event' == 1 {
-        * Explicitly retain only cohorts with at least one sharing event NDC.
-        * FormularyPanelStats and FormularyPanelEventStats produced identical
-        * positive-quarter lists for A and B at ATC3.
-        if "`event'" == "to_B_still_in_A" {
-            local cohort_list "2020Q1 2022Q1 2024Q1"
-        }
-        else if "`event'" == "to_B_not_in_A" {
-            local cohort_list "2024Q1"
-        }
-        else if "`event'" == "interlock_dissolution" {
-            local cohort_list "2021Q3 2022Q3 2024Q3 2024Q4"
-        }
-    }
-    else {
-        local cohort_list "2020 2021 2022 2023 2024"
-    }
-    if "`cohort_list'" == "" {
-        di as error "No cohort files selected for `event' and panel=`panel'."
-        exit 601
-    }
     if "`event'" == "to_B_not_in_A" {
         local imported_share_a "event_to_b_not_in_a_a_sharingatc"
         local imported_share_b "event_to_b_not_in_a_b_sharingatc"
@@ -307,132 +308,15 @@ foreach event of local events {
         local other_event_list_b ///
             "event_to_b_not_in_a_b event_to_b_still_in_a_b"
     }
-
-    * Cache the available first-seen-filtered cohort files once per event. Every
-    * direction and outcome below reuses this temporary Stata dataset.
-    local first 1
-    foreach cohort of local cohort_list {
-        local data_file ///
-            "`data_path'/`event'_path_quarter_cohort_`cohort'.csv"
-        capture confirm file "`data_file'"
-        if _rc {
-            di as error "Missing cohort file: `data_file'"
-            exit 601
-        }
-
-        import delimited "`data_file'", clear varnames(1) case(lower) ///
-            stringcols(`import_stringcols')
-        foreach required in `panel_input_vars' ndc `source_company_var' ///
-            year quarter ///
-            `cohort_required_vars' ///
-            treated_a treated_b sample_a sample_b ///
-            `other_event_list_a' `other_event_list_b' ///
-            `imported_share_a' `imported_share_b' ///
-            `retained_outcomes' {
-            capture confirm variable `required'
-            if _rc {
-                di as error "Missing variable `required' in `data_file'"
-                exit 111
-            }
-        }
-        rename `source_company_var' companyid
-        rename `imported_share_a' cohort_sharing_a
-        rename `imported_share_b' cohort_sharing_b
-        if `quarter_event' == 1 {
-            foreach cohort_var in data_cohort_year data_cohort_quarter data_cohort_qtime {
-                capture confirm numeric variable `cohort_var'
-                if _rc destring `cohort_var', replace
-            }
-            gen long data_cohort = data_cohort_qtime
-        }
-        else {
-            capture confirm numeric variable data_cohort
-            if _rc destring data_cohort, replace
-            gen int data_cohort_year = data_cohort
-            gen byte data_cohort_quarter = 1
-            gen long data_cohort_qtime = data_cohort * 4 + 1
-        }
-        foreach numeric_var in year quarter data_cohort `panel_numeric_vars' ///
-            data_cohort_year data_cohort_quarter data_cohort_qtime ///
-            treated_a treated_b sample_a sample_b ///
-            `other_event_list_a' `other_event_list_b' ///
-            cohort_sharing_a cohort_sharing_b `retained_outcomes' {
-            capture confirm numeric variable `numeric_var'
-            if _rc {
-                destring `numeric_var', replace
-            }
-        }
-        foreach binary_var in treated_a treated_b sample_a sample_b ///
-            `other_event_list_a' `other_event_list_b' ///
-            cohort_sharing_a cohort_sharing_b {
-            assert inlist(`binary_var', 0, 1)
-        }
-        if "`panel'" == "path" {
-            assert inlist(included, 0, 1)
-            assert n_path > 0 & n_path == floor(n_path)
-            assert n_path_copay >= 0 & n_path_copay == floor(n_path_copay)
-        }
-        else {
-            assert !missing(included) & inrange(included, 0, 1)
-        }
-        if `quarter_event' == 1 {
-            assert data_cohort_year == real(substr("`cohort'", 1, 4))
-            assert data_cohort_quarter == real(substr("`cohort'", 6, 1))
-            assert data_cohort == 4 * data_cohort_year + data_cohort_quarter
-            assert data_cohort_qtime == data_cohort
-        }
-        else assert data_cohort == `cohort'
-
-        keep `panel_input_vars' ndc companyid ///
-            year quarter data_cohort data_cohort_year data_cohort_quarter data_cohort_qtime ///
-            treated_a treated_b sample_a sample_b ///
-            `other_event_list_a' `other_event_list_b' ///
-            cohort_sharing_a cohort_sharing_b `retained_outcomes'
-
-        if `first' == 1 {
-            tempfile event_master
-            save `event_master', replace
-            local first 0
-        }
-        else {
-            append using `event_master'
-            save `event_master', replace
-        }
+    local event_folder "`event'"
+    if "`event'" == "to_B_not_in_A" {
+        local event_folder "notinA"
     }
-
-    use `event_master', clear
-    * Retain cohort rows only; the lookup also contains NDCs outside this event.
-    merge m:1 ndc using `first_seen_metadata', ///
-        keep(master match) keepusing(first_seen_qtime)
-    assert _merge == 3
-    drop _merge
-    gen long first_seen_cutoff = ///
-        (data_cohort_year + `first_seen_year_offset') * 4 + ///
-        cond(`quarter_event' == 1, data_cohort_quarter, `first_seen_quarter')
-    if `quarter_event' == 1 {
-        * Use the first observed cohort quarter when the requested cutoff
-        * predates the available window, matching FormularyCohortPanelMaker.
-        gen long observed_qtime = 4 * year + quarter
-        bysort data_cohort: egen long first_observed_qtime = min(observed_qtime)
-        replace first_seen_cutoff = max(first_seen_cutoff, first_observed_qtime)
-        drop observed_qtime first_observed_qtime
+    else if "`event'" == "to_B_still_in_A" {
+        local event_folder "stillA"
     }
-    keep if first_seen_qtime <= first_seen_cutoff
-    drop first_seen_qtime first_seen_cutoff
-    compress
-    save `event_master', replace
-
-    if "`panel'" == "path" {
-        * Intensive path outcomes use histories covered in every available
-        * cohort-window quarter. Path-average eligibility is already enforced
-        * by PlanPanelMaker before it writes the mean panel.
-        bysort history_id ndc data_cohort: egen byte __always_included = min(included)
-        assert inlist(__always_included, 0, 1)
-        keep if __always_included == 1
-        drop __always_included
-        compress
-        tempfile event_master_always_included
-        save `event_master_always_included', replace
+    else if "`event'" == "interlock_dissolution" {
+        local event_folder "dissolve"
     }
 
     foreach treatment_group of local treatment_groups {
@@ -440,21 +324,144 @@ foreach event of local events {
         local sample_var "sample_`side'"
         local treated_var "treated_`side'"
         local sharing_source "cohort_sharing_`side'"
-
         local other_event_list "`other_event_list_`side''"
+        local direction_data_path "`data_path'"
+        if `no_spillover' == 1 {
+            local direction_data_path "`data_path'/`treatment_group'"
+        }
 
-        local event_folder "`event'"
-        if "`event'" == "to_B_not_in_A" {
-            local event_folder "notinA"
+        * Discover only files actually generated for this direction. A file
+        * can contain controls but no treated rows for the selected direction;
+        * such a cohort does not enter that direction's regression stack.
+        local cohort_files ""
+        capture local cohort_files : dir "`direction_data_path'" files ///
+            "`event'_path_quarter_cohort_*.csv"
+        local cohort_dir_rc = _rc
+        if `cohort_dir_rc' != 0 {
+            di as text "Skipping `event' side `treatment_group': upstream direction directory is absent."
+            continue
         }
-        else if "`event'" == "to_B_still_in_A" {
-            local event_folder "stillA"
+        if `"`cohort_files'"' == "" {
+            di as text "Skipping `event' side `treatment_group': no upstream cohort-average files."
+            continue
         }
-        else if "`event'" == "interlock_dissolution" {
-            local event_folder "dissolve"
+        local cohort_list ""
+        foreach cohort_file of local cohort_files {
+            if regexm("`cohort_file'", ///
+                "_cohort_([0-9][0-9][0-9][0-9][Qq][1-4])[.]csv$") {
+                local cohort_tag = upper(regexs(1))
+                local cohort_list "`cohort_list' `cohort_tag'"
+            }
         }
+        local cohort_list : list uniq cohort_list
+        if "`cohort_list'" == "" {
+            di as text "Skipping `event' side `treatment_group': no valid quarterly cohort filenames."
+            continue
+        }
+
+        local cohort_part_count 0
+        local first_part ""
+        local append_parts ""
+        foreach cohort of local cohort_list {
+            local data_file ///
+                "`direction_data_path'/`event'_path_quarter_cohort_`cohort'.csv"
+            capture confirm file "`data_file'"
+            if _rc {
+                di as error "Discovered cohort file is missing: `data_file'"
+                exit 601
+            }
+
+            import delimited "`data_file'", clear varnames(1) case(lower) ///
+                stringcols(`import_stringcols')
+            foreach required in ndc `source_company_var' year quarter ///
+                `cohort_required_vars' treated_a treated_b sample_a sample_b ///
+                `other_event_list_a' `other_event_list_b' ///
+                `imported_share_a' `imported_share_b' `retained_outcomes' {
+                capture confirm variable `required'
+                if _rc {
+                    di as error "Missing variable `required' in `data_file'"
+                    exit 111
+                }
+            }
+            rename `source_company_var' companyid
+            rename `imported_share_a' cohort_sharing_a
+            rename `imported_share_b' cohort_sharing_b
+            foreach cohort_var in data_cohort_year data_cohort_quarter data_cohort_qtime {
+                capture confirm numeric variable `cohort_var'
+                if _rc destring `cohort_var', replace
+            }
+            gen long data_cohort = data_cohort_qtime
+            foreach numeric_var in year quarter data_cohort ///
+                data_cohort_year data_cohort_quarter data_cohort_qtime ///
+                treated_a treated_b sample_a sample_b ///
+                `other_event_list_a' `other_event_list_b' ///
+                cohort_sharing_a cohort_sharing_b `retained_outcomes' {
+                capture confirm numeric variable `numeric_var'
+                if _rc destring `numeric_var', replace
+            }
+            foreach binary_var in treated_a treated_b sample_a sample_b ///
+                `other_event_list_a' `other_event_list_b' ///
+                cohort_sharing_a cohort_sharing_b {
+                assert inlist(`binary_var', 0, 1)
+            }
+            assert !missing(included_wted) & inrange(included_wted, 0, 1)
+            assert !missing(included_non_wted) & inrange(included_non_wted, 0, 1)
+            assert data_cohort_year == real(substr("`cohort'", 1, 4))
+            assert data_cohort_quarter == real(substr("`cohort'", 6, 1))
+            assert data_cohort == 4 * data_cohort_year + data_cohort_quarter
+            assert data_cohort_qtime == data_cohort
+
+            keep ndc companyid year quarter data_cohort ///
+                data_cohort_year data_cohort_quarter data_cohort_qtime ///
+                treated_a treated_b sample_a sample_b ///
+                `other_event_list_a' `other_event_list_b' ///
+                cohort_sharing_a cohort_sharing_b `retained_outcomes'
+            keep if `sample_var' == 1
+            quietly count if `treated_var' == 1
+            if r(N) == 0 {
+                di as text "Skipping cohort file with no treated rows: `data_file'"
+                continue
+            }
+
+            * Exclusion is outcome-specific and direction-specific. It neither
+            * changes nor is changed by the no-spillover path-pool setting.
+            if `exclude' == 1 {
+                foreach outcome of local targets {
+                    if strpos("`outcome'", "included") == 1 {
+                        local eligibility_var "__eligible_`outcome'"
+                        bysort companyid ndc data_cohort: egen byte `eligibility_var' = ///
+                            min(`outcome' > 0)
+                        assert inlist(`eligibility_var', 0, 1)
+                    }
+                }
+            }
+            compress
+
+            local ++cohort_part_count
+            tempfile cohort_part
+            save `cohort_part', replace
+            if `cohort_part_count' == 1 {
+                local first_part "`cohort_part'"
+            }
+            else {
+                local append_parts `"`append_parts' "`cohort_part'""'
+            }
+        }
+        if `cohort_part_count' == 0 {
+            di as text "Skipping `event' side `treatment_group': no cohort has treated rows."
+            continue
+        }
+        use "`first_part'", clear
+        if `cohort_part_count' > 1 {
+            append using `append_parts'
+        }
+        assert `sample_var' == 1
+        compress
+        tempfile event_master
+        save `event_master', replace
 
         foreach target of local targets {
+            local included_target = strpos("`target'", "included") == 1
             local figure_dir "`figure_run_root'/`event_folder'/`treatment_group'/`target'"
             local log_dir "`log_run_root'/`event_folder'/`treatment_group'/`target'"
             cap mkdir "`figure_run_root'/`event_folder'"
@@ -463,30 +470,27 @@ foreach event of local events {
             cap mkdir "`log_run_root'/`event_folder'/`treatment_group'"
             cap mkdir "`figure_dir'"
             cap mkdir "`log_dir'"
-            capture erase "`figure_dir'/plot.png"
             capture log close
             log using "`log_dir'/run.log", replace text
             di as text "Formulary dynamic did_imputation: `event', side `treatment_group', target `target', level `panel_label'"
 
-            if "`target'" == "included" {
-                use `event_master', clear
-            }
-            else if "`panel'" == "path" {
-                use `event_master_always_included', clear
-                * included=1 guarantees tier availability, but benefit data can
-                * still be absent when no CPS-state has a complete tier schedule.
-                * Keep a balanced path-NDC history for the current outcome.
-                bysort history_id ndc data_cohort: egen byte __target_complete = ///
-                    min(!missing(`target'))
-                keep if __target_complete == 1
-                drop __target_complete
-                assert !missing(`target')
+            use `event_master', clear
+            if `included_target' {
+                if `exclude' == 1 {
+                    local eligibility_var "__eligible_`target'"
+                    capture confirm variable `eligibility_var'
+                    if _rc {
+                        di as error "Missing exclusion flag `eligibility_var'."
+                        log close
+                        exit 111
+                    }
+                    keep if `eligibility_var' == 1
+                }
             }
             else {
-                use `event_master', clear
-                * PlanPanelMaker emits each intensive path-average outcome either
-                * in every panel quarter or in none. Verify that invariant and
-                * discard the all-missing units that cannot enter the regression.
+                * PathAvgPanelMaker emits each intensive outcome either in every
+                * panel quarter or in none. Verify that invariant and discard
+                * all-missing units that cannot enter the regression.
                 bysort companyid ndc data_cohort: egen byte __target_all = ///
                     min(!missing(`target'))
                 bysort companyid ndc data_cohort: egen byte __target_any = ///
@@ -496,17 +500,7 @@ foreach event of local events {
                 drop __target_all __target_any
                 assert !missing(`target')
             }
-            local weight_var ""
-            local weight_clause ""
-            if "`panel'" == "path" {
-                local weight_var "n_path"
-                if "`target'" == "avg_copay_amt" {
-                    local weight_var "n_path_copay"
-                    keep if n_path_copay > 0
-                }
-                local weight_clause "[aw=`weight_var']"
-            }
-            keep if `sample_var' == 1
+            assert `sample_var' == 1
             gen byte treated_in_stack = `treated_var'
             count
             if r(N) == 0 {
@@ -542,13 +536,13 @@ foreach event of local events {
             }
             drop rel_quarter
 
-            quietly summarize `target' `weight_clause', detail
+            quietly summarize `target', detail
             if r(N) == 0 {
                 di as error "Target `target' is missing for every stacked observation."
                 log close
                 continue
             }
-            if "`target'" == "avg_copay_amt" {
+            if strpos("`target'", "avg_copay_amt") == 1 {
                 * Copay alone is winsorized at its unweighted P95.
                 quietly summarize `target', detail
                 local p95_value = r(p95)
@@ -560,10 +554,6 @@ foreach event of local events {
             format q_time %tq
             assert inrange(quarter, 1, 4)
             assert !missing(ndc) & !missing(companyid)
-            if "`panel'" == "path" {
-                assert !missing(history_id)
-                assert `weight_var' > 0
-            }
             bysort ndc companyid data_cohort: ///
                 assert treated_in_stack == treated_in_stack[1]
             bysort ndc companyid data_cohort: ///
@@ -572,35 +562,16 @@ foreach event of local events {
             bysort ndc data_cohort: egen int company_count = total(company_tag)
             assert company_count == 1
             drop company_tag company_count
-            if "`panel'" == "path" {
-                egen long id = group(history_id ndc data_cohort)
-                if `fe_level' == 2 {
-                    egen long history_cohort_q = group(history_id data_cohort q_time)
-                }
-            }
-            else {
-                egen long id = group(companyid ndc data_cohort)
-            }
+            egen long id = group(companyid ndc data_cohort)
             isid id q_time
 
-            if `quarter_event' == 1 {
-                bysort data_cohort: egen int window_start = min(q_time)
-                bysort data_cohort: egen int window_end = max(q_time)
-                assert window_start >= yq(data_cohort_year, data_cohort_quarter) - 4
-                assert window_end <= yq(data_cohort_year, data_cohort_quarter) + 7
-                bysort id (q_time): assert _N == window_end[1] - window_start[1] + 1
-                bysort id (q_time): assert q_time == window_start[1] + _n - 1
-                drop window_start window_end
-            }
-            else {
-                gen byte expected_quarters = 12
-                replace expected_quarters = 11 if ///
-                    `formulary_time_shift_quarters' == 1 & data_cohort == 2020
-                replace expected_quarters = 11 if ///
-                    `formulary_time_shift_quarters' == 0 & data_cohort == 2024
-                bysort id: assert _N == expected_quarters[1]
-                drop expected_quarters
-            }
+            bysort data_cohort: egen int window_start = min(q_time)
+            bysort data_cohort: egen int window_end = max(q_time)
+            assert window_start >= yq(data_cohort_year, data_cohort_quarter) - 4
+            assert window_end <= yq(data_cohort_year, data_cohort_quarter) + 7
+            bysort id (q_time): assert _N == window_end[1] - window_start[1] + 1
+            bysort id (q_time): assert q_time == window_start[1] + _n - 1
+            drop window_start window_end
 
             gen byte treated = treated_in_stack
             gen int event_cohort_q = yq(data_cohort_year, data_cohort_quarter) if treated == 1
@@ -608,6 +579,98 @@ foreach event of local events {
             gen byte pre_period = q_time < yq(data_cohort_year, data_cohort_quarter)
             bysort id (q_time): assert treated == treated[1]
             bysort id (q_time): assert atc_sharing == atc_sharing[1]
+
+            * Record the exact stacked sample immediately before did_imputation.
+            * Observation counts are panel rows. ID counts are unique
+            * company-NDC-cohort units; treated-share is a subset of treated.
+            tempvar pre_id_tag pre_control_tag pre_treated_tag ///
+                pre_notshare_tag pre_share_tag
+            egen byte `pre_id_tag' = tag(id)
+            egen byte `pre_control_tag' = tag(id) if treated == 0
+            egen byte `pre_treated_tag' = tag(id) if treated == 1
+            egen byte `pre_notshare_tag' = tag(id) if ///
+                treated == 1 & atc_sharing == 0
+            egen byte `pre_share_tag' = tag(id) if ///
+                treated == 1 & atc_sharing == 1
+
+            levelsof data_cohort, local(regression_cohorts)
+            foreach regression_cohort of local regression_cohorts {
+                quietly summarize data_cohort_year if ///
+                    data_cohort == `regression_cohort', meanonly
+                local report_cohort_year = r(min)
+                quietly summarize data_cohort_quarter if ///
+                    data_cohort == `regression_cohort', meanonly
+                local report_cohort_quarter = r(min)
+                local report_cohort ///
+                    "`report_cohort_year'Q`report_cohort_quarter'"
+
+                quietly count if data_cohort == `regression_cohort'
+                local pre_obs_total = r(N)
+                quietly count if data_cohort == `regression_cohort' & treated == 0
+                local pre_obs_control = r(N)
+                quietly count if data_cohort == `regression_cohort' & treated == 1
+                local pre_obs_treated = r(N)
+                quietly count if data_cohort == `regression_cohort' & ///
+                    treated == 1 & atc_sharing == 0
+                local pre_obs_notshare = r(N)
+                quietly count if data_cohort == `regression_cohort' & ///
+                    treated == 1 & atc_sharing == 1
+                local pre_obs_share = r(N)
+
+                quietly count if data_cohort == `regression_cohort' & ///
+                    `pre_id_tag' == 1
+                local pre_ids_total = r(N)
+                quietly count if data_cohort == `regression_cohort' & ///
+                    `pre_control_tag' == 1
+                local pre_ids_control = r(N)
+                quietly count if data_cohort == `regression_cohort' & ///
+                    `pre_treated_tag' == 1
+                local pre_ids_treated = r(N)
+                quietly count if data_cohort == `regression_cohort' & ///
+                    `pre_notshare_tag' == 1
+                local pre_ids_notshare = r(N)
+                quietly count if data_cohort == `regression_cohort' & ///
+                    `pre_share_tag' == 1
+                local pre_ids_share = r(N)
+
+                post `cohort_sample_post' ///
+                    ("`event'") ("`treatment_group'") ("`target'") ///
+                    ("cohort") ("`report_cohort'") ///
+                    (`pre_obs_total') (`pre_obs_control') (`pre_obs_treated') ///
+                    (`pre_obs_notshare') (`pre_obs_share') ///
+                    (`pre_ids_total') (`pre_ids_control') (`pre_ids_treated') ///
+                    (`pre_ids_notshare') (`pre_ids_share')
+            }
+
+            quietly count
+            local pre_obs_total = r(N)
+            quietly count if treated == 0
+            local pre_obs_control = r(N)
+            quietly count if treated == 1
+            local pre_obs_treated = r(N)
+            quietly count if treated == 1 & atc_sharing == 0
+            local pre_obs_notshare = r(N)
+            quietly count if treated == 1 & atc_sharing == 1
+            local pre_obs_share = r(N)
+            quietly count if `pre_id_tag' == 1
+            local pre_ids_total = r(N)
+            quietly count if `pre_control_tag' == 1
+            local pre_ids_control = r(N)
+            quietly count if `pre_treated_tag' == 1
+            local pre_ids_treated = r(N)
+            quietly count if `pre_notshare_tag' == 1
+            local pre_ids_notshare = r(N)
+            quietly count if `pre_share_tag' == 1
+            local pre_ids_share = r(N)
+            post `cohort_sample_post' ///
+                ("`event'") ("`treatment_group'") ("`target'") ///
+                ("stack_total") ("ALL") ///
+                (`pre_obs_total') (`pre_obs_control') (`pre_obs_treated') ///
+                (`pre_obs_notshare') (`pre_obs_share') ///
+                (`pre_ids_total') (`pre_ids_control') (`pre_ids_treated') ///
+                (`pre_ids_notshare') (`pre_ids_share')
+            drop `pre_id_tag' `pre_control_tag' `pre_treated_tag' ///
+                `pre_notshare_tag' `pre_share_tag'
 
             local other_history_list ""
             foreach other_event of local other_event_list {
@@ -630,13 +693,10 @@ foreach event of local events {
             }
 
             local fe_spec "id q_time `other_history_list'"
-            if `fe_level' == 2 {
-                local fe_spec "id history_cohort_q `other_history_list'"
-            }
             gen byte atc_sharing_het = atc_sharing if treated == 1
             replace atc_sharing_het = 0 if treated == 0
 
-            capture noisily did_imputation `target' id q_time event_cohort_q `weight_clause', ///
+            capture noisily did_imputation `target' id q_time event_cohort_q, ///
                 fe(`fe_spec') ///
                 horizons(`did_horizons') pretrends(`did_pretrends') ///
                 hetby(atc_sharing_het) autosample tol(0.1) minn(0) ///
@@ -884,6 +944,7 @@ foreach event of local events {
 
 postclose `coefficient_post'
 postclose `sample_post'
+postclose `cohort_sample_post'
 
 use `coefficient_data', clear
 sort event direction target sharing rel_quarter
@@ -892,5 +953,9 @@ export delimited using "`csv_run_root'/dynamic.csv", replace
 use `sample_data', clear
 sort event direction target
 export delimited using "`csv_run_root'/samples.csv", replace
+
+use `cohort_sample_data', clear
+sort event direction target scope cohort
+export delimited using "`csv_run_root'/cohort_samples.csv", replace
 
 di as result "Saved formulary dynamic did_imputation outputs."

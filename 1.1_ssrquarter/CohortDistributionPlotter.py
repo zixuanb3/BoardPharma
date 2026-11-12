@@ -1,4 +1,9 @@
-"""Plot existing quarterly SSR cohorts with the original annual chart styles.
+"""Purpose: Plot quarterly SSR firm/product counts and ATC3 sharing by cohort.
+Process: Read selected policy cohorts, count units, render charts and audit inputs.
+Input: Quarterly firm panels and saved static or dynamic event/req2/Not cohorts.
+Output: Policy- and sharing-specific CSV summaries, figures and an input manifest.
+
+Plot existing quarterly SSR cohorts with the original annual chart styles.
 
 Read the 1.1 event/req2/Not cohorts, retaining their saved sample and ATC3
 sharing definitions. Count unique BoardName and BoardName-product units as in
@@ -21,6 +26,7 @@ not overwritten. No cohorts or sharing labels are reconstructed.
 
 from __future__ import annotations
 
+import argparse
 from itertools import product
 from pathlib import Path
 import runpy
@@ -33,15 +39,22 @@ from matplotlib.ticker import FuncFormatter
 import pandas as pd
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
 # ========================== USER CONFIG ==========================
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUN_CONFIG = {
-    "roster_variants": ["imputed_yearquarter", "drop_sentinel_yearquarter"],
-    "late_values": [0, 3],
-    "req1_specs": ["new", "origin"],
-    "stay_specs": ["new", "origin"],
-    "share_time_specs": ["new", "origin"],
+    "ever_board": 1,  # 0: legacy roster, 1: all-role continuity.
+    "ieoc_ref": 1,  # 0: baseline BP expansion, 1: use IE/OC coverage.
+    # Quarterly roster variants and upstream event definitions to plot.
+    "roster_variants": ["drop_sentinel_yearquarter"],
+    "late_values": [3],
+    "req1_specs": ["new"],
+    # Allowed stay rules: new, origin, pre2. --stay-spec can select one.
+    "stay_specs": ["pre2"],
+    # Static sharing accepts new and origin. Dynamic sharing uses only new.
+    "share_time_specs": ["new"],
+    # 0: read static cohorts. 1: read dynamic cohorts and separate the outputs.
+    "dynamic_share": 0,
+    # Event types, treated sides (A/B), and inclusive YYYYQn plot range.
     "events": ["to_B_not_in_A", "to_B_still_in_A", "interlock_dissolution"],
     "treatment_groups": ["A", "B"],
     "start_quarter": "2009Q1",
@@ -66,15 +79,23 @@ FAMILIES = (
 )
 
 
-def configurations() -> list[Path]:
-    """Return all selected roster and four-parameter directories."""
+def configurations(dynamic_share: int = 0, stay_spec: str | None = None) -> list[Path]:
+    """Return the selected roster and sharing directories."""
+    share_specs = RUN_CONFIG["share_time_specs"]
+    stay_specs = [stay_spec] if stay_spec is not None else RUN_CONFIG["stay_specs"]
+    suffix = ""
+    if dynamic_share:
+        if "new" not in share_specs:
+            raise ValueError("dynamic_share=1 requires new in share_time_specs")
+        share_specs = ["new"]
+        suffix = "_ds1"
     return [
         Path(variant) / f"late_{late}" / f"req1_{req1}" / f"stay_{stay}"
-        / f"share_time_{share}"
+        / f"share_time_{share}{suffix}"
         for variant, late, req1, stay, share in product(
             RUN_CONFIG["roster_variants"], RUN_CONFIG["late_values"],
-            RUN_CONFIG["req1_specs"], RUN_CONFIG["stay_specs"],
-            RUN_CONFIG["share_time_specs"],
+            RUN_CONFIG["req1_specs"], stay_specs,
+            share_specs,
         )
     ]
 
@@ -197,10 +218,42 @@ def plot_sharing(
 
 def main() -> None:
     """Write three annual-style charts for every selected event/side definition."""
+    global COHORT_ROOT, PANEL_ROOT, FIGURE_ROOT, CSV_ROOT, MANIFEST_PATH
+    from ever_board_config import (
+        membership_path,
+        validate_policies,
+    )
+
+    parser = argparse.ArgumentParser(description="Plot quarterly SSR cohorts by membership policy.")
+    parser.add_argument("--ever-board", "--ever_board", type=int, choices=(0, 1), default=RUN_CONFIG["ever_board"])
+    parser.add_argument("--ieoc-ref", "--ieoc_ref", type=int, choices=(0, 1), default=RUN_CONFIG["ieoc_ref"])
+    parser.add_argument(
+        "--stay-spec", choices=("new", "origin", "pre2"),
+        help="Plot one stay rule instead of the stay rules in USER CONFIG.",
+    )
+    parser.add_argument(
+        "--dynamic-share", "--dynamic_share", type=int, choices=(0, 1),
+        default=RUN_CONFIG["dynamic_share"],
+        help="Read dynamic sharing cohorts; use only the new sharing-time rule.",
+    )
+    args = parser.parse_args()
+    try:
+        validate_policies(args.ever_board, args.ieoc_ref)
+        specs = configurations(args.dynamic_share, args.stay_spec)
+    except ValueError as error:
+        parser.error(str(error))
+    COHORT_ROOT = membership_path(COHORT_ROOT, args.ever_board, args.ieoc_ref)
+    PANEL_ROOT = membership_path(PANEL_ROOT, args.ever_board, args.ieoc_ref)
+    FIGURE_ROOT = membership_path(FIGURE_ROOT, args.ever_board, args.ieoc_ref)
+    CSV_ROOT = membership_path(CSV_ROOT, args.ever_board, args.ieoc_ref)
+    manifest_suffix = "_ds1" if args.dynamic_share else ""
+    manifest_stays = [args.stay_spec] if args.stay_spec is not None else RUN_CONFIG["stay_specs"]
+    if len(manifest_stays) == 1:
+        manifest_suffix += f"_stay_{manifest_stays[0]}"
+    MANIFEST_PATH = CSV_ROOT / f"cohort_distribution_inputs{manifest_suffix}.csv"
     periods = pd.period_range(
         RUN_CONFIG["start_quarter"], RUN_CONFIG["end_quarter"], freq="Q"
     )
-    specs = configurations()
     missing = preflight(specs, periods)
     annual = runpy.run_path(
         str(PROJECT_ROOT / "codes" / "1_data_prep" / "CohortPanelMaker.py")

@@ -1,0 +1,165 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=0.65in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+
+\title{No-Winsorization after Ruleout in the 1.1 Quarterly Event Study}
+\author{BoardPharma}
+\date{November 10, 2026}
+
+\newcommand{\thresholdpanel}[3]{%
+  \begin{minipage}[t]{0.46\textwidth}
+    \centering
+    {\small\textbf{#1}}\par
+    \vspace{0.04in}
+    \includegraphics[width=\linewidth]{#2}\par
+    \vspace{-0.03in}
+    {\small Estimation observations: #3}
+  \end{minipage}%
+}
+
+\newcommand{\panelnote}{%
+  \par\vspace{0.10in}
+  {\footnotesize\textit{Notes.} Black circles report estimates for
+  \texttt{sharingatc=0}; hollow blue triangles report estimates for
+  \texttt{sharingatc=1}. Error bars are 95\% confidence intervals. Ruleout 0
+  is the original upper-p95-winsorized benchmark. Thresholds 50, 10, and 5
+  apply no winsorization before the log transformation.}%
+}
+
+\begin{document}
+
+\maketitle
+
+\section*{1\quad Ruleout and Outcome-Transformation Design}
+
+For each saved cohort panel, observations are grouped by company and product
+(\texttt{BoardName} $\times$ \texttt{product}). Using all observed quarters in
+that cohort file, the ruleout score for company $b$, product $p$, and cohort $c$
+is
+\[
+R_{bpc}
+=
+\frac{\max(\texttt{price1}_{bpc})/\min(\texttt{price1}_{bpc})}
+     {\max(\texttt{price0}_{bpc})/\min(\texttt{price0}_{bpc})}.
+\]
+For a threshold $\tau$, every row of the company--product history is removed
+from that cohort when $R_{bpc}>\tau$; equality is retained. The score uses the
+original price levels. After removal, a cohort with no remaining treated
+observations is not stacked.
+
+This report deliberately combines the original benchmark with the new
+no-winsorization runs. Ruleout 0 is the same benchmark used in the previous
+report: no ruleout deletion, followed by upper-p95 winsorization of
+\texttt{price1} and then the log transformation. For thresholds 50, 10, and 5,
+the retained original \texttt{price1} values are logged directly, with no
+winsorization or trimming. Thus, comparisons with ruleout 0 reflect both the
+ruleout deletion and the removal of winsorization. Comparisons among thresholds
+50, 10, and 5 differ only in the threshold and its resulting sample.
+
+Treatment status, control status, event timing, event cohort, and dynamic ATC3
+sharing are read from the same saved cohort files and are not reconstructed by
+ruleout. All other settings are common: the
+\texttt{drop\_sentinel\_yearquarter} roster, \texttt{ever\_board=1},
+\texttt{ieoc\_ref=1}, \texttt{late=3}, new requirement, stay, and sharing-time
+rules, dynamic ATC3 sharing, \texttt{price1}, req2, the Not control group,
+company--product--cohort fixed effects, cohort--calendar-quarter fixed effects,
+company clustering, horizons 0--7, three pre-event coefficients, and no Kappa,
+other-event, or ATC3 fixed-effect controls.
+
+\begin{table}[h]
+  \centering
+  \caption{Outcome treatment and estimation sample}
+  \begin{tabular}{lll r}
+    \toprule
+    Ruleout & Price treatment before log & Role & Observations \\
+    \midrule
+    0  & Upper-p95 winsorization & Original benchmark & 583,584 \\
+    50 & None & New result & 577,920 \\
+    10 & None & New result & 568,884 \\
+    5  & None & New result & 546,300 \\
+    \bottomrule
+  \end{tabular}
+  \par\vspace{0.05in}
+  {\footnotesize\textit{Notes.} Counts sum the final estimation observations
+  reported by the six output files and refer to stacked regression
+  observations, not unique company--product records. Winsorization changes
+  values but does not remove observations, so the counts match the corresponding
+  threshold samples in the preceding report.}
+\end{table}
+
+\clearpage
+\section*{2\quad Interlock Dissolution --- A-side Treatment}
+\noindent
+\thresholdpanel{Ruleout = 0 (p95 winsor)}{figures/diss_A_r0.png}{109,824}\hfill
+\thresholdpanel{Ruleout = 50 (no winsor)}{figures/diss_A_r50.png}{108,576}
+
+\vspace{0.10in}
+\noindent
+\thresholdpanel{Ruleout = 10 (no winsor)}{figures/diss_A_r10.png}{106,932}\hfill
+\thresholdpanel{Ruleout = 5 (no winsor)}{figures/diss_A_r5.png}{103,704}
+\panelnote
+
+\clearpage
+\section*{3\quad Interlock Dissolution --- B-side Treatment}
+\noindent
+\thresholdpanel{Ruleout = 0 (p95 winsor)}{figures/diss_B_r0.png}{94,944}\hfill
+\thresholdpanel{Ruleout = 50 (no winsor)}{figures/diss_B_r50.png}{94,176}
+
+\vspace{0.10in}
+\noindent
+\thresholdpanel{Ruleout = 10 (no winsor)}{figures/diss_B_r10.png}{92,760}\hfill
+\thresholdpanel{Ruleout = 5 (no winsor)}{figures/diss_B_r5.png}{89,772}
+\panelnote
+
+\clearpage
+\section*{4\quad To B, Still in A --- A-side Treatment}
+\noindent
+\thresholdpanel{Ruleout = 0 (p95 winsor)}{figures/still_A_r0.png}{108,396}\hfill
+\thresholdpanel{Ruleout = 50 (no winsor)}{figures/still_A_r50.png}{107,604}
+
+\vspace{0.10in}
+\noindent
+\thresholdpanel{Ruleout = 10 (no winsor)}{figures/still_A_r10.png}{105,864}\hfill
+\thresholdpanel{Ruleout = 5 (no winsor)}{figures/still_A_r5.png}{99,696}
+\panelnote
+
+\clearpage
+\section*{5\quad To B, Still in A --- B-side Treatment}
+\noindent
+\thresholdpanel{Ruleout = 0 (p95 winsor)}{figures/still_B_r0.png}{130,236}\hfill
+\thresholdpanel{Ruleout = 50 (no winsor)}{figures/still_B_r50.png}{128,832}
+
+\vspace{0.10in}
+\noindent
+\thresholdpanel{Ruleout = 10 (no winsor)}{figures/still_B_r10.png}{126,840}\hfill
+\thresholdpanel{Ruleout = 5 (no winsor)}{figures/still_B_r5.png}{121,956}
+\panelnote
+
+\clearpage
+\section*{6\quad To B, Not in A --- A-side Treatment}
+\noindent
+\thresholdpanel{Ruleout = 0 (p95 winsor)}{figures/not_A_r0.png}{73,992}\hfill
+\thresholdpanel{Ruleout = 50 (no winsor)}{figures/not_A_r50.png}{73,068}
+
+\vspace{0.10in}
+\noindent
+\thresholdpanel{Ruleout = 10 (no winsor)}{figures/not_A_r10.png}{72,048}\hfill
+\thresholdpanel{Ruleout = 5 (no winsor)}{figures/not_A_r5.png}{69,420}
+\panelnote
+
+\clearpage
+\section*{7\quad To B, Not in A --- B-side Treatment}
+\noindent
+\thresholdpanel{Ruleout = 0 (p95 winsor)}{figures/not_B_r0.png}{66,192}\hfill
+\thresholdpanel{Ruleout = 50 (no winsor)}{figures/not_B_r50.png}{65,664}
+
+\vspace{0.10in}
+\noindent
+\thresholdpanel{Ruleout = 10 (no winsor)}{figures/not_B_r10.png}{64,440}\hfill
+\thresholdpanel{Ruleout = 5 (no winsor)}{figures/not_B_r5.png}{61,752}
+\panelnote
+
+\end{document}

@@ -63,7 +63,7 @@ QUARTER_PATTERN = re.compile(r"^(\d{4})\s*Q([1-4])$")
 RUN_CONFIG = {
     "quarter": 1,
     "n_input_blocks": 30,
-    "chunksize": 2_000_000,
+    "chunksize": 3_000_000,
     "formulary_time_shift_quarters": 1,
 }
 # ===============================================================
